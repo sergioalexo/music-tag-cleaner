@@ -1,0 +1,175 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Check, ChevronsUpDown } from "lucide-react";
+import { cn } from "./ui";
+
+interface Props {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+  /** Allow committing a value that isn't in the list (free text). */
+  allowCustom?: boolean;
+  className?: string;
+  autoFocus?: boolean;
+  onClose?: () => void;
+}
+
+/**
+ * A type-to-filter dropdown: shows the options, narrows them as you type, and
+ * lets you pick with the mouse or keyboard. The option list is portaled to the
+ * body with fixed positioning so it is never clipped by a scrolling table.
+ */
+export function Combobox({
+  value,
+  options,
+  onChange,
+  placeholder,
+  allowCustom = false,
+  className,
+  autoFocus,
+  onClose,
+}: Props) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [highlight, setHighlight] = useState(0);
+  const [rect, setRect] = useState<DOMRect | null>(null);
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const filtered = query
+    ? options.filter((o) => o.toLowerCase().includes(query.toLowerCase()))
+    : options;
+
+  const reposition = () => {
+    if (triggerRef.current) setRect(triggerRef.current.getBoundingClientRect());
+  };
+
+  const openList = () => {
+    reposition();
+    setOpen(true);
+  };
+
+  useLayoutEffect(() => {
+    if (autoFocus) {
+      inputRef.current?.focus();
+      openList();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFocus]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!triggerRef.current?.contains(t) && !listRef.current?.contains(t)) {
+        setOpen(false);
+        onClose?.();
+      }
+    };
+    // Keep the portaled list aligned while the table scrolls.
+    const onScrollResize = () => reposition();
+    window.addEventListener("mousedown", onDoc);
+    window.addEventListener("scroll", onScrollResize, true);
+    window.addEventListener("resize", onScrollResize);
+    return () => {
+      window.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("scroll", onScrollResize, true);
+      window.removeEventListener("resize", onScrollResize);
+    };
+  }, [open, onClose]);
+
+  const commit = (v: string) => {
+    onChange(v);
+    setQuery("");
+    setOpen(false);
+    onClose?.();
+  };
+
+  const commitTyped = () => {
+    const match = filtered[highlight];
+    if (match) commit(match);
+    else if (allowCustom) commit(query.trim() || value);
+    else {
+      setOpen(false);
+      onClose?.();
+    }
+  };
+
+  return (
+    <div ref={triggerRef} className={cn("relative", className)}>
+      <div
+        className="flex h-8 cursor-text items-center gap-1 rounded-md border border-input bg-background px-2 text-xs shadow-sm focus-within:ring-1 focus-within:ring-ring"
+        onClick={openList}
+      >
+        <input
+          ref={inputRef}
+          value={open ? query : value}
+          placeholder={value || placeholder}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            if (!open) openList();
+            setHighlight(0);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              if (!open) openList();
+              setHighlight((h) => Math.min(h + 1, filtered.length - 1));
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setHighlight((h) => Math.max(h - 1, 0));
+            } else if (e.key === "Enter") {
+              e.preventDefault();
+              commitTyped();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setOpen(false);
+              onClose?.();
+            }
+          }}
+          className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
+        />
+        <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      </div>
+
+      {open &&
+        rect &&
+        filtered.length > 0 &&
+        createPortal(
+          <div
+            ref={listRef}
+            className="z-[100] max-h-56 overflow-y-auto rounded-md border bg-popover p-1 shadow-lg"
+            style={{
+              position: "fixed",
+              top: rect.bottom + 4,
+              left: rect.left,
+              width: Math.max(rect.width, 160),
+            }}
+          >
+            {filtered.map((o, i) => (
+              <button
+                key={o}
+                onMouseEnter={() => setHighlight(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  commit(o);
+                }}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs",
+                  i === highlight ? "bg-accent" : "hover:bg-accent/60",
+                )}
+              >
+                <Check
+                  className={cn("h-3 w-3 shrink-0", o === value ? "opacity-100" : "opacity-0")}
+                />
+                {o}
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
