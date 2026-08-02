@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use lofty::config::WriteOptions;
 // Imported unnamed so `save_to_path` is in scope without clashing with our
@@ -12,6 +13,28 @@ use crate::commands::backup::{find_backup_in_file, make_backup_string, BACKUP_KE
 use crate::models::{AudioFile, TagData, TagReadResult};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
+
+const FILE_OP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Runs blocking file I/O off the async runtime with a timeout, so a single
+/// locked file (open in another app) or a cloud-storage placeholder that
+/// hasn't downloaded yet fails fast with a clear message instead of hanging
+/// the command forever — which otherwise leaves every toolbar button
+/// disabled with no explanation, since they all share one busy flag.
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tokio::time::timeout(FILE_OP_TIMEOUT, tauri::async_runtime::spawn_blocking(f)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("The file operation task panicked unexpectedly".to_string()),
+        Err(_) => Err(format!(
+            "Timed out after {}s — the file may be locked by another program (a DJ app, antivirus) or not fully downloaded from cloud storage",
+            FILE_OP_TIMEOUT.as_secs()
+        )),
+    }
+}
 
 /// Canonical, format-independent name for a tag key. Used for the
 /// `allFields` dump and to match the frontend's kept-field list.
@@ -424,7 +447,11 @@ pub async fn write_tags(
 /// the earliest full state is always recoverable). All other tags are kept.
 #[tauri::command]
 pub async fn backup_file(path: String, backup_field: String) -> Result<(), String> {
-    let mut tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    run_blocking(move || backup_file_blocking(&path, &backup_field)).await
+}
+
+fn backup_file_blocking(path: &str, backup_field: &str) -> Result<(), String> {
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     // Write into the format's canonical tag (e.g. ID3v2 for MP3), never a
     // limited secondary tag like ID3v1 that can't hold Composer.
     let tag_type = tagged
@@ -452,14 +479,14 @@ pub async fn backup_file(path: String, backup_field: String) -> Result<(), Strin
         };
         (a, t, y, json)
     };
-    let searchable = build_searchable_backup(&path, artist, title, year);
+    let searchable = build_searchable_backup(path, artist, title, year);
 
     // Fetch the tag by type (creating it if missing) so this never depends on
     // whether that type happens to be the file's "primary" tag.
     if tagged.tag(tag_type).is_none() {
         tagged.insert_tag(Tag::new(tag_type));
     }
-    let key = backup_item_key(&backup_field);
+    let key = backup_item_key(backup_field);
     let tag = tagged
         .tag_mut(tag_type)
         .expect("tag of tag_type was just ensured");
@@ -471,7 +498,7 @@ pub async fn backup_file(path: String, backup_field: String) -> Result<(), Strin
         ));
     }
     tagged
-        .save_to_path(&path, WriteOptions::default())
+        .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())
 }
 

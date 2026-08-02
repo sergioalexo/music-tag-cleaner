@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Plus, PlugZap, X } from "lucide-react";
 import type {
   Capitalization,
@@ -7,7 +8,7 @@ import type {
   OllamaStatus,
   Settings,
 } from "../types";
-import { CLEARABLE_FIELDS, FIELD_LABELS } from "../types";
+import { CLEARABLE_FIELDS, FIELD_LABELS, TRANSLITERATE_SCRIPTS } from "../types";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
 import { Combobox } from "../components/Combobox";
 
@@ -51,6 +52,32 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
+  const [promptOpen, setPromptOpen] = useState(false);
+  const [promptText, setPromptText] = useState("");
+  const [promptLoading, setPromptLoading] = useState(false);
+
+  const viewPrompt = async () => {
+    setPromptOpen(true);
+    setPromptLoading(true);
+    try {
+      const text = await invoke<string>("ai_preview_prompt", {
+        transliterateScripts: settings.transliterateScripts,
+      });
+      setPromptText(text);
+    } catch (e) {
+      setPromptText(`Could not load the prompt: ${e}`);
+    } finally {
+      setPromptLoading(false);
+    }
+  };
+
+  const toggleScript = (id: string) =>
+    set(
+      "transliterateScripts",
+      settings.transliterateScripts.includes(id)
+        ? settings.transliterateScripts.filter((s) => s !== id)
+        : [...settings.transliterateScripts, id],
+    );
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     onSave({ ...settings, [key]: value });
@@ -102,6 +129,7 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
   }, []);
 
   return (
+    <>
     <div className="mx-auto max-w-3xl space-y-4 p-6">
       <div>
         <h1 className="text-xl font-bold">Settings</h1>
@@ -183,6 +211,41 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
                   }. Make sure Ollama is running locally. Download at ollama.com`}
             </p>
           )}
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="AI Clean"
+          hint="What the AI Clean button actually does to Artist, Title, Year, and Genre"
+        />
+        <div className="px-5 py-2">
+          <Row label="See the exact instructions" hint="The real prompt sent to the model, not a summary">
+            <Button variant="secondary" size="sm" onClick={viewPrompt}>
+              View AI instructions
+            </Button>
+          </Row>
+          <div className="border-t py-3">
+            <div className="mb-1 text-sm font-medium">Foreign alphabets</div>
+            <p className="mb-2 text-xs text-muted-foreground">
+              For scripts you check here, AI Clean transliterates Artist/Title into Latin letters
+              (phonetic spelling) instead of keeping the original script — handy if you can't read
+              it yourself. Unchecked scripts are always preserved exactly as written.
+            </p>
+            <div className="flex flex-wrap gap-x-6 gap-y-1">
+              {TRANSLITERATE_SCRIPTS.map((s) => (
+                <label key={s.id} className="flex items-center gap-2 text-sm" title={s.hint}>
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--primary)]"
+                    checked={settings.transliterateScripts.includes(s.id)}
+                    onChange={() => toggleScript(s.id)}
+                  />
+                  {s.label}
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
       </Card>
 
@@ -513,5 +576,39 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
         </div>
       </Card>
     </div>
+
+    {promptOpen && (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+        onClick={() => setPromptOpen(false)}
+      >
+        <Card className="max-h-[85vh] w-[700px] overflow-y-auto">
+          <div onClick={(e) => e.stopPropagation()} className="p-5">
+            <div className="mb-1 flex items-start justify-between gap-4">
+              <h2 className="text-sm font-semibold">Exact AI Clean instructions</h2>
+              <button
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => setPromptOpen(false)}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mb-4 text-xs text-muted-foreground">
+              This is the literal system prompt sent to the model for every AI Clean run, including
+              your current foreign-alphabet choices above. The track list (filename, artist, title,
+              year, genre) is appended after it.
+            </p>
+            {promptLoading ? (
+              <p className="text-xs text-muted-foreground">Loading…</p>
+            ) : (
+              <pre className="whitespace-pre-wrap rounded-md border bg-secondary/40 p-3 text-xs">
+                {promptText}
+              </pre>
+            )}
+          </div>
+        </Card>
+      </div>
+    )}
+    </>
   );
 }

@@ -108,9 +108,23 @@ export interface Settings {
   nextTrackId: number;
   /** Fields the "Clear Fields" action empties. */
   clearFields: string[];
+  /**
+   * Non-Latin scripts (from TRANSLITERATE_SCRIPTS) that AI Clean should
+   * romanize to Latin letters instead of preserving as-is.
+   */
+  transliterateScripts: string[];
   /** Bumped when defaults change so saved settings can be migrated. */
   settingsVersion: number;
 }
+
+/** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */
+export const TRANSLITERATE_SCRIPTS = [
+  { id: "Cyrillic", label: "Cyrillic", hint: "Russian, Ukrainian, Bulgarian, Serbian…" },
+  { id: "Hebrew", label: "Hebrew", hint: "" },
+  { id: "Arabic", label: "Arabic", hint: "" },
+  { id: "Greek", label: "Greek", hint: "" },
+  { id: "Chinese/Japanese/Korean", label: "Chinese / Japanese / Korean", hint: "" },
+] as const;
 
 export type PreviewMode = "strip" | "ai" | "standardize" | "genre" | "clear";
 

@@ -34,6 +34,20 @@ interface Toast {
   kind: "success" | "error" | "info";
 }
 
+interface HistoryChange {
+  path: string;
+  field: string;
+  before: string | number;
+  after: string | number;
+}
+
+interface HistoryEntry {
+  label: string;
+  changes: HistoryChange[];
+}
+
+const HISTORY_LIMIT = 50;
+
 let toastId = 0;
 
 export default function App() {
@@ -67,6 +81,66 @@ export default function App() {
   const [tagsMap, setTagsMap] = useState<Record<string, TagData>>({});
   const [busy, setBusy] = useState(false);
   const [aiRunning, setAiRunning] = useState(false);
+  const [backupRunning, setBackupRunning] = useState(false);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [redoStack, setRedoStack] = useState<HistoryEntry[]>([]);
+
+  const pushHistory = (entry: HistoryEntry) => {
+    if (!entry.changes.length) return;
+    setHistory((h) => [...h.slice(-(HISTORY_LIMIT - 1)), entry]);
+    setRedoStack([]);
+  };
+
+  /** Writes `before` (undo) or `after` (redo) for every change in `changes`. */
+  const applyHistoryChanges = async (changes: HistoryChange[], useAfter: boolean) => {
+    const paths = [...new Set(changes.map((c) => c.path))];
+    const { map } = await tagsApi.read(paths);
+    for (const c of changes) {
+      const current = map[c.path];
+      if (!current) continue;
+      const value = useAfter ? c.after : c.before;
+      const field = c.field as keyof TagData & string;
+      const tagsForWrite = c.field === "rating" ? { ...current, rating: Number(value) } : current;
+      await tagsApi.updateField(c.path, tagsForWrite, field, value, settings);
+      (map[c.path] as unknown as Record<string, string | number>)[c.field] = value;
+    }
+  };
+
+  const undo = async () => {
+    const entry = history[history.length - 1];
+    if (!entry || busy) return;
+    setBusy(true);
+    try {
+      await applyHistoryChanges(entry.changes, false);
+      setHistory((h) => h.slice(0, -1));
+      setRedoStack((r) => [...r, entry]);
+      setLibraryTags({});
+      await filesApi.refresh();
+      notify(`Undid: ${entry.label}`, "success");
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const redo = async () => {
+    const entry = redoStack[redoStack.length - 1];
+    if (!entry || busy) return;
+    setBusy(true);
+    try {
+      await applyHistoryChanges(entry.changes, true);
+      setRedoStack((r) => r.slice(0, -1));
+      setHistory((h) => [...h, entry]);
+      setLibraryTags({});
+      await filesApi.refresh();
+      notify(`Redid: ${entry.label}`, "success");
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
   const [dropActive, setDropActive] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number; label: string } | null>(
     null,
@@ -331,6 +405,15 @@ export default function App() {
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(`Updated ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
+      // Strip removes arbitrary non-common fields we don't have "before" values
+      // for beyond what's shown here, so it isn't added to the undo stack —
+      // "Restore Backup" is the full-fidelity revert path for that action.
+      if (previewMode !== "strip") {
+        const changes = pending
+          .filter((r) => r.kind === "update" && r.changed && r.include)
+          .map((r) => ({ path: r.path, field: r.field, before: r.before, after: r.after }));
+        pushHistory({ label: `Apply ${previewMode}`, changes });
+      }
       await afterWrite(affected);
     } catch (e) {
       notify(String(e), "error");
@@ -394,32 +477,65 @@ export default function App() {
     }
   };
 
-  const editField = async (path: string, field: keyof TagData & string, value: string) => {
-    const current = libraryTags[path];
-    if (!current) return;
+  /** Edits `field` on every path in `paths` (multi-select bulk edit shares one value). */
+  const editField = async (paths: string[], field: keyof TagData & string, value: string) => {
     setBusy(true);
     try {
-      await tagsApi.updateField(path, current, field, value, settings);
-      setLibraryTags((prev) => ({ ...prev, [path]: { ...prev[path], [field]: value } }));
-      clearUnresolved(path);
+      const changes: HistoryChange[] = [];
+      for (const path of paths) {
+        const current = libraryTags[path];
+        if (!current) continue;
+        const before = (current as unknown as Record<string, string | undefined>)[field] ?? "";
+        if (before === value) continue;
+        await tagsApi.updateField(path, current, field, value, settings);
+        changes.push({ path, field, before, after: value });
+        clearUnresolved(path);
+      }
+      if (changes.length) {
+        setLibraryTags((prev) => {
+          const next = { ...prev };
+          for (const c of changes) next[c.path] = { ...next[c.path], [field]: value };
+          return next;
+        });
+        pushHistory({
+          label: `Edit ${FIELD_LABELS[field] ?? field}${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
+          changes,
+        });
+      }
       await filesApi.refresh();
     } catch (e) {
-      notify(`${path}: ${e}`, "error");
+      notify(String(e), "error");
     } finally {
       setBusy(false);
     }
   };
 
-  const editRating = async (path: string, stars: number) => {
-    const current = libraryTags[path];
-    if (!current) return;
+  const editRating = async (paths: string[], stars: number) => {
     setBusy(true);
     try {
-      await tagsApi.updateField(path, { ...current, rating: stars }, "rating", stars, settings);
-      setLibraryTags((prev) => ({ ...prev, [path]: { ...prev[path], rating: stars } }));
+      const changes: HistoryChange[] = [];
+      for (const path of paths) {
+        const current = libraryTags[path];
+        if (!current) continue;
+        const before = current.rating ?? 0;
+        if (before === stars) continue;
+        await tagsApi.updateField(path, { ...current, rating: stars }, "rating", stars, settings);
+        changes.push({ path, field: "rating", before, after: stars });
+      }
+      if (changes.length) {
+        setLibraryTags((prev) => {
+          const next = { ...prev };
+          for (const c of changes) next[c.path] = { ...next[c.path], rating: stars };
+          return next;
+        });
+        pushHistory({
+          label: `Set rating${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
+          changes,
+        });
+      }
       await filesApi.refresh();
     } catch (e) {
-      notify(`${path}: ${e}`, "error");
+      notify(String(e), "error");
     } finally {
       setBusy(false);
     }
@@ -429,15 +545,21 @@ export default function App() {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
     setBusy(true);
+    setBackupRunning(true);
     try {
-      const result = await tagsApi.backupSelected(paths, settings);
+      const result = await tagsApi.backupSelected(paths, settings, (done, total) =>
+        setProgress({ done, total, label: `Backing up ${Math.min(done + 1, total)} of ${total}` }),
+      );
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(`Backed up ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
+      if (result.stopped) notify("Backup stopped", "info");
       await afterWrite(paths);
     } catch (e) {
       notify(String(e), "error");
     } finally {
+      setProgress(null);
+      setBackupRunning(false);
       setBusy(false);
     }
   };
@@ -476,18 +598,52 @@ export default function App() {
     );
     if (!ok) return;
     setBusy(true);
+    setBackupRunning(true);
     try {
-      const result = await tagsApi.restore(paths);
+      const result = await tagsApi.restore(paths, (done, total) =>
+        setProgress({ done, total, label: `Restoring ${Math.min(done + 1, total)} of ${total}` }),
+      );
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(
           `Restored original tags for ${result.written} file${result.written === 1 ? "" : "s"}`,
           "success",
         );
+      if (result.stopped) notify("Restore stopped", "info");
       await afterWrite(paths);
     } finally {
+      setProgress(null);
+      setBackupRunning(false);
       setBusy(false);
     }
+  };
+
+  /** Adds a genre to the active preset (used by the "+" row in the table's genre editor). */
+  const addGenreToPreset = (genre: string) => {
+    const trimmed = genre.trim();
+    if (!trimmed) return;
+    const preset = activePreset(settings.genrePresets, settings.activeGenrePreset);
+    if (!preset || preset.genres.some((g) => g.toLowerCase() === trimmed.toLowerCase())) return;
+    save({
+      ...settings,
+      genrePresets: settings.genrePresets.map((p) =>
+        p.name === settings.activeGenrePreset ? { ...p, genres: [...p.genres, trimmed] } : p,
+      ),
+    });
+  };
+
+  /** Renames a genre within the active preset in place. */
+  const renameGenreInPreset = (oldName: string, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName) return;
+    save({
+      ...settings,
+      genrePresets: settings.genrePresets.map((p) =>
+        p.name === settings.activeGenrePreset
+          ? { ...p, genres: p.genres.map((g) => (g === oldName ? trimmed : g)) }
+          : p,
+      ),
+    });
   };
 
   const inspect = (file: AudioFile) => {
@@ -495,15 +651,28 @@ export default function App() {
     if (tags) setInspected({ file, tags });
   };
 
-  // Keyboard shortcuts: Ctrl+O folder, Ctrl+A select all, Escape close.
+  // Keyboard shortcuts: Ctrl+O folder, Ctrl+A select all, Ctrl+Z/Shift+Z undo/redo, Escape close.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Let the browser handle native undo/redo while typing in a cell editor
+      // or any other text field instead of hijacking it for tag history.
+      const isEditable =
+        target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+
       if (e.ctrlKey && e.key.toLowerCase() === "o") {
         e.preventDefault();
         if (!busy) filesApi.selectFolder();
       } else if (e.ctrlKey && e.key.toLowerCase() === "a") {
         e.preventDefault();
         filesApi.setAll(true);
+      } else if (e.ctrlKey && !isEditable && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) void redo();
+        else void undo();
+      } else if (e.ctrlKey && !isEditable && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        void redo();
       } else if (e.key === "Escape") {
         if (inspected) setInspected(null);
         else if (pending) setPending(null);
@@ -534,6 +703,12 @@ export default function App() {
               settings={settings}
               busy={busy || filesApi.scanning}
               aiRunning={aiRunning}
+              backupRunning={backupRunning}
+              onStopBackup={tagsApi.stopBackup}
+              canUndo={history.length > 0}
+              canRedo={redoStack.length > 0}
+              onUndo={undo}
+              onRedo={redo}
               pending={pending}
               previewMode={previewMode}
               lastFolder={settings.lastFolder}
@@ -549,6 +724,8 @@ export default function App() {
               onGenerateIds={generateIds}
               onRename={renameToStandard}
               onClearFields={runClearFields}
+              onAddGenre={addGenreToPreset}
+              onRenameGenre={renameGenreInPreset}
               onBackup={runBackup}
               onRestore={restoreBackup}
               onEditField={editField}

@@ -1,0 +1,64 @@
+name: release
+
+# Push a tag like "v0.2.0" to build, sign, and publish a GitHub Release with
+# the updater's latest.json manifest — the in-app "Check for Updates" button
+# (Components page) reads that manifest to find and verify new versions.
+#
+# One-time setup required before this workflow can sign anything:
+#   1. Generate a signing keypair locally:
+#        npx @tauri-apps/cli signer generate -w ~/.tauri/music-tag-cleaner.key
+#      This prints a public key — paste it into `plugins.updater.pubkey` in
+#      src-tauri/tauri.conf.json (replacing the placeholder).
+#   2. In the GitHub repo settings -> Secrets and variables -> Actions, add:
+#        TAURI_SIGNING_PRIVATE_KEY          (contents of the .key file)
+#        TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the password you set, if any)
+#   The private key never belongs in this repo or in this workflow file.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+          - platform: macos-latest
+          - platform: ubuntu-22.04
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Music Tag Cleaner ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false

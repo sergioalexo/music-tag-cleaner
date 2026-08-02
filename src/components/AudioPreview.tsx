@@ -50,10 +50,16 @@ export function AudioPreview({ path }: { path: string }) {
     if (!el) return;
     el.currentTime = Number(e.target.value);
     setTime(el.currentTime);
+    // Clicking/dragging the scrub bar auto-starts playback if it's paused.
+    if (!playing) {
+      if (stopOthers && stopOthers !== pause) stopOthers();
+      stopOthers = pause;
+      void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    }
   };
 
   return (
-    <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+    <div className="flex min-w-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
       <audio
         ref={audioRef}
         preload="none"
@@ -83,8 +89,8 @@ export function AudioPreview({ path }: { path: string }) {
         onChange={seek}
         onMouseDown={(e) => e.stopPropagation()}
         disabled={!ready || !duration}
-        className="h-1 flex-1 cursor-pointer accent-[var(--primary)] disabled:opacity-40"
-        title="Scrub"
+        className="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--primary)] disabled:opacity-40"
+        title="Scrub — click to play from here"
       />
     </div>
   );

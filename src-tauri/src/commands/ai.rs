@@ -4,7 +4,35 @@ use serde_json::{json, Value};
 
 use crate::models::{CleanedTrack, GenreInput, GenreResult, OllamaStatus, TrackInput};
 
-const SYSTEM_PROMPT: &str = r#"You are a music metadata cleanup expert. You will receive a list of audio tracks with messy metadata and must return cleaned versions.
+/// Non-Latin writing systems the user can opt into transliterating. Names
+/// must match what the frontend's TRANSLITERATE_SCRIPTS list sends.
+const SCRIPTS: &[&str] = &["Cyrillic", "Hebrew", "Arabic", "Greek", "Chinese/Japanese/Korean"];
+
+fn script_rules(transliterate: &[String]) -> String {
+    SCRIPTS
+        .iter()
+        .map(|name| {
+            let wants_transliteration = transliterate.iter().any(|s| s.eq_ignore_ascii_case(name));
+            let instruction = if wants_transliteration {
+                "transliterate it phonetically into Latin letters (romanize how it sounds — do not translate the meaning)"
+            } else {
+                "keep it exactly as written — do not transliterate or translate it"
+            };
+            format!("   - {name}: {instruction}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Builds the exact prompt sent to the model. `transliterate` lists the
+/// scripts (from `SCRIPTS`) the user wants romanized instead of preserved —
+/// also used verbatim by `ai_preview_prompt` so the Settings UI can show the
+/// user precisely what will be sent, never a hand-written summary that could
+/// drift out of sync.
+fn build_system_prompt(transliterate: &[String]) -> String {
+    let rules = script_rules(transliterate);
+    format!(
+        r#"You are a music metadata cleanup expert. You will receive a list of audio tracks with messy metadata and must return cleaned versions.
 RULES:
 1. ARTIST: Keep only the main/lead artist. Remove all of the following from the artist field:
    - Legal full names (e.g. "Benito Antonio Martinez Ocasio" → remove, keep "Bad Bunny")
@@ -27,20 +55,32 @@ RULES:
 3. YEAR: Return the ORIGINAL release year of the song (when it was first ever released commercially or publicly), NOT the year of a remaster, re-release, streaming upload, or compilation. Use your music knowledge. If you are not certain, leave the existing year unchanged.
 4. GENRE: Normalize to a standard single genre. Use common terms like: Pop, Rock, Hip-Hop, R&B, Reggaeton, House, Techno, Trance, Electronic, Dance, Folk, Country, Jazz, Classical, Metal, Punk, Soul, Funk, Latin, Reggae, Indie, Alternative. Do not use subgenres unless they are very widely recognized.
 5. Do NOT change Album, Track Number, Disc Number, or Album Artist unless they are clearly wrong.
-6. Preserve non-Latin scripts (Cyrillic, Hebrew, Arabic, Ukrainian, etc.) correctly.
+6. SCRIPTS: Apply this per writing system, to both Artist and Title:
+{rules}
+   Any other non-Latin script not listed above: keep it exactly as written.
 7. For mashups (two songs blended together), keep the mashup creator as the artist and format the title as: "Song1 N Song2"
 8. FILENAME FALLBACK: Every track includes a "filename" field. When the artist or title is empty, missing, or clearly junk, derive them from the filename — filenames are usually "Artist - Title" or "Artist - Title (Mix)". Apply all the cleaning rules above to values you take from the filename. If, after using both the metadata AND the filename, you still cannot determine the artist or the title, return an empty string "" for that field (do not guess a random value).
 OUTPUT FORMAT: Return ONLY a valid JSON array, no explanation, no markdown, no preamble:
 [
-  {
+  {{
     "index": 1,
     "artist": "cleaned artist",
     "title": "cleaned title",
     "year": "YYYY",
     "genre": "Genre"
-  },
+  }},
   ...
-]"#;
+]"#
+    )
+}
+
+/// Returns the exact prompt `ai_clean_batch` would send for the given
+/// transliteration choices, without needing a track list — used by the
+/// Settings UI's "What does AI Clean do?" viewer.
+#[tauri::command]
+pub fn ai_preview_prompt(transliterate_scripts: Vec<String>) -> String {
+    build_system_prompt(&transliterate_scripts)
+}
 
 #[tauri::command]
 pub async fn check_ollama(url: String) -> OllamaStatus {
@@ -100,9 +140,11 @@ pub async fn ai_clean_batch(
     url: String,
     model: String,
     tracks: Vec<TrackInput>,
+    transliterate_scripts: Vec<String>,
 ) -> Result<Vec<CleanedTrack>, String> {
     let track_list = serde_json::to_string_pretty(&tracks).map_err(|e| e.to_string())?;
-    let prompt = format!("{SYSTEM_PROMPT}\n\nTrack list to clean:\n{track_list}");
+    let system_prompt = build_system_prompt(&transliterate_scripts);
+    let prompt = format!("{system_prompt}\n\nTrack list to clean:\n{track_list}");
     let body = json!({
         "model": model,
         "prompt": prompt,

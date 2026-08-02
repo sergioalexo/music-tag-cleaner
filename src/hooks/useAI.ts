@@ -85,6 +85,7 @@ export function useAI() {
         url: settings.ollamaUrl,
         model,
         tracks: batch,
+        transliterateScripts: settings.transliterateScripts,
       });
       // Discard a batch that finished after the user asked to stop.
       if (stopRef.current) break;

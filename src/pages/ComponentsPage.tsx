@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   Boxes,
   CheckCircle2,
@@ -10,7 +13,9 @@ import {
   Loader2,
   Play,
   RefreshCw,
+  RotateCw,
   Server,
+  Sparkles,
   XCircle,
 } from "lucide-react";
 import type { ComponentProgress, OllamaInfo, OllamaStatus } from "../types";
@@ -64,6 +69,59 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
   const [pullName, setPullName] = useState("");
   const [progress, setProgress] = useState<ComponentProgress | null>(null);
   const pollTimer = useRef<number | null>(null);
+
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [updateChecked, setUpdateChecked] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  );
+  const [installed, setInstalled] = useState(false);
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(null));
+  }, []);
+
+  const checkForUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const result = await check();
+      setUpdate(result);
+      setUpdateChecked(true);
+      if (!result) notify("You're on the latest version", "success");
+    } catch (e) {
+      notify(`Could not check for updates: ${e}`, "error");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!update) return;
+    setDownloading(true);
+    setDownloadProgress(null);
+    try {
+      let total = 0;
+      let done = 0;
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+          setDownloadProgress({ done: 0, total });
+        } else if (event.event === "Progress") {
+          done += event.data.chunkLength;
+          setDownloadProgress({ done, total });
+        }
+      });
+      setInstalled(true);
+      notify(`Version ${update.version} installed — restart to apply`, "success");
+    } catch (e) {
+      notify(`Update failed: ${e}`, "error");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -173,6 +231,87 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
           Refresh
         </Button>
       </div>
+
+      {/* Music Tag Cleaner itself */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">
+              <Sparkles className="h-5 w-5 text-muted-foreground" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">Music Tag Cleaner</span>
+                <Badge className="bg-secondary">v{appVersion ?? "…"}</Badge>
+                {update && (
+                  <Badge className="gap-1 bg-primary/15 text-primary">
+                    <CheckCircle2 className="h-3 w-3" /> v{update.version} available
+                  </Badge>
+                )}
+              </div>
+              <button
+                onClick={() => void openUrl("https://github.com/sergioalexo/music-tag-cleaner/releases")}
+                className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"
+              >
+                Release notes <ExternalLink className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 gap-2">
+            {installed ? (
+              <Button size="sm" onClick={() => void relaunch()}>
+                <RefreshCw />
+                Restart to Apply
+              </Button>
+            ) : update ? (
+              <Button size="sm" onClick={installUpdate} disabled={downloading}>
+                {downloading ? <Loader2 className="animate-spin" /> : <Download />}
+                {downloading ? "Installing…" : `Install v${update.version}`}
+              </Button>
+            ) : (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={checkForUpdate}
+                disabled={checkingUpdate}
+              >
+                <RotateCw className={checkingUpdate ? "animate-spin" : ""} />
+                {checkingUpdate ? "Checking…" : "Check for Updates"}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {updateChecked && !update && !checkingUpdate && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            You're running the latest version.
+          </p>
+        )}
+
+        {update?.body && (
+          <p className="mt-3 whitespace-pre-wrap rounded-md bg-secondary/50 p-3 text-xs text-muted-foreground">
+            {update.body}
+          </p>
+        )}
+
+        {downloading && (
+          <div className="mt-3">
+            <ProgressBar
+              value={
+                downloadProgress && downloadProgress.total > 0
+                  ? downloadProgress.done / downloadProgress.total
+                  : null
+              }
+            />
+            <div className="mt-1 text-xs text-muted-foreground">
+              {downloadProgress && downloadProgress.total > 0
+                ? `Downloading ${formatBytes(downloadProgress.done)} / ${formatBytes(downloadProgress.total)}`
+                : "Downloading update…"}
+            </div>
+          </div>
+        )}
+      </Card>
 
       {/* Ollama runtime */}
       <Card className="p-5">

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Filter, Music, Rows3, SlidersHorizontal } from "lucide-react";
-import type { AudioFile, RowHeight, TagData } from "../types";
+import type { AudioFile, PendingChange, RowHeight, TagData } from "../types";
 import { formatBytes } from "../types";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { AudioPreview } from "./AudioPreview";
@@ -89,9 +89,14 @@ interface Props {
   onVisibleColumnsChange: (columns: string[]) => void;
   onColumnWidthsChange: (widths: Record<string, number>) => void;
   onRowHeightChange: (height: RowHeight) => void;
-  onEditField: (path: string, field: keyof TagData & string, value: string) => void;
-  onEditRating: (path: string, stars: number) => void;
+  onEditField: (paths: string[], field: keyof TagData & string, value: string) => void;
+  onEditRating: (paths: string[], stars: number) => void;
   onInspect: (file: AudioFile) => void;
+  onAddGenre: (genre: string) => void;
+  onRenameGenre: (oldName: string, newName: string) => void;
+  /** Non-strip pending changes (AI/Standardize/Genre/Clear) shown inline as before → after diffs. */
+  pending: PendingChange[] | null;
+  onPendingChange: (rows: PendingChange[]) => void;
 }
 
 export function TrackTable({
@@ -113,6 +118,10 @@ export function TrackTable({
   onEditField,
   onEditRating,
   onInspect,
+  onAddGenre,
+  onRenameGenre,
+  pending,
+  onPendingChange,
 }: Props) {
   const [widths, setWidths] = useState<Record<string, number>>(columnWidths);
   const widthsRef = useRef(widths);
@@ -135,7 +144,12 @@ export function TrackTable({
   }, [pickerOpen]);
 
   const rh = ROW_STYLE[rowHeight];
-  const columns = ALL_COLUMNS.filter((c) => visibleColumns.includes(c.id));
+  const columnById = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
+  // Order follows visibleColumns (drag-and-drop reorders that array), not
+  // ALL_COLUMNS' fixed definition order.
+  const columns = visibleColumns
+    .map((id) => columnById.get(id))
+    .filter((c): c is ColumnDef => !!c);
   const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
   const totalWidth = 36 + rh.art + columns.reduce((sum, c) => sum + widthOf(c), 0);
 
@@ -151,6 +165,13 @@ export function TrackTable({
   let rows = files;
   if (onlyFlagged) rows = rows.filter((f) => flagged.has(f.path));
   if (onlyUnresolved) rows = rows.filter((f) => unresolved.has(f.path));
+
+  /** Pending AI/Standardize/Genre/Clear changes, keyed by "path::field" for O(1) cell lookup. */
+  const pendingByKey = useMemo(() => {
+    const m = new Map<string, PendingChange>();
+    if (pending) for (const r of pending) if (r.changed) m.set(`${r.path}::${r.field}`, r);
+    return m;
+  }, [pending]);
 
   const startResize = (e: React.MouseEvent, colId: string, startWidth: number) => {
     e.preventDefault();
@@ -171,9 +192,24 @@ export function TrackTable({
   const toggleColumn = (id: string) => {
     const next = visibleColumns.includes(id)
       ? visibleColumns.filter((c) => c !== id)
-      : ALL_COLUMNS.map((c) => c.id).filter((c) => visibleColumns.includes(c) || c === id);
+      : [...visibleColumns, id];
     if (next.length === 0) return;
     onVisibleColumnsChange(next);
+  };
+
+  const [dragCol, setDragCol] = useState<string | null>(null);
+  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
+
+  const reorderColumn = (fromId: string, toId: string) => {
+    if (fromId === toId) return;
+    const order = visibleColumns.slice();
+    const fromIdx = order.indexOf(fromId);
+    if (fromIdx === -1) return;
+    order.splice(fromIdx, 1);
+    const toIdx = order.indexOf(toId);
+    if (toIdx === -1) return;
+    order.splice(toIdx, 0, fromId);
+    onVisibleColumnsChange(order);
   };
 
   const cycleRowHeight = () => {
@@ -186,15 +222,33 @@ export function TrackTable({
     setDraft(value);
   };
 
+  /** A multi-selected row's edit applies to every selected row, not just the one clicked. */
+  const targetPaths = (path: string): string[] =>
+    selected.has(path) && selected.size > 1 ? [...selected] : [path];
+
+  /** Edits the proposed "after" value of a pending change instead of writing to disk. */
+  const editPendingAfter = (id: string, after: string) => {
+    if (!pending) return;
+    onPendingChange(
+      pending.map((r) => (r.id === id ? { ...r, after, changed: after !== r.before, include: after !== r.before } : r)),
+    );
+  };
+
   const commitEdit = (override?: string) => {
     if (!editing) return;
     const value = override ?? draft;
+    const pend = pendingByKey.get(`${editing.path}::${editing.field}`);
+    if (pend) {
+      editPendingAfter(pend.id, value);
+      setEditing(null);
+      return;
+    }
     const current = tags[editing.path];
     const original = current
       ? ((current as unknown as Record<string, string | undefined>)[editing.field] ?? "")
       : "";
     if (value !== original) {
-      onEditField(editing.path, editing.field as keyof TagData & string, value);
+      onEditField(targetPaths(editing.path), editing.field as keyof TagData & string, value);
     }
     setEditing(null);
   };
@@ -328,16 +382,38 @@ export function TrackTable({
                 {columns.map((c) => (
                   <th
                     key={c.id}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.effectAllowed = "move";
+                      setDragCol(c.id);
+                    }}
+                    onDragEnter={() => dragCol && dragCol !== c.id && setDragOverCol(c.id)}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (dragCol) reorderColumn(dragCol, c.id);
+                      setDragCol(null);
+                      setDragOverCol(null);
+                    }}
+                    onDragEnd={() => {
+                      setDragCol(null);
+                      setDragOverCol(null);
+                    }}
                     className={cn(
-                      "relative select-none whitespace-nowrap px-3 py-2 font-medium text-muted-foreground",
+                      "relative cursor-move select-none whitespace-nowrap px-3 py-2 font-medium text-muted-foreground",
                       headerSep,
                       c.align === "right" && "text-right",
                       c.align === "center" && "text-center",
+                      dragCol === c.id && "opacity-40",
+                      dragOverCol === c.id && "bg-accent/40",
                     )}
+                    title="Drag to reorder"
                   >
                     {c.label}
                     <span
                       className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
+                      draggable
+                      onDragStart={(e) => e.preventDefault()}
                       onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
                       title="Drag to resize"
                     >
@@ -408,7 +484,7 @@ export function TrackTable({
                     {columns.map((c) => {
                       if (c.custom === "preview") {
                         return (
-                          <td key={c.id} className={cn("px-2", rh.py)}>
+                          <td key={c.id} className={cn("overflow-hidden px-2", rh.py)}>
                             <AudioPreview path={f.path} />
                           </td>
                         );
@@ -423,13 +499,14 @@ export function TrackTable({
                             <Stars
                               value={t?.rating ?? 0}
                               readOnly={!t}
-                              onChange={(n) => onEditRating(f.path, n)}
+                              onChange={(n) => onEditRating(targetPaths(f.path), n)}
                             />
                           </td>
                         );
                       }
                       const isEditing = editing?.path === f.path && editing.field === c.id && c.field;
                       const value = c.value(f, t);
+                      const pend = c.field ? pendingByKey.get(`${f.path}::${c.id}`) : undefined;
                       return (
                         <td
                           key={c.id}
@@ -440,18 +517,25 @@ export function TrackTable({
                             c.align === "right" && "text-right",
                             c.align === "center" && "text-center",
                             c.field && "cursor-text",
+                            pend && "bg-primary/5",
                           )}
-                          title={c.id === "filename" ? f.path : value}
+                          title={
+                            pend
+                              ? `${pend.before || "(empty)"} → ${pend.after || "(empty)"} — click to ${pend.include ? "exclude" : "include"}, double-click to edit`
+                              : c.id === "filename"
+                                ? f.path
+                                : value
+                          }
                           onClick={(e) => {
                             if (isEditing) e.stopPropagation();
                           }}
                           onDoubleClick={(e) => {
                             if (!c.field) return;
                             e.stopPropagation();
-                            beginEdit(f.path, c.id, value);
+                            beginEdit(f.path, c.id, pend ? pend.after : value);
                           }}
                         >
-                          {isEditing && c.field === "genre" && genreOptions.length > 0 ? (
+                          {isEditing && c.field === "genre" ? (
                             <Combobox
                               value={draft}
                               options={genreOptions}
@@ -459,6 +543,8 @@ export function TrackTable({
                               autoFocus
                               onChange={(v) => commitEdit(v)}
                               onClose={() => setEditing(null)}
+                              onCreate={onAddGenre}
+                              onEditOption={onRenameGenre}
                             />
                           ) : isEditing ? (
                             <input
@@ -472,6 +558,39 @@ export function TrackTable({
                               }}
                               className="w-full rounded border border-primary bg-background px-1 py-0.5 text-xs outline-none"
                             />
+                          ) : pend ? (
+                            <label
+                              className="flex items-center gap-1"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <input
+                                type="checkbox"
+                                className="shrink-0 accent-[var(--primary)]"
+                                checked={pend.include}
+                                onChange={() =>
+                                  onPendingChange(
+                                    pending!.map((r) =>
+                                      r.id === pend.id ? { ...r, include: !r.include } : r,
+                                    ),
+                                  )
+                                }
+                              />
+                              <span className={cn("truncate", !pend.include && "opacity-50")}>
+                                {pend.kind === "remove" ? (
+                                  <span className="text-destructive line-through">{pend.before}</span>
+                                ) : (
+                                  <>
+                                    {pend.before && (
+                                      <span className="text-muted-foreground line-through">
+                                        {pend.before}
+                                      </span>
+                                    )}
+                                    <span className="mx-1 text-muted-foreground">→</span>
+                                    <span className="font-medium text-primary">{pend.after}</span>
+                                  </>
+                                )}
+                              </span>
+                            </label>
                           ) : t || !c.field ? (
                             renderCellValue(c, value)
                           ) : (

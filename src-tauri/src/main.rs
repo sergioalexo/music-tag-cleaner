@@ -8,6 +8,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             commands::files::scan_folder,
             commands::files::list_files,
@@ -22,6 +24,7 @@ fn main() {
             commands::ai::check_ollama,
             commands::ai::ai_clean_batch,
             commands::ai::ai_map_genre_batch,
+            commands::ai::ai_preview_prompt,
             commands::components::ollama_info,
             commands::components::install_ollama,
             commands::components::start_ollama,

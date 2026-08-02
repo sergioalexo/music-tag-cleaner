@@ -5,6 +5,8 @@ import {
   FolderOpen,
   Hash,
   Paintbrush,
+  RotateCcw,
+  RotateCw,
   Sparkles,
   SquarePen,
   StopCircle,
@@ -40,6 +42,12 @@ interface Props {
   settings: Settings;
   busy: boolean;
   aiRunning: boolean;
+  backupRunning: boolean;
+  onStopBackup: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
   pending: PendingChange[] | null;
   previewMode: PreviewMode;
   lastFolder: string;
@@ -55,10 +63,12 @@ interface Props {
   onGenerateIds: () => void;
   onRename: () => void;
   onClearFields: () => void;
+  onAddGenre: (genre: string) => void;
+  onRenameGenre: (oldName: string, newName: string) => void;
   onBackup: () => void;
   onRestore: () => void;
-  onEditField: (path: string, field: keyof TagData & string, value: string) => void;
-  onEditRating: (path: string, stars: number) => void;
+  onEditField: (paths: string[], field: keyof TagData & string, value: string) => void;
+  onEditRating: (paths: string[], stars: number) => void;
   onInspect: (file: AudioFile) => void;
   onSaveSettings: (settings: Settings) => void;
 }
@@ -71,6 +81,12 @@ export function LibraryPage({
   settings,
   busy,
   aiRunning,
+  backupRunning,
+  onStopBackup,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
   pending,
   previewMode,
   lastFolder,
@@ -86,6 +102,8 @@ export function LibraryPage({
   onGenerateIds,
   onRename,
   onClearFields,
+  onAddGenre,
+  onRenameGenre,
   onBackup,
   onRestore,
   onEditField,
@@ -99,6 +117,24 @@ export function LibraryPage({
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
   ).length;
   const genreOptions = activePreset(settings.genrePresets, settings.activeGenrePreset)?.genres ?? [];
+
+  // AI/Standardize/Genre/Clear previews are shown inline in the table itself.
+  // Strip keeps the dedicated table below, since it removes arbitrary custom
+  // tag fields that have no corresponding column to show a diff in.
+  const inlinePreview = !!pending && previewMode !== "strip";
+  const changedCount = pending?.filter((r) => r.changed).length ?? 0;
+  const includedCount = pending?.filter((r) => r.changed && r.include).length ?? 0;
+  const fileCount = pending
+    ? new Set(pending.filter((r) => r.changed && r.include).map((r) => r.path)).size
+    : 0;
+  const modeLabel =
+    previewMode === "ai"
+      ? "AI Cleanup"
+      : previewMode === "genre"
+        ? "Genre Match"
+        : previewMode === "clear"
+          ? "Clear Fields"
+          : "Standardize";
 
   return (
     <div className="flex h-full flex-col gap-4 p-6">
@@ -132,16 +168,82 @@ export function LibraryPage({
         </div>
       </div>
 
+      {inlinePreview && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card px-3 py-2.5">
+          <div className="min-w-0">
+            <span className="text-sm font-semibold">{modeLabel} preview</span>
+            <p className="text-xs text-muted-foreground">
+              {includedCount} of {changedCount} change{changedCount === 1 ? "" : "s"} selected across{" "}
+              {fileCount} file{fileCount === 1 ? "" : "s"} — nothing is written until you apply.
+              Click a highlighted cell to include/exclude it, double-click to edit the new value.
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() =>
+                onPendingChange(pending!.map((r) => (r.changed ? { ...r, include: true } : r)))
+              }
+            >
+              Select All
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() =>
+                onPendingChange(pending!.map((r) => (r.changed ? { ...r, include: false } : r)))
+              }
+            >
+              Deselect All
+            </Button>
+            <Button variant="outline" size="sm" onClick={onCancelPending} disabled={busy}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={onApplyPending} disabled={busy || includedCount === 0}>
+              Apply Selected ({includedCount})
+            </Button>
+          </div>
+        </div>
+      )}
+
       {!pending && (
         <div className="flex flex-wrap items-center gap-2">
           <Button
-            onClick={onBackup}
-            disabled={noSel}
-            title="Write the full + searchable backup for the selected files"
+            variant="ghost"
+            size="icon"
+            onClick={onUndo}
+            disabled={busy || !canUndo}
+            title="Undo (Ctrl+Z)"
           >
-            <Archive />
-            Backup
+            <RotateCcw />
           </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onRedo}
+            disabled={busy || !canRedo}
+            title="Redo (Ctrl+Shift+Z)"
+          >
+            <RotateCw />
+          </Button>
+          <span className="mx-1 h-6 w-px bg-border" />
+
+          {backupRunning ? (
+            <Button variant="destructive" onClick={onStopBackup}>
+              <StopCircle />
+              Stop
+            </Button>
+          ) : (
+            <Button
+              onClick={onBackup}
+              disabled={noSel}
+              title="Write the full + searchable backup for the selected files"
+            >
+              <Archive />
+              Backup
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
@@ -224,7 +326,7 @@ export function LibraryPage({
         </div>
       )}
 
-      {pending ? (
+      {pending && previewMode === "strip" ? (
         <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
           <PreviewTable
             rows={pending}
@@ -255,6 +357,10 @@ export function LibraryPage({
           onEditField={onEditField}
           onEditRating={onEditRating}
           onInspect={onInspect}
+          onAddGenre={onAddGenre}
+          onRenameGenre={onRenameGenre}
+          pending={inlinePreview ? pending : null}
+          onPendingChange={onPendingChange}
         />
       )}
     </div>

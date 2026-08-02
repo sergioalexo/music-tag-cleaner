@@ -68,7 +68,11 @@ pub fn make_backup_string(tag: Option<&Tag>, tag_type: TagType) -> String {
 
 #[tauri::command]
 pub async fn restore_from_backup(path: String) -> Result<(), String> {
-    let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    crate::commands::files::run_blocking(move || restore_from_backup_blocking(&path)).await
+}
+
+fn restore_from_backup_blocking(path: &str) -> Result<(), String> {
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let backup =
         find_backup_in_file(&tagged).ok_or_else(|| "No backup found in this file".to_string())?;
     let json = &backup[BACKUP_PREFIX.len()..];
@@ -95,6 +99,6 @@ pub async fn restore_from_backup(path: String) -> Result<(), String> {
     }
     drop(tagged);
     restored
-        .save_to_path(&path, WriteOptions::default())
+        .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())
 }

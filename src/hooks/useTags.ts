@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   basename,
@@ -19,7 +20,11 @@ function backupArg(s: Settings): string | null {
 export interface ApplyResult {
   written: number;
   errors: string[];
+  /** True if a backup/restore run was stopped early by the user. */
+  stopped?: boolean;
 }
+
+export type Progress = (done: number, total: number) => void;
 
 const DISPLAY_FIELDS = Object.keys(FIELD_LABELS) as (keyof TagData & string)[];
 
@@ -42,6 +47,8 @@ function preserveExtras(tags: TagData): string[] {
 }
 
 export function useTags() {
+  const stopRef = useRef(false);
+
   const read = async (paths: string[]) => {
     const results = await invoke<TagReadResult[]>("read_tags_batch", { paths });
     const map: Record<string, TagData> = {};
@@ -318,36 +325,54 @@ export function useTags() {
    * Explicit backup of the selected files: writes the full JSON snapshot and
    * the searchable backup field, preserving everything else. Runs regardless
    * of the auto-backup toggles and works on untagged (filename-only) files.
+   * Each file gets a server-side timeout, so one locked/cloud-only file
+   * reports an error instead of hanging the whole run.
    */
   const backupSelected = async (
     paths: string[],
     settings: Settings,
+    onProgress?: Progress,
   ): Promise<ApplyResult> => {
+    stopRef.current = false;
     let written = 0;
     const errors: string[] = [];
-    for (const path of paths) {
+    onProgress?.(0, paths.length);
+    for (let i = 0; i < paths.length; i++) {
+      if (stopRef.current) return { written, errors, stopped: true };
+      const path = paths[i];
       try {
         await invoke("backup_file", { path, backupField: settings.backupField });
         written++;
       } catch (e) {
         errors.push(`${basename(path)}: ${e}`);
       }
+      onProgress?.(i + 1, paths.length);
     }
     return { written, errors };
   };
 
-  const restore = async (paths: string[]): Promise<ApplyResult> => {
+  const restore = async (paths: string[], onProgress?: Progress): Promise<ApplyResult> => {
+    stopRef.current = false;
     let written = 0;
     const errors: string[] = [];
-    for (const path of paths) {
+    onProgress?.(0, paths.length);
+    for (let i = 0; i < paths.length; i++) {
+      if (stopRef.current) return { written, errors, stopped: true };
+      const path = paths[i];
       try {
         await invoke("restore_from_backup", { path });
         written++;
       } catch (e) {
         errors.push(`${basename(path)}: ${e}`);
       }
+      onProgress?.(i + 1, paths.length);
     }
     return { written, errors };
+  };
+
+  /** Requests the in-progress backup/restore run to stop after the current file. */
+  const stopBackup = () => {
+    stopRef.current = true;
   };
 
   return {
@@ -362,5 +387,6 @@ export function useTags() {
     renameFiles,
     backupSelected,
     restore,
+    stopBackup,
   };
 }
