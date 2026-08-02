@@ -4,15 +4,12 @@ name: release
 # the updater's latest.json manifest — the in-app "Check for Updates" button
 # (Components page) reads that manifest to find and verify new versions.
 #
-# One-time setup required before this workflow can sign anything:
-#   1. Generate a signing keypair locally:
-#        npx @tauri-apps/cli signer generate -w ~/.tauri/music-tag-cleaner.key
-#      This prints a public key — paste it into `plugins.updater.pubkey` in
-#      src-tauri/tauri.conf.json (replacing the placeholder).
-#   2. In the GitHub repo settings -> Secrets and variables -> Actions, add:
-#        TAURI_SIGNING_PRIVATE_KEY          (contents of the .key file)
-#        TAURI_SIGNING_PRIVATE_KEY_PASSWORD (the password you set, if any)
-#   The private key never belongs in this repo or in this workflow file.
+# Signing is one-time setup: a keypair was generated with
+# `npx @tauri-apps/cli signer generate`, the public half is committed in
+# `plugins.updater.pubkey` (src-tauri/tauri.conf.json), and the private half
+# + its password live only in this repo's Actions secrets
+# (TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD) — never in
+# this file or the repo itself.
 
 on:
   push:
