@@ -10,7 +10,7 @@ use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 use walkdir::WalkDir;
 
 use crate::commands::backup::{find_backup_in_file, make_backup_string, BACKUP_KEY};
-use crate::models::{AudioFile, TagData, TagReadResult};
+use crate::models::{AudioFile, ImageInfo, TagData, TagReadResult};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
 
@@ -67,10 +67,14 @@ fn is_audio(path: &Path) -> bool {
 
 fn file_info(path: &Path) -> AudioFile {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let has_backup = lofty::read_from_path(path)
-        .ok()
-        .map(|t| find_backup_in_file(&t).is_some())
+    let tagged = lofty::read_from_path(path).ok();
+    let has_backup = tagged
+        .as_ref()
+        .map(|t| find_backup_in_file(t).is_some())
         .unwrap_or(false);
+    let duration_secs = tagged
+        .as_ref()
+        .map(|t| t.properties().duration().as_secs_f64());
     AudioFile {
         path: path.to_string_lossy().to_string(),
         filename: path
@@ -84,6 +88,7 @@ fn file_info(path: &Path) -> AudioFile {
             .unwrap_or_default(),
         size,
         has_backup,
+        duration_secs,
     }
 }
 
@@ -268,6 +273,9 @@ fn backup_item_key(field: &str) -> ItemKey {
     match field {
         "OriginalArtist" => ItemKey::OriginalArtist,
         "Comment" => ItemKey::Comment,
+        "Album" => ItemKey::AlbumTitle,
+        "AlbumArtist" => ItemKey::AlbumArtist,
+        "Genre" => ItemKey::Genre,
         _ => ItemKey::Composer,
     }
 }
@@ -325,7 +333,7 @@ pub async fn read_tags_batch(paths: Vec<String>) -> Vec<TagReadResult> {
 /// the file's current state before anything is overwritten; an existing
 /// backup is never replaced.
 ///
-/// `backup_field` (when Some) writes "file name - artist - title - year"
+/// `backup_field` (when Some) writes "file name | | artist | | title | | year"
 /// (from the pre-change values) into a chosen field — Composer by default,
 /// or OriginalArtist / Comment — so the original identity stays searchable
 /// in DJ software. A non-empty target is never overwritten, so the oldest
@@ -440,6 +448,39 @@ pub async fn write_tags(
         .map_err(|e| e.to_string())
 }
 
+/// Writes (or, when `value` is empty, completely removes) a raw tag field
+/// identified by its `key_name()` display string — the same name shown in
+/// the "All Tags" view. Matches against the tag's existing items rather than
+/// reconstructing an `ItemKey` from the string, so it works for every key
+/// `allFields` can surface, known or unknown to lofty.
+#[tauri::command]
+pub async fn write_raw_field(path: String, field_key: String, value: String) -> Result<(), String> {
+    let mut tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    let tag_type = tagged
+        .primary_tag()
+        .map(|t| t.tag_type())
+        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
+    let Some(tag) = tagged.tag_mut(tag_type) else {
+        return Ok(());
+    };
+    let Some(existing_key) = tag
+        .items()
+        .find(|item| key_name(item.key()) == field_key)
+        .map(|item| item.key().clone())
+    else {
+        return Ok(()); // Field no longer present — nothing to write or clear.
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        tag.remove_key(&existing_key);
+    } else {
+        tag.insert_text(existing_key, value.to_string());
+    }
+    tagged
+        .save_to_path(&path, WriteOptions::default())
+        .map_err(|e| e.to_string())
+}
+
 /// Explicit backup of a single file. Always (re)writes the searchable
 /// backup field in the canonical "filename | | artist | | title | | year"
 /// format from the file's current values, and writes the full JSON snapshot
@@ -522,6 +563,132 @@ pub async fn read_cover_art(path: String) -> Result<Option<String>, String> {
     Ok(Some(format!("data:{mime};base64,{b64}")))
 }
 
+/// Returns byte size, pixel dimensions, and mime type of the first embedded
+/// picture, or None if the file has no cover art. Dimensions are decoded from
+/// the picture bytes with the `image` crate (lofty exposes the mime/bytes only).
+#[tauri::command]
+pub async fn image_info(path: String) -> Result<Option<ImageInfo>, String> {
+    let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(None);
+    };
+    let Some(pic) = tag.pictures().first() else {
+        return Ok(None);
+    };
+    let mime = pic
+        .mime_type()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "image/jpeg".to_string());
+    let size_bytes = pic.data().len() as u64;
+    let (width, height) = image::load_from_memory(pic.data())
+        .map(|img| {
+            use image::GenericImageView;
+            img.dimensions()
+        })
+        .unwrap_or((0, 0));
+    Ok(Some(ImageInfo { mime, size_bytes, width, height }))
+}
+
+fn mime_from_extension(image_path: &str) -> lofty::picture::MimeType {
+    match Path::new(image_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => lofty::picture::MimeType::Png,
+        "gif" => lofty::picture::MimeType::Gif,
+        "bmp" => lofty::picture::MimeType::Bmp,
+        _ => lofty::picture::MimeType::Jpeg,
+    }
+}
+
+fn mime_from_data_url_type(mime_str: &str) -> lofty::picture::MimeType {
+    match mime_str {
+        "image/png" => lofty::picture::MimeType::Png,
+        "image/gif" => lofty::picture::MimeType::Gif,
+        "image/bmp" => lofty::picture::MimeType::Bmp,
+        _ => lofty::picture::MimeType::Jpeg,
+    }
+}
+
+/// Embeds `bytes` as the file's sole cover art, replacing any existing picture.
+fn embed_picture_bytes(path: &str, mime: lofty::picture::MimeType, bytes: Vec<u8>) -> Result<(), String> {
+    let picture = lofty::picture::Picture::new_unchecked(
+        lofty::picture::PictureType::CoverFront,
+        Some(mime),
+        None,
+        bytes,
+    );
+
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let tag_type = tagged
+        .primary_tag()
+        .map(|t| t.tag_type())
+        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
+    if tagged.primary_tag().is_none() {
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged.tag_mut(tag_type).ok_or("Could not access tag")?;
+    tag.set_picture(0, picture);
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| e.to_string())
+}
+
+/// Removes all embedded pictures from the file.
+fn remove_all_pictures(path: &str) -> Result<(), String> {
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let tag_type = tagged
+        .primary_tag()
+        .map(|t| t.tag_type())
+        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
+    let Some(tag) = tagged.tag_mut(tag_type) else {
+        return Ok(());
+    };
+    while !tag.pictures().is_empty() {
+        tag.remove_picture(0);
+    }
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| e.to_string())
+}
+
+/// Embeds `image_path` as the file's cover art, replacing any existing picture.
+#[tauri::command]
+pub async fn set_cover_art(path: String, image_path: String) -> Result<(), String> {
+    let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+    let mime = mime_from_extension(&image_path);
+    embed_picture_bytes(&path, mime, bytes)
+}
+
+/// Removes all embedded cover art from the file.
+#[tauri::command]
+pub async fn remove_cover_art(path: String) -> Result<(), String> {
+    remove_all_pictures(&path)
+}
+
+/// Re-embeds (or removes, if `data_url` is `None`/empty) cover art from a
+/// `data:<mime>;base64,<data>` string — used to undo/redo artwork changes
+/// without needing to keep the original source file around.
+#[tauri::command]
+pub async fn restore_cover_art(path: String, data_url: Option<String>) -> Result<(), String> {
+    use base64::Engine;
+    let Some(url) = data_url.filter(|u| !u.is_empty()) else {
+        return remove_all_pictures(&path);
+    };
+    let (meta, b64) = url.split_once(',').ok_or("Malformed image data")?;
+    let mime_str = meta
+        .strip_prefix("data:")
+        .and_then(|m| m.strip_suffix(";base64"))
+        .unwrap_or("image/jpeg");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| e.to_string())?;
+    embed_picture_bytes(&path, mime_from_data_url_type(mime_str), bytes)
+}
+
 /// Renames the file to `new_stem` (extension preserved), resolving collisions
 /// by appending " (2)", " (3)", … Returns the new absolute path.
 #[tauri::command]
@@ -557,6 +724,29 @@ pub async fn rename_file(path: String, new_stem: String) -> Result<String, Strin
     }
     std::fs::rename(src, &target).map_err(|e| e.to_string())?;
     Ok(target.to_string_lossy().to_string())
+}
+
+/// Sends the file to the OS Recycle Bin / Trash rather than deleting it
+/// permanently, so a mistaken delete from the app can still be recovered.
+#[tauri::command]
+pub async fn delete_file(path: String) -> Result<(), String> {
+    let src = Path::new(&path);
+    if !src.is_file() {
+        return Err(format!("File not found: {path}"));
+    }
+    trash::delete(src).map_err(|e| e.to_string())
+}
+
+/// Generic text file write, used for exporting settings to a user-chosen path.
+#[tauri::command]
+pub async fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
+/// Generic text file read, used for importing a previously exported settings file.
+#[tauri::command]
+pub async fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
 fn set_text(tag: &mut Tag, key: ItemKey, value: &Option<String>) {

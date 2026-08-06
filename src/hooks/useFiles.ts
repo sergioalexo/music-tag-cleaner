@@ -132,6 +132,17 @@ export function useFiles(
     }
   };
 
+  /** Drops files from the list (e.g. after they were deleted from disk). */
+  const removeFiles = (paths: string[]) => {
+    const gone = new Set(paths);
+    setFiles((prev) => prev.filter((f) => !gone.has(f.path)));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const p of paths) next.delete(p);
+      return next;
+    });
+  };
+
   /** Applies path changes after a rename, preserving order and selection. */
   const remap = (mapping: Record<string, AudioFile>) => {
     setFiles((prev) => prev.map((f) => mapping[f.path] ?? f));
@@ -163,5 +174,6 @@ export function useFiles(
     clearList,
     refresh,
     remap,
+    removeFiles,
   };
 }

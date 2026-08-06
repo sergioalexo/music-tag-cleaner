@@ -17,8 +17,16 @@ fn main() {
             commands::files::read_tags,
             commands::files::read_tags_batch,
             commands::files::write_tags,
+            commands::files::write_raw_field,
             commands::files::read_cover_art,
+            commands::files::image_info,
+            commands::files::set_cover_art,
+            commands::files::remove_cover_art,
+            commands::files::restore_cover_art,
             commands::files::rename_file,
+            commands::files::delete_file,
+            commands::files::write_text_file,
+            commands::files::read_text_file,
             commands::files::backup_file,
             commands::backup::restore_from_backup,
             commands::ai::check_ollama,
@@ -29,6 +37,7 @@ fn main() {
             commands::components::install_ollama,
             commands::components::start_ollama,
             commands::components::pull_model,
+            commands::components::delete_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");

@@ -1,11 +1,12 @@
-import { Disc3, Moon, Music, Package, Settings, Sun } from "lucide-react";
+import { Disc3, Moon, Music, Package, Settings, Sun, Terminal } from "lucide-react";
 import { cn } from "./ui";
 
-export type Page = "library" | "components" | "settings";
+export type Page = "library" | "components" | "settings" | "logs";
 
 const NAV: { page: Page; label: string; icon: typeof Music }[] = [
   { page: "library", label: "Library", icon: Disc3 },
   { page: "components", label: "Components", icon: Package },
+  { page: "logs", label: "Logs", icon: Terminal },
   { page: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -17,9 +18,18 @@ interface Props {
   fileCount: number;
   /** null = unknown; false shows the attention dot on Components. */
   ollamaRunning: boolean | null;
+  errorLogCount: number;
 }
 
-export function Sidebar({ page, setPage, theme, onToggleTheme, fileCount, ollamaRunning }: Props) {
+export function Sidebar({
+  page,
+  setPage,
+  theme,
+  onToggleTheme,
+  fileCount,
+  ollamaRunning,
+  errorLogCount,
+}: Props) {
   return (
     <aside className="flex h-full w-56 shrink-0 flex-col border-r bg-card/50">
       <div className="flex items-center gap-2.5 px-5 pb-4 pt-5">
@@ -60,6 +70,11 @@ export function Sidebar({ page, setPage, theme, onToggleTheme, fileCount, ollama
                   className="h-2 w-2 rounded-full bg-amber-500"
                   title="Ollama is not running"
                 />
+              )}
+              {p === "logs" && errorLogCount > 0 && (
+                <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-destructive px-1.5 text-[10px] font-semibold text-destructive-foreground">
+                  {errorLogCount}
+                </span>
               )}
             </button>
           );

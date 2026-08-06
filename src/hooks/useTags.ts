@@ -138,14 +138,15 @@ export function useTags() {
     paths: string[],
     map: Record<string, TagData>,
     transform: (value: string, field: string) => string,
+    fields: readonly string[] = STANDARDIZE_FIELDS,
   ): PendingChange[] => {
     const rows: PendingChange[] = [];
     for (const path of paths) {
       const tags = map[path];
       if (!tags) continue;
       const filename = basename(path);
-      for (const field of STANDARDIZE_FIELDS) {
-        const before = (tags[field] ?? "").trim();
+      for (const field of fields) {
+        const before = ((tags as unknown as Record<string, string | undefined>)[field] ?? "").trim();
         if (!before) continue;
         const after = transform(before, field);
         const changed = after !== before;
@@ -277,7 +278,7 @@ export function useTags() {
     for (const path of paths) {
       const current = map[path];
       if (!current) continue;
-      const id = formatTrackId(counter);
+      const id = formatTrackId(counter, settings.trackIdDigits);
       try {
         await updateField(path, current, "trackNumber", id, settings);
         written++;
@@ -296,6 +297,7 @@ export function useTags() {
   const renameFiles = async (
     files: AudioFile[],
     map: Record<string, TagData>,
+    trackIdDigits = 6,
   ): Promise<ApplyResult & { mapping: Record<string, AudioFile> }> => {
     let written = 0;
     const errors: string[] = [];
@@ -303,7 +305,7 @@ export function useTags() {
     for (const file of files) {
       const tags = map[file.path];
       if (!tags) continue;
-      const uid = isUid(tags.trackNumber) ? tags.trackNumber : undefined;
+      const uid = isUid(tags.trackNumber, trackIdDigits) ? tags.trackNumber : undefined;
       const stem = buildRenameStem(tags.artist, tags.title, uid);
       if (!stem) {
         errors.push(`${file.filename}: no artist/title to build a name from`);

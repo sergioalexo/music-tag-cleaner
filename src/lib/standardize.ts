@@ -11,12 +11,21 @@ export const DEFAULT_REPLACEMENTS: CharReplacement[] = [
 /** Characters considered "normal" in a title/artist — anything else is flagged. */
 const ALLOWED = /[\p{L}\p{N}\s\-'()]/u;
 
+/** Escapes regex metacharacters so a literal string can be used in a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Applies enabled character replacements (literal, all occurrences). */
 export function applyReplacements(value: string, rules: CharReplacement[]): string {
   let out = value;
   for (const r of rules) {
     if (!r.enabled || !r.from) continue;
-    out = out.split(r.from).join(r.to);
+    if (r.caseSensitive === false) {
+      out = out.replace(new RegExp(escapeRegExp(r.from), "gi"), r.to);
+    } else {
+      out = out.split(r.from).join(r.to);
+    }
   }
   return collapseSpaces(out);
 }
@@ -50,12 +59,16 @@ export function applyCapitalization(value: string, mode: Capitalization): string
 
 function toTitleCase(value: string): string {
   const words = value.split(/(\s+)/); // keep the whitespace runs
+  const wordIndexes = words
+    .map((token, i) => (/^\s+$/.test(token) || token === "" ? -1 : i))
+    .filter((i) => i !== -1);
+  const lastWordIndex = wordIndexes[wordIndexes.length - 1];
   let seenWord = 0;
   return words
-    .map((token) => {
+    .map((token, i) => {
       if (/^\s+$/.test(token) || token === "") return token;
       const lower = token.toLowerCase();
-      const isFirstOrLast = seenWord === 0;
+      const isFirstOrLast = seenWord === 0 || i === lastWordIndex;
       seenWord++;
       if (!isFirstOrLast && SMALL_WORDS.has(lower)) return lower;
       return capitalizeWord(token);
@@ -116,12 +129,13 @@ export function buildRenameStem(
   return parts.join(" - ");
 }
 
-/** A track number counts as a generated UID if it is exactly 6 digits. */
-export function isUid(value: string | undefined): boolean {
-  return !!value && /^\d{6}$/.test(value.trim());
+/** A track number counts as a generated UID if it is exactly `digits` digits long. */
+export function isUid(value: string | undefined, digits = 6): boolean {
+  return !!value && new RegExp(`^\\d{${digits}}$`).test(value.trim());
 }
 
-/** Formats a sequential id as a zero-padded 6-digit string (0 -> "000000"). */
-export function formatTrackId(n: number): string {
-  return String(Math.max(0, Math.floor(n)) % 1000000).padStart(6, "0");
+/** Formats a sequential id as a zero-padded `digits`-digit string (0 -> "000...0"). */
+export function formatTrackId(n: number, digits = 6): string {
+  const max = 10 ** digits;
+  return String(Math.max(0, Math.floor(n)) % max).padStart(digits, "0");
 }

@@ -1,8 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Filter, Music, Rows3, SlidersHorizontal } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  Filter,
+  ImageOff,
+  ImagePlus,
+  Layers,
+  Music,
+  Search,
+  SlidersHorizontal,
+  Trash2,
+  X,
+  ZoomIn,
+} from "lucide-react";
 import type { AudioFile, PendingChange, RowHeight, TagData } from "../types";
 import { formatBytes } from "../types";
+import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
+import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { AudioPreview } from "./AudioPreview";
 import { Combobox } from "./Combobox";
 import { Stars } from "./Stars";
@@ -16,7 +32,11 @@ export interface ColumnDef {
   value: (file: AudioFile, tags?: TagData) => string;
   align?: "right" | "center";
   /** Rendered with a custom cell (not text/editable). */
-  custom?: "preview" | "rating";
+  custom?: "preview" | "rating" | "imageInfo";
+  /** Ad-hoc raw-tag column from the "All Tags" view — not draggable/resizable/persisted. */
+  dynamic?: boolean;
+  /** The raw allFields/key_name() key this dynamic column edits — unset for curated columns. */
+  rawKey?: string;
 }
 
 export const ALL_COLUMNS: ColumnDef[] = [
@@ -60,10 +80,49 @@ export const ALL_COLUMNS: ColumnDef[] = [
   { id: "comment", label: "Comment", width: 200, field: "comment", value: (_f, t) => t?.comment ?? "" },
   { id: "format", label: "Format", width: 72, value: (f) => f.format.toUpperCase() },
   { id: "size", label: "Size", width: 84, value: (f) => formatBytes(f.size), align: "right" },
+  { id: "imageInfo", label: "Artwork", width: 150, value: () => "", custom: "imageInfo" },
 ];
+
+export function formatImageInfo(info: { mime: string; sizeBytes: number; width: number; height: number } | null | undefined): string {
+  if (info === null) return "no art";
+  if (!info) return "…";
+  const format = (info.mime.split("/")[1] || info.mime).toUpperCase();
+  return `${info.width}×${info.height} · ${format} · ${formatBytes(info.sizeBytes)}`;
+}
 
 const HIGHLIGHT_FIELDS = new Set(["title", "artist"]);
 const MIN_WIDTH = 50;
+
+function stemOf(filename: string): string {
+  const idx = filename.lastIndexOf(".");
+  return idx > 0 ? filename.slice(0, idx) : filename;
+}
+
+/** Splits `value` into segments, wrapping every case-insensitive match of `query`. */
+function highlightSearch(value: string, query: string) {
+  if (!query) return value;
+  const lower = value.toLowerCase();
+  const q = query.toLowerCase();
+  if (!lower.includes(q)) return value;
+  const segs: React.ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+  while (true) {
+    const found = lower.indexOf(q, i);
+    if (found === -1) {
+      segs.push(<span key={key++}>{value.slice(i)}</span>);
+      break;
+    }
+    if (found > i) segs.push(<span key={key++}>{value.slice(i, found)}</span>);
+    segs.push(
+      <mark key={key++} className="rounded-sm bg-yellow-400/70 text-black">
+        {value.slice(found, found + query.length)}
+      </mark>,
+    );
+    i = found + query.length;
+  }
+  return segs;
+}
 
 const ROW_STYLE: Record<RowHeight, { py: string; img: string; art: number }> = {
   compact: { py: "py-0.5", img: "h-7 w-7", art: 40 },
@@ -77,6 +136,10 @@ interface Props {
   files: AudioFile[];
   tags: Record<string, TagData>;
   covers: Record<string, string | null>;
+  imageInfo: Record<string, ImgInfo | null>;
+  onFetchImageInfo: (path: string) => void;
+  onSetCoverArt: (file: AudioFile) => void;
+  onRemoveCoverArt: (file: AudioFile) => void;
   unresolved: Set<string>;
   selected: Set<string>;
   visibleColumns: string[];
@@ -86,14 +149,22 @@ interface Props {
   genreOptions: string[];
   onToggle: (path: string) => void;
   onSetAll: (checked: boolean) => void;
+  onSetMany: (paths: string[], checked: boolean) => void;
   onVisibleColumnsChange: (columns: string[]) => void;
   onColumnWidthsChange: (widths: Record<string, number>) => void;
   onRowHeightChange: (height: RowHeight) => void;
   onEditField: (paths: string[], field: keyof TagData & string, value: string) => void;
+  onEditRawField: (paths: string[], rawKey: string, value: string) => void;
   onEditRating: (paths: string[], stars: number) => void;
   onInspect: (file: AudioFile) => void;
   onAddGenre: (genre: string) => void;
   onRenameGenre: (oldName: string, newName: string) => void;
+  onDeleteFile: (file: AudioFile) => void;
+  onRenameFile: (path: string, newStem: string) => void;
+  /** Column id of the field currently holding the searchable backup, if enabled. */
+  backupFieldId: string | null;
+  shortcuts: Record<string, string>;
+  onTrack: (name: string) => void;
   /** Non-strip pending changes (AI/Standardize/Genre/Clear) shown inline as before → after diffs. */
   pending: PendingChange[] | null;
   onPendingChange: (rows: PendingChange[]) => void;
@@ -103,6 +174,10 @@ export function TrackTable({
   files,
   tags,
   covers,
+  imageInfo,
+  onFetchImageInfo,
+  onSetCoverArt,
+  onRemoveCoverArt,
   unresolved,
   selected,
   visibleColumns,
@@ -112,14 +187,21 @@ export function TrackTable({
   genreOptions,
   onToggle,
   onSetAll,
+  onSetMany,
   onVisibleColumnsChange,
   onColumnWidthsChange,
   onRowHeightChange,
   onEditField,
+  onEditRawField,
   onEditRating,
   onInspect,
   onAddGenre,
   onRenameGenre,
+  onDeleteFile,
+  onRenameFile,
+  backupFieldId,
+  shortcuts,
+  onTrack,
   pending,
   onPendingChange,
 }: Props) {
@@ -130,9 +212,18 @@ export function TrackTable({
   const [onlyFlagged, setOnlyFlagged] = useState(false);
   const [onlyUnresolved, setOnlyUnresolved] = useState(false);
   const [activePath, setActivePath] = useState<string | null>(null);
+  const [anchorPath, setAnchorPath] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ path: string; field: string } | null>(null);
   const [draft, setDraft] = useState("");
+  const [sortCol, setSortCol] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [matchIndex, setMatchIndex] = useState(0);
+  const [showAllTags, setShowAllTags] = useState(false);
   const pickerRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!pickerOpen) return;
@@ -143,15 +234,25 @@ export function TrackTable({
     return () => window.removeEventListener("mousedown", close);
   }, [pickerOpen]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (matchesShortcut(e, "find", shortcuts)) {
+        e.preventDefault();
+        setSearchOpen(true);
+        requestAnimationFrame(() => searchInputRef.current?.focus());
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [shortcuts]);
+
   const rh = ROW_STYLE[rowHeight];
-  const columnById = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
   // Order follows visibleColumns (drag-and-drop reorders that array), not
   // ALL_COLUMNS' fixed definition order.
-  const columns = visibleColumns
-    .map((id) => columnById.get(id))
+  const curatedColumnById = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
+  const curatedColumns = visibleColumns
+    .map((id) => curatedColumnById.get(id))
     .filter((c): c is ColumnDef => !!c);
-  const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
-  const totalWidth = 36 + rh.art + columns.reduce((sum, c) => sum + widthOf(c), 0);
 
   const flagged = useMemo(() => {
     const set = new Set<string>();
@@ -166,6 +267,121 @@ export function TrackTable({
   if (onlyFlagged) rows = rows.filter((f) => flagged.has(f.path));
   if (onlyUnresolved) rows = rows.filter((f) => unresolved.has(f.path));
 
+  /**
+   * Raw tag keys (from TagData.allFields) not already shown as a curated
+   * column, one dynamic column per key found on any currently visible row,
+   * auto-hidden the moment no visible row has a value for that key anymore.
+   */
+  const extraColumns: ColumnDef[] = useMemo(() => {
+    if (!showAllTags) return [];
+    const keys = new Set<string>();
+    for (const f of rows) {
+      const extra = tags[f.path]?.allFields;
+      if (!extra) continue;
+      for (const [k, v] of Object.entries(extra)) if (v) keys.add(k);
+    }
+    return [...keys].sort().map((key) => ({
+      id: `extra:${key}`,
+      label: key,
+      width: 140,
+      dynamic: true,
+      rawKey: key,
+      value: (_f: AudioFile, t?: TagData) => t?.allFields?.[key] ?? "",
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllTags, rows, tags]);
+
+  const columns = [...curatedColumns, ...extraColumns];
+  const columnById = new Map(columns.map((c) => [c.id, c]));
+  const widthOf = (c: ColumnDef) => (c.dynamic ? c.width : (widths[c.id] ?? c.width));
+  const totalWidth = 36 + rh.art + 32 + columns.reduce((sum, c) => sum + widthOf(c), 0);
+
+  /** Comparable primitive for a cell — numeric where that makes sense, else lowercased text. */
+  const sortValue = (col: ColumnDef, f: AudioFile): string | number => {
+    const t = tags[f.path];
+    if (col.id === "rating") return t?.rating ?? 0;
+    if (col.id === "size") return f.size;
+    if (col.id === "preview") return f.durationSecs ?? -1;
+    if (col.id === "imageInfo") return imageInfo[f.path]?.sizeBytes ?? 0;
+    if (col.id === "year" || col.id === "trackNumber" || col.id === "discNumber") {
+      const n = parseInt(col.value(f, t), 10);
+      return Number.isNaN(n) ? -Infinity : n;
+    }
+    return col.value(f, t).toLowerCase();
+  };
+
+  if (sortCol) {
+    const col = columnById.get(sortCol);
+    if (col) {
+      rows = [...rows].sort((a, b) => {
+        const av = sortValue(col, a);
+        const bv = sortValue(col, b);
+        const cmp = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv));
+        return sortDir === "asc" ? cmp : -cmp;
+      });
+    }
+  }
+
+  const toggleSort = (colId: string) => {
+    onTrack(`sortColumn:${colId}`);
+    if (sortCol === colId) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortCol(colId);
+      setSortDir("asc");
+    }
+  };
+
+  const handleRowClick = (e: React.MouseEvent, path: string) => {
+    setActivePath(path);
+    if (e.shiftKey && anchorPath) {
+      const idxA = rows.findIndex((r) => r.path === anchorPath);
+      const idxB = rows.findIndex((r) => r.path === path);
+      if (idxA !== -1 && idxB !== -1) {
+        const [lo, hi] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+        onSetMany(
+          rows.slice(lo, hi + 1).map((r) => r.path),
+          true,
+        );
+        return;
+      }
+    }
+    onToggle(path);
+    setAnchorPath(path);
+  };
+
+  /** Rows (in display order) whose visible cell text matches the search query. */
+  const searchMatches = useMemo(() => {
+    if (!searchQuery.trim()) return [] as string[];
+    const q = searchQuery.trim().toLowerCase();
+    const out: string[] = [];
+    for (const f of rows) {
+      const t = tags[f.path];
+      const hit = columns.some((c) => {
+        if (c.custom) return false;
+        const v = c.value(f, t);
+        return v && v.toLowerCase().includes(q);
+      });
+      if (hit) out.push(f.path);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, tags, columns, searchQuery]);
+
+  useEffect(() => {
+    setMatchIndex(0);
+  }, [searchQuery]);
+
+  const goToMatch = (delta: number) => {
+    if (!searchMatches.length) return;
+    const next = (matchIndex + delta + searchMatches.length) % searchMatches.length;
+    setMatchIndex(next);
+    const path = searchMatches[next];
+    scrollRef.current
+      ?.querySelector(`[data-path="${CSS.escape(path)}"]`)
+      ?.scrollIntoView({ block: "center" });
+  };
+
   /** Pending AI/Standardize/Genre/Clear changes, keyed by "path::field" for O(1) cell lookup. */
   const pendingByKey = useMemo(() => {
     const m = new Map<string, PendingChange>();
@@ -173,11 +389,16 @@ export function TrackTable({
     return m;
   }, [pending]);
 
+  // Resizing ends in a mouseup on the header, which would otherwise also fire a
+  // click there and toggle sort right after — this flag suppresses that one click.
+  const resizingRef = useRef(false);
+
   const startResize = (e: React.MouseEvent, colId: string, startWidth: number) => {
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
     const onMove = (ev: MouseEvent) => {
+      resizingRef.current = true;
       const next = Math.max(MIN_WIDTH, startWidth + ev.clientX - startX);
       setWidths((w) => ({ ...w, [colId]: next }));
     };
@@ -212,11 +433,6 @@ export function TrackTable({
     onVisibleColumnsChange(order);
   };
 
-  const cycleRowHeight = () => {
-    const i = ROW_HEIGHTS.indexOf(rowHeight);
-    onRowHeightChange(ROW_HEIGHTS[(i + 1) % ROW_HEIGHTS.length]);
-  };
-
   const beginEdit = (path: string, field: string, value: string) => {
     setEditing({ path, field });
     setDraft(value);
@@ -234,9 +450,28 @@ export function TrackTable({
     );
   };
 
-  const commitEdit = (override?: string) => {
+  const commitEdit = (override?: string, scope: "all" | "single" = "all") => {
     if (!editing) return;
     const value = override ?? draft;
+    if (editing.field === "filename") {
+      const file = files.find((x) => x.path === editing.path);
+      const newStem = value.trim();
+      if (file && newStem && newStem !== stemOf(file.filename)) {
+        onRenameFile(editing.path, newStem);
+      }
+      setEditing(null);
+      return;
+    }
+    const editingCol = columnById.get(editing.field);
+    if (editingCol?.dynamic && editingCol.rawKey) {
+      const original = editingCol.value(files.find((x) => x.path === editing.path)!, tags[editing.path]);
+      if (value !== original) {
+        const paths = scope === "single" ? [editing.path] : targetPaths(editing.path);
+        onEditRawField(paths, editingCol.rawKey, value);
+      }
+      setEditing(null);
+      return;
+    }
     const pend = pendingByKey.get(`${editing.path}::${editing.field}`);
     if (pend) {
       editPendingAfter(pend.id, value);
@@ -248,7 +483,8 @@ export function TrackTable({
       ? ((current as unknown as Record<string, string | undefined>)[editing.field] ?? "")
       : "";
     if (value !== original) {
-      onEditField(targetPaths(editing.path), editing.field as keyof TagData & string, value);
+      const paths = scope === "single" ? [editing.path] : targetPaths(editing.path);
+      onEditField(paths, editing.field as keyof TagData & string, value);
     }
     setEditing(null);
   };
@@ -256,6 +492,9 @@ export function TrackTable({
   const allChecked = files.length > 0 && files.every((f) => selected.has(f.path));
 
   const renderCellValue = (col: ColumnDef, value: string) => {
+    if (searchQuery.trim() && value) {
+      return highlightSearch(value, searchQuery.trim());
+    }
     if (highlightSymbols && col.field && HIGHLIGHT_FIELDS.has(col.field) && value) {
       return markWeird(value).map((seg, i) =>
         seg.weird ? (
@@ -282,14 +521,29 @@ export function TrackTable({
         </span>
         <div className="flex items-center gap-1">
           <Button
-            variant="ghost"
+            variant={searchOpen ? "secondary" : "ghost"}
             size="sm"
-            onClick={cycleRowHeight}
-            title={`Row height: ${rowHeight} (click to change)`}
+            onClick={() => {
+              onTrack("search");
+              setSearchOpen((o) => !o);
+              requestAnimationFrame(() => searchInputRef.current?.focus());
+            }}
+            title={`Find in table (${shortcutFor("find", shortcuts)})`}
           >
-            <Rows3 />
-            {rowHeight}
+            <Search />
           </Button>
+          <div className="flex items-center gap-1.5 px-1.5" title={`Zoom: ${rowHeight} row height — drag to change`}>
+            <ZoomIn className="h-3.5 w-3.5 text-muted-foreground" />
+            <input
+              type="range"
+              min={0}
+              max={ROW_HEIGHTS.length - 1}
+              step={1}
+              value={ROW_HEIGHTS.indexOf(rowHeight)}
+              onChange={(e) => onRowHeightChange(ROW_HEIGHTS[Number(e.target.value)])}
+              className="h-1 w-16 cursor-pointer accent-[var(--primary)]"
+            />
+          </div>
           {unresolved.size > 0 && (
             <Button
               variant={onlyUnresolved ? "secondary" : "ghost"}
@@ -310,6 +564,15 @@ export function TrackTable({
           >
             <Filter />
             Flagged{flagged.size > 0 ? ` (${flagged.size})` : ""}
+          </Button>
+          <Button
+            variant={showAllTags ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setShowAllTags((v) => !v)}
+            title="Show every raw tag field found on these tracks, as extra columns — a column hides itself once none of the visible tracks have a value for it"
+          >
+            <Layers />
+            All Tags{extraColumns.length > 0 ? ` (${extraColumns.length})` : ""}
           </Button>
           <div className="relative" ref={pickerRef}>
             <Button variant="ghost" size="sm" onClick={() => setPickerOpen((o) => !o)}>
@@ -338,7 +601,72 @@ export function TrackTable({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto">
+      {searchOpen && (
+        <div className="flex items-center gap-2 border-b bg-secondary/30 px-3 py-1.5">
+          <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setSearchOpen(false);
+                setSearchQuery("");
+              } else if (e.key === "Enter") {
+                goToMatch(e.shiftKey ? -1 : 1);
+              }
+            }}
+            placeholder="Find in table…"
+            className="h-6 flex-1 max-w-xs border-none bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+          />
+          <span className="shrink-0 text-[11px] text-muted-foreground">
+            {searchQuery.trim()
+              ? searchMatches.length
+                ? `${matchIndex + 1}/${searchMatches.length}`
+                : "0/0"
+              : ""}
+          </span>
+          <button
+            onClick={() => goToMatch(-1)}
+            disabled={!searchMatches.length}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent disabled:opacity-30"
+            title="Previous match (Shift+Enter)"
+          >
+            <ChevronUp className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => goToMatch(1)}
+            disabled={!searchMatches.length}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent disabled:opacity-30"
+            title="Next match (Enter)"
+          >
+            <ChevronDown className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => {
+              setSearchOpen(false);
+              setSearchQuery("");
+            }}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent"
+            title="Close (Esc)"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-auto"
+        onWheel={(e) => {
+          // Cross-mouse-hardware fallback: Shift+wheel always pans horizontally,
+          // even on mice without a tilt wheel or trackpad gesture support.
+          if (e.shiftKey && e.deltaY !== 0) {
+            e.currentTarget.scrollLeft += e.deltaY;
+          }
+        }}
+      >
         {rows.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 py-16 text-muted-foreground">
             <p className="text-sm">
@@ -362,13 +690,14 @@ export function TrackTable({
             <colgroup>
               <col style={{ width: 36 }} />
               <col style={{ width: rh.art }} />
+              <col style={{ width: 32 }} />
               {columns.map((c) => (
                 <col key={c.id} style={{ width: widthOf(c) }} />
               ))}
             </colgroup>
             <thead className="sticky top-0 z-10 bg-card">
               <tr className="border-b">
-                <th className={cn("px-2 py-2", headerSep)}>
+                <th className={cn("sticky left-0 z-20 bg-card px-2 py-2", headerSep)}>
                   <input
                     type="checkbox"
                     className="accent-[var(--primary)]"
@@ -379,46 +708,89 @@ export function TrackTable({
                 <th className={cn("px-1 py-2 text-center text-[10px] font-medium text-muted-foreground", headerSep)}>
                   Art
                 </th>
+                <th className={cn("px-1 py-2", headerSep)} />
                 {columns.map((c) => (
                   <th
                     key={c.id}
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.effectAllowed = "move";
-                      setDragCol(c.id);
-                    }}
-                    onDragEnter={() => dragCol && dragCol !== c.id && setDragOverCol(c.id)}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (dragCol) reorderColumn(dragCol, c.id);
-                      setDragCol(null);
-                      setDragOverCol(null);
-                    }}
-                    onDragEnd={() => {
-                      setDragCol(null);
-                      setDragOverCol(null);
+                    draggable={!c.dynamic}
+                    onDragStart={
+                      c.dynamic
+                        ? undefined
+                        : (e) => {
+                            e.dataTransfer.effectAllowed = "move";
+                            setDragCol(c.id);
+                          }
+                    }
+                    onDragEnter={
+                      c.dynamic ? undefined : () => dragCol && dragCol !== c.id && setDragOverCol(c.id)
+                    }
+                    onDragOver={c.dynamic ? undefined : (e) => e.preventDefault()}
+                    onDrop={
+                      c.dynamic
+                        ? undefined
+                        : (e) => {
+                            e.preventDefault();
+                            if (dragCol) reorderColumn(dragCol, c.id);
+                            setDragCol(null);
+                            setDragOverCol(null);
+                          }
+                    }
+                    onDragEnd={
+                      c.dynamic
+                        ? undefined
+                        : () => {
+                            setDragCol(null);
+                            setDragOverCol(null);
+                          }
+                    }
+                    onClick={() => {
+                      if (resizingRef.current) {
+                        resizingRef.current = false;
+                        return;
+                      }
+                      toggleSort(c.id);
                     }}
                     className={cn(
-                      "relative cursor-move select-none whitespace-nowrap px-3 py-2 font-medium text-muted-foreground",
+                      "relative cursor-pointer select-none whitespace-nowrap px-3 py-2 font-medium text-muted-foreground",
+                      !c.dynamic && "cursor-move",
                       headerSep,
                       c.align === "right" && "text-right",
                       c.align === "center" && "text-center",
                       dragCol === c.id && "opacity-40",
                       dragOverCol === c.id && "bg-accent/40",
+                      c.dynamic && "italic",
                     )}
-                    title="Drag to reorder"
+                    title={
+                      c.id === "preview"
+                        ? "Click to sort by track length — drag to reorder"
+                        : c.dynamic
+                          ? "Raw tag field — click to sort"
+                          : "Click to sort — drag to reorder"
+                    }
                   >
-                    {c.label}
-                    <span
-                      className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
-                      draggable
-                      onDragStart={(e) => e.preventDefault()}
-                      onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
-                      title="Drag to resize"
-                    >
-                      <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
+                    <span className="inline-flex items-center gap-0.5">
+                      {c.label}
+                      {c.id === backupFieldId && (
+                        <span className="text-[9px] font-normal text-amber-500">(Backup)</span>
+                      )}
+                      {sortCol === c.id &&
+                        (sortDir === "asc" ? (
+                          <ChevronUp className="h-3 w-3" />
+                        ) : (
+                          <ChevronDown className="h-3 w-3" />
+                        ))}
                     </span>
+                    {!c.dynamic && (
+                      <span
+                        className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
+                        draggable
+                        onDragStart={(e) => e.preventDefault()}
+                        onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
+                        title="Drag to resize"
+                      >
+                        <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
+                      </span>
+                    )}
                   </th>
                 ))}
               </tr>
@@ -428,22 +800,34 @@ export function TrackTable({
                 const t = tags[f.path];
                 const cover = covers[f.path];
                 const isUnresolved = unresolved.has(f.path);
+                const rowBg = selected.has(f.path)
+                  ? "bg-accent/60"
+                  : isUnresolved
+                    ? "bg-amber-500/10 hover:bg-amber-500/20"
+                    : activePath === f.path
+                      ? "bg-accent/30"
+                      : "hover:bg-accent/20";
+                // Same states, but with a resting `bg-card` in the default case — the
+                // sticky checkbox cell needs an always-opaque background so columns
+                // scrolling underneath it don't show through.
+                const stickyBg = selected.has(f.path)
+                  ? "bg-accent/60"
+                  : isUnresolved
+                    ? "bg-amber-500/10 hover:bg-amber-500/20"
+                    : activePath === f.path
+                      ? "bg-accent/30"
+                      : "bg-card hover:bg-accent/20";
                 return (
                   <tr
                     key={f.path}
-                    className={cn(
-                      "border-b border-border/50 transition-colors",
-                      selected.has(f.path)
-                        ? "bg-accent/60"
-                        : isUnresolved
-                          ? "bg-amber-500/10 hover:bg-amber-500/20"
-                          : activePath === f.path
-                            ? "bg-accent/30"
-                            : "hover:bg-accent/20",
-                    )}
-                    onClick={() => setActivePath(f.path)}
+                    data-path={f.path}
+                    className={cn("cursor-pointer border-b border-border/50 transition-colors", rowBg)}
+                    onClick={(e) => handleRowClick(e, f.path)}
                   >
-                    <td className={cn("px-2", rh.py)} onClick={(e) => e.stopPropagation()}>
+                    <td
+                      className={cn("sticky left-0 z-10 px-2", rh.py, stickyBg)}
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       <input
                         type="checkbox"
                         className="accent-[var(--primary)]"
@@ -453,16 +837,20 @@ export function TrackTable({
                     </td>
                     <td
                       className={cn("px-1", rh.py)}
-                      onClick={(e) => e.stopPropagation()}
-                      onDoubleClick={() => onInspect(f)}
-                      title="Double-click for all tag fields"
+                      onMouseEnter={() => onFetchImageInfo(f.path)}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        onInspect(f);
+                      }}
+                      title="Click to select — double-click for all tag fields"
                     >
-                      <div className="relative mx-auto w-fit">
+                      <div className="group relative mx-auto w-fit">
                         <div
                           className={cn(
                             "flex cursor-pointer items-center justify-center overflow-hidden rounded bg-secondary",
                             rh.img,
                           )}
+                          title={cover ? formatImageInfo(imageInfo[f.path]) : "No embedded artwork"}
                         >
                           {cover ? (
                             <img src={cover} alt="" className="h-full w-full object-cover" />
@@ -476,16 +864,58 @@ export function TrackTable({
                             aria-label="Couldn't identify — edit manually"
                           />
                         )}
+                        <div
+                          className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-0.5 bg-black/60 opacity-0 transition-opacity group-hover:opacity-100"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            onClick={() => onSetCoverArt(f)}
+                            title={cover ? "Replace artwork" : "Add artwork"}
+                            className="flex h-4 w-4 items-center justify-center text-white hover:text-primary"
+                          >
+                            <ImagePlus className="h-3 w-3" />
+                          </button>
+                          {cover && (
+                            <button
+                              onClick={() => onRemoveCoverArt(f)}
+                              title="Remove artwork"
+                              className="flex h-4 w-4 items-center justify-center text-white hover:text-destructive"
+                            >
+                              <ImageOff className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
                       </div>
                       <div className="mt-0.5 text-center text-[9px] uppercase text-muted-foreground">
                         {f.format}
                       </div>
+                    </td>
+                    <td className={cn("px-1", rh.py)} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        onClick={() => onDeleteFile(f)}
+                        className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                        title="Delete this file (moves it to the Recycle Bin)"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
                     </td>
                     {columns.map((c) => {
                       if (c.custom === "preview") {
                         return (
                           <td key={c.id} className={cn("overflow-hidden px-2", rh.py)}>
                             <AudioPreview path={f.path} />
+                          </td>
+                        );
+                      }
+                      if (c.custom === "imageInfo") {
+                        return (
+                          <td
+                            key={c.id}
+                            className={cn("truncate px-3 text-muted-foreground", rh.py)}
+                            onMouseEnter={() => onFetchImageInfo(f.path)}
+                            title={formatImageInfo(imageInfo[f.path])}
+                          >
+                            {formatImageInfo(imageInfo[f.path])}
                           </td>
                         );
                       }
@@ -504,7 +934,10 @@ export function TrackTable({
                           </td>
                         );
                       }
-                      const isEditing = editing?.path === f.path && editing.field === c.id && c.field;
+                      const isEditing =
+                        editing?.path === f.path &&
+                        editing.field === c.id &&
+                        (c.field || c.id === "filename" || c.dynamic);
                       const value = c.value(f, t);
                       const pend = c.field ? pendingByKey.get(`${f.path}::${c.id}`) : undefined;
                       return (
@@ -516,23 +949,25 @@ export function TrackTable({
                             c.id === "filename" ? "text-foreground" : "text-muted-foreground",
                             c.align === "right" && "text-right",
                             c.align === "center" && "text-center",
-                            c.field && "cursor-text",
+                            (c.field || c.id === "filename" || c.dynamic) && "cursor-text",
                             pend && "bg-primary/5",
                           )}
                           title={
                             pend
                               ? `${pend.before || "(empty)"} → ${pend.after || "(empty)"} — click to ${pend.include ? "exclude" : "include"}, double-click to edit`
-                              : c.id === "filename"
-                                ? f.path
-                                : value
+                              : c.dynamic
+                                ? `${value} — double-click to edit, clear it to delete this field entirely`
+                                : c.id === "filename"
+                                  ? `${f.path} — double-click to rename`
+                                  : value
                           }
                           onClick={(e) => {
                             if (isEditing) e.stopPropagation();
                           }}
                           onDoubleClick={(e) => {
-                            if (!c.field) return;
+                            if (!c.field && c.id !== "filename" && !c.dynamic) return;
                             e.stopPropagation();
-                            beginEdit(f.path, c.id, pend ? pend.after : value);
+                            beginEdit(f.path, c.id, c.id === "filename" ? stemOf(f.filename) : pend ? pend.after : value);
                           }}
                         >
                           {isEditing && c.field === "genre" ? (
@@ -547,17 +982,36 @@ export function TrackTable({
                               onEditOption={onRenameGenre}
                             />
                           ) : isEditing ? (
-                            <input
-                              autoFocus
-                              value={draft}
-                              onChange={(e) => setDraft(e.target.value)}
-                              onBlur={() => commitEdit()}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") commitEdit();
-                                else if (e.key === "Escape") setEditing(null);
-                              }}
-                              className="w-full rounded border border-primary bg-background px-1 py-0.5 text-xs outline-none"
-                            />
+                            <div className="flex items-center gap-1">
+                              <input
+                                autoFocus
+                                value={draft}
+                                onChange={(e) => setDraft(e.target.value)}
+                                onBlur={() => commitEdit()}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") commitEdit(undefined, e.altKey ? "single" : "all");
+                                  else if (e.key === "Escape") setEditing(null);
+                                }}
+                                title={
+                                  editing.field !== "filename" &&
+                                  selected.has(f.path) &&
+                                  selected.size > 1
+                                    ? `Enter applies to all ${selected.size} selected — Alt+Enter applies to just this row`
+                                    : undefined
+                                }
+                                className="w-full min-w-0 flex-1 rounded border border-primary bg-background px-1 py-0.5 text-xs outline-none"
+                              />
+                              {editing.field !== "filename" && selected.has(f.path) && selected.size > 1 && (
+                                <button
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => commitEdit(undefined, "single")}
+                                  title={`Apply to just this row instead of all ${selected.size} selected (or press Alt+Enter)`}
+                                  className="shrink-0 whitespace-nowrap rounded bg-secondary px-1.5 py-0.5 text-[10px] text-secondary-foreground hover:bg-accent"
+                                >
+                                  just this
+                                </button>
+                              )}
+                            </div>
                           ) : pend ? (
                             <label
                               className="flex items-center gap-1"

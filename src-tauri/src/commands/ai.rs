@@ -1,8 +1,24 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
 
-use crate::models::{CleanedTrack, GenreInput, GenreResult, OllamaStatus, TrackInput};
+use crate::models::{AiUsage, CleanedTrack, GenreInput, GenreResult, OllamaStatus, TrackInput};
+
+/// Emits token-usage counters from an Ollama `/api/generate` response so the
+/// frontend can accumulate session/lifetime usage stats independent of the
+/// command's own return value.
+fn emit_usage(app: &AppHandle, model: &str, v: &Value, tracks: usize) {
+    let _ = app.emit(
+        "ai-usage",
+        AiUsage {
+            model: model.to_string(),
+            prompt_eval_count: v["prompt_eval_count"].as_u64().unwrap_or(0),
+            eval_count: v["eval_count"].as_u64().unwrap_or(0),
+            tracks,
+        },
+    );
+}
 
 /// Non-Latin writing systems the user can opt into transliterating. Names
 /// must match what the frontend's TRANSLITERATE_SCRIPTS list sends.
@@ -137,11 +153,13 @@ pub async fn check_ollama(url: String) -> OllamaStatus {
 
 #[tauri::command]
 pub async fn ai_clean_batch(
+    app: AppHandle,
     url: String,
     model: String,
     tracks: Vec<TrackInput>,
     transliterate_scripts: Vec<String>,
 ) -> Result<Vec<CleanedTrack>, String> {
+    let track_count = tracks.len();
     let track_list = serde_json::to_string_pretty(&tracks).map_err(|e| e.to_string())?;
     let system_prompt = build_system_prompt(&transliterate_scripts);
     let prompt = format!("{system_prompt}\n\nTrack list to clean:\n{track_list}");
@@ -174,6 +192,7 @@ pub async fn ai_clean_batch(
         .json()
         .await
         .map_err(|e| format!("Invalid response from Ollama: {e}"))?;
+    emit_usage(&app, &model, &v, track_count);
     let text = v["response"]
         .as_str()
         .ok_or_else(|| "Ollama response is missing the 'response' field".to_string())?;
@@ -184,11 +203,13 @@ pub async fn ai_clean_batch(
 /// preset). The model must choose from the list — never invent a genre.
 #[tauri::command]
 pub async fn ai_map_genre_batch(
+    app: AppHandle,
     url: String,
     model: String,
     tracks: Vec<GenreInput>,
     genres: Vec<String>,
 ) -> Result<Vec<GenreResult>, String> {
+    let track_count = tracks.len();
     let track_list = serde_json::to_string_pretty(&tracks).map_err(|e| e.to_string())?;
     let allowed = genres.join(", ");
     let prompt = format!(
@@ -227,6 +248,7 @@ Tracks:\n{track_list}"
         .json()
         .await
         .map_err(|e| format!("Invalid response from Ollama: {e}"))?;
+    emit_usage(&app, &model, &v, track_count);
     let text = v["response"]
         .as_str()
         .ok_or_else(|| "Ollama response is missing the 'response' field".to_string())?;

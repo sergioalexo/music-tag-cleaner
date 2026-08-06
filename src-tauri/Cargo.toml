@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner"
-version = "0.2.0"
+version = "0.3.0"
 description = "Strip audio tags to the essentials and clean them up with AI"
 edition = "2021"
 
@@ -21,6 +21,8 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 walkdir = "2"
 tokio = { version = "1", features = ["time"] }
+trash = "5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 
 [profile.release]
 strip = true

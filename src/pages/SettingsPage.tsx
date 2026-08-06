@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Plus, PlugZap, X } from "lucide-react";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { Download, Plus, PlugZap, Upload, X } from "lucide-react";
 import type {
   Capitalization,
   CharReplacement,
@@ -9,6 +10,9 @@ import type {
   Settings,
 } from "../types";
 import { CLEARABLE_FIELDS, FIELD_LABELS, TRANSLITERATE_SCRIPTS } from "../types";
+import { migrate, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
+import { STANDARDIZE_FIELDS } from "../hooks/useTags";
+import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
 import { Combobox } from "../components/Combobox";
 
@@ -16,6 +20,7 @@ interface Props {
   settings: Settings;
   onSave: (settings: Settings) => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
+  notify: (message: string, kind?: "success" | "error" | "info") => void;
 }
 
 const BATCH_SIZES = [10, 25, 50, 100];
@@ -48,13 +53,76 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
   );
 }
 
-export function SettingsPage({ settings, onSave, checkOllama }: Props) {
+export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptText, setPromptText] = useState("");
   const [promptLoading, setPromptLoading] = useState(false);
+  const [exportingSettings, setExportingSettings] = useState(false);
+  const [importingSettings, setImportingSettings] = useState(false);
+  const [recordingShortcut, setRecordingShortcut] = useState<string | null>(null);
+
+  const exportSettings = async () => {
+    const dest = await save({
+      title: "Export Settings",
+      defaultPath: "music-tag-cleaner-settings.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!dest) return;
+    setExportingSettings(true);
+    try {
+      await invoke("write_text_file", { path: dest, contents: JSON.stringify(settings, null, 2) });
+      notify("Settings exported", "success");
+    } catch (e) {
+      notify(`Could not export settings: ${e}`, "error");
+    } finally {
+      setExportingSettings(false);
+    }
+  };
+
+  const importSettings = async () => {
+    const src = await open({
+      title: "Import Settings",
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!src || typeof src !== "string") return;
+    setImportingSettings(true);
+    try {
+      const raw = await invoke<string>("read_text_file", { path: src });
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      const merged = { ...DEFAULT_SETTINGS, ...parsed };
+      const savedVersion = parsed.settingsVersion ?? 1;
+      const next = savedVersion < CURRENT_SETTINGS_VERSION ? migrate(merged, savedVersion) : merged;
+      onSave(next);
+      notify("Settings imported", "success");
+    } catch (e) {
+      notify(`Could not import settings: ${e}`, "error");
+    } finally {
+      setImportingSettings(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!recordingShortcut) return;
+    const handler = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+      if (e.key === "Escape") {
+        setRecordingShortcut(null);
+        return;
+      }
+      const combo = comboFromEvent(e);
+      set("shortcuts", { ...settings.shortcuts, [recordingShortcut]: combo });
+      setRecordingShortcut(null);
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordingShortcut]);
 
   const viewPrompt = async () => {
     setPromptOpen(true);
@@ -263,7 +331,7 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
           </Row>
           <Row
             label="Searchable backup"
-            hint='Writes "file name - artist - title - year" into a chosen field before the first change'
+            hint='Writes "file name | | artist | | title | | year" into a chosen field before the first change'
           >
             <Toggle
               checked={settings.searchableBackup}
@@ -280,6 +348,9 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
                 <option value="Composer">Composer</option>
                 <option value="OriginalArtist">Original Artist</option>
                 <option value="Comment">Comment</option>
+                <option value="Album">Album</option>
+                <option value="AlbumArtist">Album Artist</option>
+                <option value="Genre">Genre</option>
               </select>
             </Row>
           )}
@@ -301,7 +372,7 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
       <Card>
         <CardHeader
           title="Standardization"
-          hint="Used by the Standardize action on Title & Artist"
+          hint="Rules used by the Standardize and Remove Characters actions"
         />
         <div className="px-5 py-2">
           <Row
@@ -388,6 +459,29 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
                     }
                   />
                   <div className="ml-auto flex items-center gap-2">
+                    <button
+                      className={cn(
+                        "h-8 rounded-md px-2 text-xs font-medium transition-colors",
+                        r.caseSensitive !== false
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-secondary text-secondary-foreground hover:bg-accent",
+                      )}
+                      title={
+                        r.caseSensitive !== false
+                          ? "Case-sensitive — click to match any case"
+                          : "Case-insensitive — click to require exact case"
+                      }
+                      onClick={() =>
+                        set(
+                          "replacements",
+                          settings.replacements.map((x, idx) =>
+                            idx === i ? { ...x, caseSensitive: x.caseSensitive === false } : x,
+                          ),
+                        )
+                      }
+                    >
+                      Aa
+                    </button>
                     <Toggle
                       checked={r.enabled}
                       onChange={(v) =>
@@ -430,6 +524,39 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
               Add rule
             </Button>
           </div>
+
+          <div className="border-t py-3">
+            <div className="mb-2 text-sm font-medium">Scope — fields Standardize touches</div>
+            <div className="flex flex-wrap gap-x-6 gap-y-1">
+              {STANDARDIZE_FIELDS.map((f) => (
+                <label key={f} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--primary)]"
+                    checked={settings.standardizeFields.includes(f)}
+                    onChange={(e) =>
+                      set(
+                        "standardizeFields",
+                        e.target.checked
+                          ? [...settings.standardizeFields, f]
+                          : settings.standardizeFields.filter((x) => x !== f),
+                      )
+                    }
+                  />
+                  {FIELD_LABELS[f] ?? f}
+                </label>
+              ))}
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-[var(--primary)]"
+                  checked={settings.standardizeFilename}
+                  onChange={(e) => set("standardizeFilename", e.target.checked)}
+                />
+                File name
+              </label>
+            </div>
+          </div>
         </div>
       </Card>
 
@@ -439,24 +566,41 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
           hint="The Clear Fields button erases these fields on the selected tracks"
         />
         <div className="flex flex-wrap gap-x-6 gap-y-1 px-5 py-3">
-          {CLEARABLE_FIELDS.map((f) => (
-            <label key={f} className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="accent-[var(--primary)]"
-                checked={settings.clearFields.includes(f)}
-                onChange={(e) =>
-                  set(
-                    "clearFields",
-                    e.target.checked
-                      ? [...settings.clearFields, f]
-                      : settings.clearFields.filter((x) => x !== f),
-                  )
-                }
-              />
-              {FIELD_LABELS[f] ?? f}
-            </label>
-          ))}
+          {CLEARABLE_FIELDS.map((f) => {
+            const backupFieldKey =
+              settings.backupField.charAt(0).toLowerCase() + settings.backupField.slice(1);
+            const isBackupField = settings.searchableBackup && f === backupFieldKey;
+            return (
+              <label key={f} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-[var(--primary)]"
+                  checked={settings.clearFields.includes(f)}
+                  onChange={async (e) => {
+                    if (e.target.checked && isBackupField) {
+                      const ok = await confirm(
+                        `${FIELD_LABELS[f] ?? f} currently holds your searchable backup text. Clearing it here will erase that backup too — clear it anyway?`,
+                        { title: "Clearing the backup field", kind: "warning" },
+                      );
+                      if (!ok) return;
+                    }
+                    set(
+                      "clearFields",
+                      e.target.checked
+                        ? [...settings.clearFields, f]
+                        : settings.clearFields.filter((x) => x !== f),
+                    );
+                  }}
+                />
+                {FIELD_LABELS[f] ?? f}
+                {isBackupField && (
+                  <span className="text-xs text-amber-500" title="This field holds the searchable backup">
+                    (Backup)
+                  </span>
+                )}
+              </label>
+            );
+          })}
         </div>
       </Card>
 
@@ -539,8 +683,23 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
       </Card>
 
       <Card>
-        <CardHeader title="Track IDs" hint="Sequential 6-digit IDs written to the Track # field" />
+        <CardHeader
+          title="Track IDs"
+          hint={`Sequential ${settings.trackIdDigits}-digit IDs written to the Track # field`}
+        />
         <div className="px-5 py-3">
+          <Row label="ID length" hint="How many digits Generate IDs zero-pads to">
+            <input
+              type="number"
+              min={1}
+              max={12}
+              className={cn(inputClass, "w-20 text-center font-mono")}
+              value={settings.trackIdDigits}
+              onChange={(e) =>
+                set("trackIdDigits", Math.min(12, Math.max(1, Number(e.target.value) || 6)))
+              }
+            />
+          </Row>
           <Row
             label="Next track ID"
             hint="The next number Generate IDs will assign — reset it to regenerate"
@@ -548,7 +707,7 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
             <input
               type="number"
               min={0}
-              max={999999}
+              max={10 ** settings.trackIdDigits - 1}
               className={cn(inputClass, "w-28 text-center font-mono")}
               value={settings.nextTrackId}
               onChange={(e) => set("nextTrackId", Math.max(0, Number(e.target.value) || 0))}
@@ -573,6 +732,113 @@ export function SettingsPage({ settings, onSave, checkOllama }: Props) {
               ))}
             </select>
           </Row>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Usage & Plan"
+          hint="Ollama runs locally and is free — this tracks usage as groundwork for a possible future paid tier"
+        />
+        <div className="px-5 py-3">
+          <Row label="Plan">
+            <div className="flex items-center gap-2">
+              <Badge className={settings.plan.tier === "pro" ? "bg-primary/15 text-primary" : "bg-secondary"}>
+                {settings.plan.tier === "pro" ? "Pro" : "Free"}
+              </Badge>
+              <span className="text-xs text-muted-foreground">Local Ollama has no usage limits today</span>
+            </div>
+          </Row>
+          {(() => {
+            const totalTokens = settings.usage.totalPromptTokens + settings.usage.totalCompletionTokens;
+            const creditsUsed = Math.ceil(totalTokens / 1000);
+            const pct = Math.min(100, (creditsUsed / settings.plan.creditsTotal) * 100);
+            return (
+              <>
+                <Row label="Credits used" hint="Placeholder unit — 1 credit ≈ 1,000 tokens">
+                  <span className="font-mono text-sm">
+                    {creditsUsed.toLocaleString()} / {settings.plan.creditsTotal.toLocaleString()}
+                  </span>
+                </Row>
+                <div className="mb-3 h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <Row label="Tokens used">
+                  <span className="font-mono text-sm">{totalTokens.toLocaleString()}</span>
+                </Row>
+                <Row label="Songs processed">
+                  <span className="font-mono text-sm">{settings.usage.songsProcessed.toLocaleString()}</span>
+                </Row>
+                <Row label="AI calls made">
+                  <span className="font-mono text-sm">{settings.usage.totalCalls.toLocaleString()}</span>
+                </Row>
+              </>
+            );
+          })()}
+          <div className="mt-3">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => set("usage", DEFAULT_SETTINGS.usage)}
+            >
+              Reset usage stats
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader title="Keyboard Shortcuts" hint="Click Change, then press the new key combo" />
+        <div className="px-5 py-2">
+          {SHORTCUTS.map((s) => (
+            <Row key={s.id} label={s.label}>
+              <div className="flex items-center gap-2">
+                <Badge className="bg-secondary font-mono">
+                  {recordingShortcut === s.id ? "Press keys…" : shortcutFor(s.id, settings.shortcuts)}
+                </Badge>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setRecordingShortcut(s.id)}
+                  disabled={recordingShortcut !== null}
+                >
+                  Change
+                </Button>
+                {settings.shortcuts[s.id] && (
+                  <button
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      const next = { ...settings.shortcuts };
+                      delete next[s.id];
+                      set("shortcuts", next);
+                    }}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </Row>
+          ))}
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Backup & Restore Settings"
+          hint="Save all of the settings on this page to a file, or load them back in"
+        />
+        <div className="flex gap-2 px-5 py-3">
+          <Button variant="secondary" size="sm" onClick={exportSettings} disabled={exportingSettings}>
+            <Download />
+            Export Settings
+          </Button>
+          <Button variant="secondary" size="sm" onClick={importSettings} disabled={importingSettings}>
+            <Upload />
+            Import Settings
+          </Button>
         </div>
       </Card>
     </div>

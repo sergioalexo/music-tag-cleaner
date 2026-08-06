@@ -1,9 +1,12 @@
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   Eraser,
   FilePlus2,
   FolderOpen,
+  GitCompare,
   Hash,
+  History,
   Paintbrush,
   RotateCcw,
   RotateCw,
@@ -17,7 +20,9 @@ import {
   Wand2,
 } from "lucide-react";
 import type { AudioFile, PendingChange, PreviewMode, RowHeight, Settings, TagData } from "../types";
+import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { activePreset } from "../lib/genres";
+import { shortcutFor } from "../lib/shortcuts";
 import { TrackTable } from "../components/TrackTable";
 import PreviewTable from "../components/PreviewTable";
 import { Button } from "../components/ui";
@@ -31,6 +36,7 @@ interface FilesApi {
   addFiles: () => void;
   toggle: (path: string) => void;
   setAll: (checked: boolean) => void;
+  setManySelected: (paths: string[], checked: boolean) => void;
   clearList: () => void;
 }
 
@@ -48,6 +54,10 @@ interface Props {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  historyTimeline: { label: string; changeCount: number }[];
+  historyIndex: number;
+  onJumpToHistory: (index: number) => void;
+  onCompare: () => void;
   pending: PendingChange[] | null;
   previewMode: PreviewMode;
   lastFolder: string;
@@ -68,9 +78,19 @@ interface Props {
   onBackup: () => void;
   onRestore: () => void;
   onEditField: (paths: string[], field: keyof TagData & string, value: string) => void;
+  onEditRawField: (paths: string[], rawKey: string, value: string) => void;
   onEditRating: (paths: string[], stars: number) => void;
   onInspect: (file: AudioFile) => void;
+  onDeleteFile: (file: AudioFile) => void;
+  onRenameFile: (path: string, newStem: string) => void;
   onSaveSettings: (settings: Settings) => void;
+  backupFieldId: string | null;
+  shortcuts: Record<string, string>;
+  onTrack: (name: string) => void;
+  imageInfo: Record<string, ImgInfo | null>;
+  onFetchImageInfo: (path: string) => void;
+  onSetCoverArt: (file: AudioFile) => void;
+  onRemoveCoverArt: (file: AudioFile) => void;
 }
 
 export function LibraryPage({
@@ -87,6 +107,10 @@ export function LibraryPage({
   canRedo,
   onUndo,
   onRedo,
+  historyTimeline,
+  historyIndex,
+  onJumpToHistory,
+  onCompare,
   pending,
   previewMode,
   lastFolder,
@@ -107,9 +131,19 @@ export function LibraryPage({
   onBackup,
   onRestore,
   onEditField,
+  onEditRawField,
   onEditRating,
   onInspect,
+  onDeleteFile,
+  onRenameFile,
   onSaveSettings,
+  backupFieldId,
+  shortcuts,
+  onTrack,
+  imageInfo,
+  onFetchImageInfo,
+  onSetCoverArt,
+  onRemoveCoverArt,
 }: Props) {
   const selectedCount = filesApi.selectedPaths.length;
   const noSel = busy || selectedCount === 0;
@@ -117,6 +151,17 @@ export function LibraryPage({
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
   ).length;
   const genreOptions = activePreset(settings.genrePresets, settings.activeGenrePreset)?.genres ?? [];
+
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const historyRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!historyOpen) return;
+    const close = (e: MouseEvent) => {
+      if (!historyRef.current?.contains(e.target as Node)) setHistoryOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [historyOpen]);
 
   // AI/Standardize/Genre/Clear previews are shown inline in the table itself.
   // Strip keeps the dedicated table below, since it removes arbitrary custom
@@ -146,7 +191,12 @@ export function LibraryPage({
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
-          <Button variant="secondary" onClick={filesApi.selectFolder} disabled={busy} title="Ctrl+O">
+          <Button
+            variant="secondary"
+            onClick={filesApi.selectFolder}
+            disabled={busy}
+            title={`Choose a folder of music files to load (${shortcutFor("selectFolder", settings.shortcuts)})`}
+          >
             <FolderOpen />
             Select Folder
           </Button>
@@ -214,7 +264,7 @@ export function LibraryPage({
             size="icon"
             onClick={onUndo}
             disabled={busy || !canUndo}
-            title="Undo (Ctrl+Z)"
+            title={`Undo the last change (${shortcutFor("undo", settings.shortcuts)})`}
           >
             <RotateCcw />
           </Button>
@@ -223,9 +273,61 @@ export function LibraryPage({
             size="icon"
             onClick={onRedo}
             disabled={busy || !canRedo}
-            title="Redo (Ctrl+Shift+Z)"
+            title={`Redo the last undone change (${shortcutFor("redo", settings.shortcuts)})`}
           >
             <RotateCw />
+          </Button>
+          <div className="relative" ref={historyRef}>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setHistoryOpen((o) => !o)}
+              disabled={historyTimeline.length === 0}
+              title="Version history — jump to any point in this session"
+            >
+              <History />
+            </Button>
+            {historyOpen && (
+              <div className="absolute left-0 top-9 z-30 max-h-80 w-72 overflow-y-auto rounded-lg border bg-popover p-1.5 shadow-lg">
+                <button
+                  onClick={() => {
+                    onJumpToHistory(-1);
+                    setHistoryOpen(false);
+                  }}
+                  className={`w-full rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent ${
+                    historyIndex === -1 ? "bg-accent/60 font-medium" : "text-muted-foreground"
+                  }`}
+                >
+                  Session start
+                </button>
+                {historyTimeline.map((entry, i) => (
+                  <button
+                    key={i}
+                    onClick={() => {
+                      onJumpToHistory(i);
+                      setHistoryOpen(false);
+                    }}
+                    className={`w-full rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent ${
+                      historyIndex === i ? "bg-accent/60 font-medium" : ""
+                    }`}
+                  >
+                    {entry.label}
+                    <span className="ml-1 text-muted-foreground">
+                      ({entry.changeCount} change{entry.changeCount === 1 ? "" : "s"})
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onCompare}
+            disabled={historyTimeline.length === 0}
+            title="Compare — see everything changed this session"
+          >
+            <GitCompare />
           </Button>
           <span className="mx-1 h-6 w-px bg-border" />
 
@@ -342,6 +444,10 @@ export function LibraryPage({
           files={filesApi.files}
           tags={libraryTags}
           covers={covers}
+          imageInfo={imageInfo}
+          onFetchImageInfo={onFetchImageInfo}
+          onSetCoverArt={onSetCoverArt}
+          onRemoveCoverArt={onRemoveCoverArt}
           unresolved={unresolved}
           selected={filesApi.selected}
           visibleColumns={settings.visibleColumns}
@@ -351,14 +457,21 @@ export function LibraryPage({
           genreOptions={genreOptions}
           onToggle={filesApi.toggle}
           onSetAll={filesApi.setAll}
+          onSetMany={filesApi.setManySelected}
           onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
           onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
           onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
           onEditField={onEditField}
+          onEditRawField={onEditRawField}
           onEditRating={onEditRating}
           onInspect={onInspect}
           onAddGenre={onAddGenre}
           onRenameGenre={onRenameGenre}
+          onDeleteFile={onDeleteFile}
+          onRenameFile={onRenameFile}
+          backupFieldId={backupFieldId}
+          shortcuts={shortcuts}
+          onTrack={onTrack}
           pending={inlinePreview ? pending : null}
           onPendingChange={onPendingChange}
         />

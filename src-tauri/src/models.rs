@@ -9,6 +9,8 @@ pub struct AudioFile {
     pub format: String,
     pub size: u64,
     pub has_backup: bool,
+    /// Playback length in seconds, when readable from the file's audio properties.
+    pub duration_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -39,6 +41,24 @@ pub struct TagReadResult {
     pub path: String,
     pub tags: Option<TagData>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageInfo {
+    pub mime: String,
+    pub size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsage {
+    pub model: String,
+    pub prompt_eval_count: u64,
+    pub eval_count: u64,
+    pub tracks: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

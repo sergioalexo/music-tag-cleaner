@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
 import { Upload, X } from "lucide-react";
 
 import { Sidebar, type Page } from "./components/Sidebar";
@@ -8,19 +10,24 @@ import StatusBar from "./components/StatusBar";
 import { Card, cn } from "./components/ui";
 import { useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
+import { useImageInfo } from "./hooks/useImageInfo";
+import { useAnalytics } from "./hooks/useAnalytics";
 import { useFiles } from "./hooks/useFiles";
 import { useSettings } from "./hooks/useSettings";
 import { useTags } from "./hooks/useTags";
 import { ComponentsPage } from "./pages/ComponentsPage";
 import { LibraryPage } from "./pages/LibraryPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { LogsPage } from "./pages/LogsPage";
 import {
   applyCapitalization,
   applyReplacements,
   removeCharsFrom,
 } from "./lib/standardize";
 import { activePreset } from "./lib/genres";
+import { matchesShortcut } from "./lib/shortcuts";
 import {
+  basename,
   FIELD_LABELS,
   type AudioFile,
   type PendingChange,
@@ -33,6 +40,15 @@ interface Toast {
   message: string;
   kind: "success" | "error" | "info";
 }
+
+export interface LogEntry {
+  id: number;
+  time: number;
+  message: string;
+  kind: "success" | "error" | "info";
+}
+
+const LOG_LIMIT = 500;
 
 interface HistoryChange {
   path: string;
@@ -54,11 +70,13 @@ export default function App() {
   const { settings, save, loaded } = useSettings();
   const [page, setPage] = useState<Page>("library");
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const notify = useCallback((message: string, kind: Toast["kind"] = "info") => {
     const id = ++toastId;
     setToasts((prev) => [...prev, { id, message, kind }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
+    setLogs((prev) => [...prev.slice(-(LOG_LIMIT - 1)), { id, time: Date.now(), message, kind }]);
   }, []);
 
   // Keep a live reference so async callbacks always see current settings.
@@ -74,6 +92,16 @@ export default function App() {
   const tagsApi = useTags();
   const ai = useAI();
   const { covers, invalidate: invalidateCovers } = useCovers(filesApi.files);
+  const imageInfoApi = useImageInfo(filesApi.files, settings.visibleColumns.includes("imageInfo"));
+  const analytics = useAnalytics();
+  const withTrack = (name: string, fn: () => void) => () => {
+    analytics.track(name);
+    fn();
+  };
+  const withTrack1 = <T,>(name: string, fn: (arg: T) => void) => (arg: T) => {
+    analytics.track(name);
+    fn(arg);
+  };
 
   const [libraryTags, setLibraryTags] = useState<Record<string, TagData>>({});
   const [pending, setPending] = useState<PendingChange[] | null>(null);
@@ -93,9 +121,24 @@ export default function App() {
 
   /** Writes `before` (undo) or `after` (redo) for every change in `changes`. */
   const applyHistoryChanges = async (changes: HistoryChange[], useAfter: boolean) => {
-    const paths = [...new Set(changes.map((c) => c.path))];
+    const artChanges = changes.filter((c) => c.field === "__coverArt");
+    const rawChanges = changes.filter((c) => c.field.startsWith("__raw:"));
+    const tagChanges = changes.filter((c) => c.field !== "__coverArt" && !c.field.startsWith("__raw:"));
+
+    for (const c of artChanges) {
+      const value = String(useAfter ? c.after : c.before);
+      await invoke("restore_cover_art", { path: c.path, dataUrl: value || null });
+    }
+    if (artChanges.length) invalidateCovers(artChanges.map((c) => c.path));
+
+    for (const c of rawChanges) {
+      const value = String(useAfter ? c.after : c.before);
+      await invoke("write_raw_field", { path: c.path, fieldKey: c.field.slice("__raw:".length), value });
+    }
+
+    const paths = [...new Set(tagChanges.map((c) => c.path))];
     const { map } = await tagsApi.read(paths);
-    for (const c of changes) {
+    for (const c of tagChanges) {
       const current = map[c.path];
       if (!current) continue;
       const value = useAfter ? c.after : c.before;
@@ -141,6 +184,57 @@ export default function App() {
       setBusy(false);
     }
   };
+
+  /** Full session timeline in chronological order: applied entries followed by undone-but-redoable ones. */
+  const historyTimeline = [...history, ...[...redoStack].reverse()];
+  /** Index (into historyTimeline) of the last applied entry — -1 means nothing applied. */
+  const historyIndex = history.length - 1;
+
+  /** Moves the undo/redo boundary directly to `targetIndex`, applying/reverting every entry in between in one go. */
+  const jumpToHistory = async (targetIndex: number) => {
+    if (busy || targetIndex === historyIndex) return;
+    setBusy(true);
+    try {
+      if (targetIndex < historyIndex) {
+        const toUndo = historyTimeline.slice(targetIndex + 1, historyIndex + 1).reverse();
+        for (const entry of toUndo) await applyHistoryChanges(entry.changes, false);
+      } else {
+        const toRedo = historyTimeline.slice(historyIndex + 1, targetIndex + 1);
+        for (const entry of toRedo) await applyHistoryChanges(entry.changes, true);
+      }
+      setHistory(historyTimeline.slice(0, targetIndex + 1));
+      setRedoStack([...historyTimeline.slice(targetIndex + 1)].reverse());
+      setLibraryTags({});
+      await filesApi.refresh();
+      notify(
+        targetIndex < 0 ? "Jumped to session start" : `Jumped to: ${historyTimeline[targetIndex].label}`,
+        "success",
+      );
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Read-only diff of every change applied so far this session, reusing the preview table. */
+  const showHistoryCompare = () => {
+    const rows: PendingChange[] = history.flatMap((entry, i) =>
+      entry.changes.map((c, j) => ({
+        id: `hist::${i}::${j}`,
+        path: c.path,
+        filename: basename(c.path),
+        field: c.field,
+        before: String(c.before),
+        after: String(c.after),
+        include: true,
+        changed: true,
+        kind: "update" as const,
+      })),
+    );
+    setPreviewMode("history");
+    setPending(rows);
+  };
   const [dropActive, setDropActive] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number; label: string } | null>(
     null,
@@ -166,6 +260,32 @@ export default function App() {
     if (loaded) ai.check(settings.ollamaUrl);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
+
+  // Accumulates local Ollama token usage into settings.usage as AI calls complete.
+  useEffect(() => {
+    const unlisten = listen<{
+      model: string;
+      promptEvalCount: number;
+      evalCount: number;
+      tracks: number;
+    }>("ai-usage", (e) => {
+      const { promptEvalCount, evalCount, tracks } = e.payload;
+      const prev = settingsRef.current;
+      save({
+        ...prev,
+        usage: {
+          totalPromptTokens: prev.usage.totalPromptTokens + promptEvalCount,
+          totalCompletionTokens: prev.usage.totalCompletionTokens + evalCount,
+          totalCalls: prev.usage.totalCalls + 1,
+          songsProcessed: prev.usage.songsProcessed + tracks,
+        },
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Eagerly read tags for files in the list so table columns fill in.
   useEffect(() => {
@@ -234,6 +354,10 @@ export default function App() {
     }
   };
 
+  // Remembers the transform used to build the current standardize preview so
+  // applyPending can also apply it to filenames (see standardizeFilename).
+  const lastStandardizeTransformRef = useRef<((value: string) => string) | null>(null);
+
   const runStandardize = async (
     mode: PreviewMode,
     transform: (value: string, field: string) => string,
@@ -241,11 +365,12 @@ export default function App() {
   ) => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
+    lastStandardizeTransformRef.current = (v: string) => transform(v, "filename");
     setBusy(true);
     try {
       const { map, errors } = await tagsApi.read(paths);
       errors.forEach((e) => notify(e, "error"));
-      const rows = tagsApi.buildStandardizePreview(paths, map, transform);
+      const rows = tagsApi.buildStandardizePreview(paths, map, transform, settingsRef.current.standardizeFields);
       setTagsMap(map);
       setPreviewMode(mode);
       setPending(rows);
@@ -415,11 +540,39 @@ export default function App() {
         pushHistory({ label: `Apply ${previewMode}`, changes });
       }
       await afterWrite(affected);
+      if (previewMode === "standardize" && settings.standardizeFilename && lastStandardizeTransformRef.current) {
+        await renameFilenamesInPlace(affected, lastStandardizeTransformRef.current);
+      }
     } catch (e) {
       notify(String(e), "error");
     } finally {
       setBusy(false);
     }
+  };
+
+  /** Applies `transform` to each affected file's stem (extension preserved), used by Standardize's filename scope. */
+  const renameFilenamesInPlace = async (paths: string[], transform: (stem: string) => string) => {
+    let renamed = 0;
+    for (const path of paths) {
+      const file = filesApi.files.find((f) => f.path === path);
+      if (!file) continue;
+      const dot = file.filename.lastIndexOf(".");
+      const stem = dot > 0 ? file.filename.slice(0, dot) : file.filename;
+      const newStem = transform(stem).trim();
+      if (!newStem || newStem === stem) continue;
+      try {
+        const newPath = await invoke<string>("rename_file", { path, newStem });
+        const [updated] = await invoke<AudioFile[]>("list_files", { paths: [newPath] });
+        if (updated) {
+          invalidateCovers([path]);
+          filesApi.remap({ [path]: updated });
+          renamed++;
+        }
+      } catch (e) {
+        notify(String(e), "error");
+      }
+    }
+    if (renamed) notify(`Renamed ${renamed} file${renamed === 1 ? "" : "s"}`, "success");
   };
 
   const generateIds = async () => {
@@ -451,17 +604,23 @@ export default function App() {
   const renameToStandard = async () => {
     const files = filesApi.files.filter((f) => filesApi.selected.has(f.path));
     if (!files.length) return notify("No files selected", "info");
-    const ok = await confirm(
-      `Rename ${files.length} file${files.length === 1 ? "" : "s"} to "artist - title - id"? ` +
-        "Original tags are not affected.",
-      { title: "Rename to Standard", kind: "info" },
-    );
-    if (!ok) return;
+    // A deliberately narrowed selection (not "everything") is already an explicit
+    // choice — only prompt when acting on the full/default set, where the blast
+    // radius is bigger and less obviously intentional.
+    const isPartialSelection = files.length < filesApi.files.length;
+    if (!isPartialSelection) {
+      const ok = await confirm(
+        `Rename ${files.length} file${files.length === 1 ? "" : "s"} to "artist - title - id"? ` +
+          "Original tags are not affected.",
+        { title: "Rename to Standard", kind: "info" },
+      );
+      if (!ok) return;
+    }
     setBusy(true);
     try {
       const { map, errors } = await tagsApi.read(files.map((f) => f.path));
       errors.forEach((e) => notify(e, "error"));
-      const result = await tagsApi.renameFiles(files, map);
+      const result = await tagsApi.renameFiles(files, map, settings.trackIdDigits);
       result.errors.forEach((e) => notify(e, "error"));
       if (Object.keys(result.mapping).length) {
         invalidateCovers(Object.keys(result.mapping));
@@ -474,6 +633,88 @@ export default function App() {
       notify(String(e), "error");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const deleteFile = async (file: AudioFile) => {
+    const ok = await confirm(
+      `Delete "${file.filename}"? It will be moved to the Recycle Bin.`,
+      { title: "Delete File", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      await invoke("delete_file", { path: file.path });
+      invalidateCovers([file.path]);
+      filesApi.removeFiles([file.path]);
+      setLibraryTags((prev) => {
+        const next = { ...prev };
+        delete next[file.path];
+        return next;
+      });
+      notify(`Deleted "${file.filename}"`, "success");
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const setCoverArt = async (file: AudioFile) => {
+    const picked = await open({
+      title: "Choose Artwork",
+      multiple: false,
+      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "gif", "bmp"] }],
+    });
+    if (!picked || typeof picked !== "string") return;
+    try {
+      const before = await invoke<string | null>("read_cover_art", { path: file.path });
+      await invoke("set_cover_art", { path: file.path, imagePath: picked });
+      const after = await invoke<string | null>("read_cover_art", { path: file.path });
+      invalidateCovers([file.path]);
+      imageInfoApi.invalidate([file.path]);
+      pushHistory({
+        label: "Set artwork",
+        changes: [{ path: file.path, field: "__coverArt", before: before ?? "", after: after ?? "" }],
+      });
+      notify("Artwork updated", "success");
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const removeCoverArt = async (file: AudioFile) => {
+    try {
+      const before = await invoke<string | null>("read_cover_art", { path: file.path });
+      if (!before) return; // Nothing to remove — no history entry needed.
+      await invoke("remove_cover_art", { path: file.path });
+      invalidateCovers([file.path]);
+      imageInfoApi.invalidate([file.path]);
+      pushHistory({
+        label: "Remove artwork",
+        changes: [{ path: file.path, field: "__coverArt", before, after: "" }],
+      });
+      notify("Artwork removed", "success");
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const renameSingleFile = async (path: string, newStem: string) => {
+    try {
+      const newPath = await invoke<string>("rename_file", { path, newStem });
+      const [updated] = await invoke<AudioFile[]>("list_files", { paths: [newPath] });
+      if (updated) {
+        invalidateCovers([path]);
+        filesApi.remap({ [path]: updated });
+        setLibraryTags((prev) => {
+          if (!prev[path]) return prev;
+          const next = { ...prev };
+          next[newPath] = next[path];
+          delete next[path];
+          return next;
+        });
+        notify(`Renamed to "${updated.filename}"`, "success");
+      }
+    } catch (e) {
+      notify(String(e), "error");
     }
   };
 
@@ -503,6 +744,43 @@ export default function App() {
         });
       }
       await filesApi.refresh();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Edits (or, when `value` is empty, completely deletes) a raw "All Tags" field. */
+  const editRawField = async (paths: string[], rawKey: string, value: string) => {
+    setBusy(true);
+    try {
+      const changes: HistoryChange[] = [];
+      for (const path of paths) {
+        const current = libraryTags[path];
+        const before = current?.allFields?.[rawKey] ?? "";
+        if (before === value) continue;
+        await invoke("write_raw_field", { path, fieldKey: rawKey, value });
+        changes.push({ path, field: `__raw:${rawKey}`, before, after: value });
+      }
+      if (changes.length) {
+        setLibraryTags((prev) => {
+          const next = { ...prev };
+          for (const c of changes) {
+            const tags = next[c.path];
+            if (!tags) continue;
+            const allFields = { ...tags.allFields };
+            if (value) allFields[rawKey] = value;
+            else delete allFields[rawKey];
+            next[c.path] = { ...tags, allFields };
+          }
+          return next;
+        });
+        pushHistory({
+          label: `Edit ${rawKey}${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
+          changes,
+        });
+      }
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -569,6 +847,15 @@ export default function App() {
     if (!paths.length) return notify("No files selected", "info");
     if (!settings.clearFields.length)
       return notify("No fields chosen to clear — pick some in Settings", "info");
+    const backupFieldKey =
+      settings.backupField.charAt(0).toLowerCase() + settings.backupField.slice(1);
+    if (settings.searchableBackup && settings.clearFields.includes(backupFieldKey)) {
+      const ok = await confirm(
+        `Your Clear Fields settings include "${backupFieldKey}", which currently holds your searchable backup text. Clearing it will erase that backup — continue?`,
+        { title: "Clearing the backup field", kind: "warning" },
+      );
+      if (!ok) return;
+    }
     setBusy(true);
     try {
       const { map, errors } = await tagsApi.read(paths);
@@ -651,7 +938,7 @@ export default function App() {
     if (tags) setInspected({ file, tags });
   };
 
-  // Keyboard shortcuts: Ctrl+O folder, Ctrl+A select all, Ctrl+Z/Shift+Z undo/redo, Escape close.
+  // Keyboard shortcuts: customizable via settings.shortcuts (see lib/shortcuts.ts), Escape close.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -659,18 +946,22 @@ export default function App() {
       // or any other text field instead of hijacking it for tag history.
       const isEditable =
         target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+      const overrides = settingsRef.current.shortcuts;
 
-      if (e.ctrlKey && e.key.toLowerCase() === "o") {
+      if (matchesShortcut(e, "selectFolder", overrides)) {
         e.preventDefault();
         if (!busy) filesApi.selectFolder();
-      } else if (e.ctrlKey && e.key.toLowerCase() === "a") {
+      } else if (!isEditable && matchesShortcut(e, "selectAll", overrides)) {
         e.preventDefault();
         filesApi.setAll(true);
-      } else if (e.ctrlKey && !isEditable && e.key.toLowerCase() === "z") {
+      } else if (!isEditable && matchesShortcut(e, "undo", overrides)) {
         e.preventDefault();
-        if (e.shiftKey) void redo();
-        else void undo();
-      } else if (e.ctrlKey && !isEditable && e.key.toLowerCase() === "y") {
+        void undo();
+      } else if (!isEditable && matchesShortcut(e, "redo", overrides)) {
+        e.preventDefault();
+        void redo();
+      } else if (!isEditable && e.ctrlKey && e.key.toLowerCase() === "y") {
+        // Legacy secondary redo binding, not user-customizable.
         e.preventDefault();
         void redo();
       } else if (e.key === "Escape") {
@@ -692,6 +983,7 @@ export default function App() {
           onToggleTheme={() => save({ ...settings, theme: settings.theme === "dark" ? "light" : "dark" })}
           fileCount={filesApi.files.length}
           ollamaRunning={ai.status ? ai.status.running : null}
+          errorLogCount={logs.filter((l) => l.kind === "error").length}
         />
         <main className="relative min-w-0 flex-1 overflow-y-auto">
           {page === "library" ? (
@@ -707,31 +999,49 @@ export default function App() {
               onStopBackup={tagsApi.stopBackup}
               canUndo={history.length > 0}
               canRedo={redoStack.length > 0}
-              onUndo={undo}
-              onRedo={redo}
+              onUndo={withTrack("undo", undo)}
+              onRedo={withTrack("redo", redo)}
+              historyTimeline={historyTimeline.map((e) => ({ label: e.label, changeCount: e.changes.length }))}
+              historyIndex={historyIndex}
+              onJumpToHistory={jumpToHistory}
+              onCompare={withTrack("compare", showHistoryCompare)}
               pending={pending}
               previewMode={previewMode}
               lastFolder={settings.lastFolder}
               onPendingChange={setPending}
               onApplyPending={applyPending}
               onCancelPending={() => setPending(null)}
-              onCleanTags={runCleanTags}
-              onAIClean={runAIClean}
+              onCleanTags={withTrack("cleanTags", runCleanTags)}
+              onAIClean={withTrack("aiClean", runAIClean)}
               onStopAI={ai.stop}
-              onStandardize={runStandardizeRules}
-              onRemoveChars={runRemoveChars}
-              onGenre={runGenre}
-              onGenerateIds={generateIds}
-              onRename={renameToStandard}
-              onClearFields={runClearFields}
+              onStandardize={withTrack("standardize", runStandardizeRules)}
+              onRemoveChars={withTrack("removeChars", runRemoveChars)}
+              onGenre={withTrack("genre", runGenre)}
+              onGenerateIds={withTrack("generateIds", generateIds)}
+              onRename={withTrack("renameToStandard", renameToStandard)}
+              onClearFields={withTrack("clearFields", runClearFields)}
               onAddGenre={addGenreToPreset}
               onRenameGenre={renameGenreInPreset}
-              onBackup={runBackup}
-              onRestore={restoreBackup}
+              onBackup={withTrack("backup", runBackup)}
+              onRestore={withTrack("restore", restoreBackup)}
               onEditField={editField}
+              onEditRawField={editRawField}
               onEditRating={editRating}
               onInspect={inspect}
+              onDeleteFile={withTrack1("deleteFile", deleteFile)}
+              onRenameFile={renameSingleFile}
+              imageInfo={imageInfoApi.info}
+              onFetchImageInfo={imageInfoApi.fetchOne}
+              onSetCoverArt={withTrack1("setCoverArt", setCoverArt)}
+              onRemoveCoverArt={withTrack1("removeCoverArt", removeCoverArt)}
               onSaveSettings={save}
+              backupFieldId={
+                settings.searchableBackup
+                  ? settings.backupField.charAt(0).toLowerCase() + settings.backupField.slice(1)
+                  : null
+              }
+              shortcuts={settings.shortcuts}
+              onTrack={analytics.track}
             />
           ) : page === "components" ? (
             <ComponentsPage
@@ -739,8 +1049,15 @@ export default function App() {
               notify={notify}
               onOllamaChanged={() => void ai.check(settingsRef.current.ollamaUrl)}
             />
+          ) : page === "logs" ? (
+            <LogsPage
+              logs={logs}
+              onClear={() => setLogs([])}
+              actionCounts={analytics.counts}
+              onResetActionCounts={analytics.reset}
+            />
           ) : (
-            <SettingsPage settings={settings} onSave={save} checkOllama={ai.check} />
+            <SettingsPage settings={settings} onSave={save} checkOllama={ai.check} notify={notify} />
           )}
         </main>
       </div>

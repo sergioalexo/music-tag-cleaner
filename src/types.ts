@@ -4,6 +4,7 @@ export interface AudioFile {
   format: string;
   size: number;
   hasBackup: boolean;
+  durationSecs?: number;
 }
 
 export interface TagData {
@@ -63,13 +64,33 @@ export interface CharReplacement {
   from: string;
   to: string;
   enabled: boolean;
+  /** Defaults to true (preserves prior literal-match behavior) when unset. */
+  caseSensitive?: boolean;
 }
 
 export type Capitalization = "asis" | "upper" | "title" | "lower";
 
-export type BackupField = "Composer" | "OriginalArtist" | "Comment";
+export type BackupField = "Composer" | "OriginalArtist" | "Comment" | "Album" | "AlbumArtist" | "Genre";
 
 export type RowHeight = "compact" | "normal" | "tall";
+
+/** Cumulative local Ollama usage — tracked for the usage dashboard, not billed. */
+export interface UsageStats {
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalCalls: number;
+  songsProcessed: number;
+}
+
+/**
+ * Scaffolding for a possible future paid/cloud tier. Ollama itself is local
+ * and free — "credits" here are a placeholder unit (1 credit ≈ 1000 tokens)
+ * so the usage UI has something concrete to show, not a real balance.
+ */
+export interface PlanInfo {
+  tier: "free" | "pro";
+  creditsTotal: number;
+}
 
 export interface GenrePreset {
   name: string;
@@ -85,7 +106,7 @@ export interface Settings {
   stripToCommon: boolean;
   preserveCoverArt: boolean;
   recursive: boolean;
-  /** When true, write "file name - artist - title - year" into the backup field. */
+  /** When true, write "file name | | artist | | title | | year" into the backup field. */
   searchableBackup: boolean;
   /** Tag field the searchable backup is written into. */
   backupField: BackupField;
@@ -104,8 +125,10 @@ export interface Settings {
   /** Named genre presets; the Genre action snaps genres to the active one. */
   genrePresets: GenrePreset[];
   activeGenrePreset: string;
-  /** Next sequential track ID to assign (6-digit, zero-padded). */
+  /** Next sequential track ID to assign (zero-padded to trackIdDigits). */
   nextTrackId: number;
+  /** Digit count for generated track IDs (also the required length to count as a UID). */
+  trackIdDigits: number;
   /** Fields the "Clear Fields" action empties. */
   clearFields: string[];
   /**
@@ -115,6 +138,14 @@ export interface Settings {
   transliterateScripts: string[];
   /** Bumped when defaults change so saved settings can be migrated. */
   settingsVersion: number;
+  /** Custom key-combo overrides, keyed by shortcut action id (see lib/shortcuts.ts). */
+  shortcuts: Record<string, string>;
+  usage: UsageStats;
+  plan: PlanInfo;
+  /** Tag fields the Standardize/Remove-Chars actions touch. */
+  standardizeFields: string[];
+  /** When true, Standardize also renames the file using the same rules. */
+  standardizeFilename: boolean;
 }
 
 /** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */
@@ -126,7 +157,7 @@ export const TRANSLITERATE_SCRIPTS = [
   { id: "Chinese/Japanese/Korean", label: "Chinese / Japanese / Korean", hint: "" },
 ] as const;
 
-export type PreviewMode = "strip" | "ai" | "standardize" | "genre" | "clear";
+export type PreviewMode = "strip" | "ai" | "standardize" | "genre" | "clear" | "history";
 
 /** Fields the Clear Fields action can target. */
 export const CLEARABLE_FIELDS = [

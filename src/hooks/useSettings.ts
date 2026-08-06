@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-const CURRENT_SETTINGS_VERSION = 2;
+export const CURRENT_SETTINGS_VERSION = 2;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -39,9 +39,15 @@ export const DEFAULT_SETTINGS: Settings = {
   genrePresets: DEFAULT_GENRE_PRESETS,
   activeGenrePreset: "Sergio Alexo",
   nextTrackId: 0,
+  trackIdDigits: 6,
   clearFields: ["album"],
   transliterateScripts: [],
   settingsVersion: CURRENT_SETTINGS_VERSION,
+  shortcuts: {},
+  usage: { totalPromptTokens: 0, totalCompletionTokens: 0, totalCalls: 0, songsProcessed: 0 },
+  plan: { tier: "free", creditsTotal: 5000 },
+  standardizeFields: ["title", "artist", "album", "albumArtist"],
+  standardizeFilename: false,
 };
 
 const STORE_FILE = "settings.json";
@@ -50,7 +56,7 @@ const STORE_FILE = "settings.json";
  * Brings older saved settings up to date. v2 ensures the Preview and Rating
  * columns (added after some users' settings were first saved) are visible.
  */
-function migrate(s: Settings, savedVersion: number): Settings {
+export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
   if (savedVersion < 2) {
     const cols = [...next.visibleColumns];

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
@@ -16,6 +17,7 @@ import {
   RotateCw,
   Server,
   Sparkles,
+  Trash2,
   XCircle,
 } from "lucide-react";
 import type { ComponentProgress, OllamaInfo, OllamaStatus } from "../types";
@@ -48,6 +50,25 @@ function ProgressBar({ value }: { value: number | null }) {
   );
 }
 
+/** Maps opaque Tauri updater errors to a plain-language explanation, with the raw error kept for debugging. */
+function describeUpdateError(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const lower = raw.toLowerCase();
+  let hint: string;
+  if (lower.includes("error sending request") || lower.includes("dns") || lower.includes("network")) {
+    hint = "Could not reach the update server — check your internet connection.";
+  } else if (lower.includes("404") || lower.includes("not found")) {
+    hint = "No update endpoint found — a release may not be published yet.";
+  } else if (lower.includes("signature")) {
+    hint = "The update failed signature verification — it may be corrupted or tampered with.";
+  } else if (lower.includes("json") || lower.includes("parse") || lower.includes("deserialize")) {
+    hint = "The update server returned an unexpected response.";
+  } else {
+    hint = "Update check failed.";
+  }
+  return `${hint} (${raw})`;
+}
+
 function InfoTile({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg bg-secondary/50 px-3 py-2">
@@ -67,6 +88,7 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
   const [starting, setStarting] = useState(false);
   const [pulling, setPulling] = useState(false);
   const [pullName, setPullName] = useState("");
+  const [deletingModel, setDeletingModel] = useState<string | null>(null);
   const [progress, setProgress] = useState<ComponentProgress | null>(null);
   const pollTimer = useRef<number | null>(null);
 
@@ -92,7 +114,7 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
       setUpdateChecked(true);
       if (!result) notify("You're on the latest version", "success");
     } catch (e) {
-      notify(`Could not check for updates: ${e}`, "error");
+      notify(describeUpdateError(e), "error");
     } finally {
       setCheckingUpdate(false);
     }
@@ -117,7 +139,7 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
       setInstalled(true);
       notify(`Version ${update.version} installed — restart to apply`, "success");
     } catch (e) {
-      notify(`Update failed: ${e}`, "error");
+      notify(`Update failed: ${describeUpdateError(e)}`, "error");
     } finally {
       setDownloading(false);
     }
@@ -211,6 +233,24 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
     } finally {
       setPulling(false);
       setProgress(null);
+    }
+  };
+
+  const deleteModel = async (name: string) => {
+    const ok = await confirm(`Delete model "${name}"? You'll need to pull it again to use it.`, {
+      title: "Delete Model",
+      kind: "warning",
+    });
+    if (!ok) return;
+    setDeletingModel(name);
+    try {
+      await invoke("delete_model", { url: ollamaUrl, model: name });
+      notify(`Model ${name} deleted`, "success");
+      await refresh();
+    } catch (e) {
+      notify(`Could not delete ${name}: ${e}`, "error");
+    } finally {
+      setDeletingModel(null);
     }
   };
 
@@ -428,7 +468,19 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
                     className="flex items-center gap-2 rounded-lg bg-secondary/50 px-3 py-2 font-mono text-sm"
                   >
                     <CheckCircle2 className="h-3.5 w-3.5 text-primary" />
-                    {m}
+                    <span className="flex-1">{m}</span>
+                    <button
+                      onClick={() => deleteModel(m)}
+                      disabled={deletingModel === m}
+                      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/15 hover:text-destructive disabled:opacity-50"
+                      title={`Delete ${m}`}
+                    >
+                      {deletingModel === m ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                    </button>
                   </li>
                 ))}
               </ul>

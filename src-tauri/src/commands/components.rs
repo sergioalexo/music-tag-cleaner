@@ -208,3 +208,22 @@ pub async fn pull_model(app: AppHandle, url: String, model: String) -> Result<()
     }
     Ok(())
 }
+
+/// Removes a locally installed model through Ollama's delete API.
+#[tauri::command]
+pub async fn delete_model(url: String, model: String) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .delete(format!("{}/api/delete", url.trim_end_matches('/')))
+        .json(&json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Ollama: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Ollama returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}

@@ -13,6 +13,7 @@ interface Props {
 
 export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, onCancel }: Props) {
   const [showUnchanged, setShowUnchanged] = useState(false);
+  const readOnly = mode === "history";
 
   const visible = useMemo(
     () => (showUnchanged ? rows : rows.filter((r) => r.changed)),
@@ -54,12 +55,14 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
                   ? "Preview — Genre Match"
                   : mode === "clear"
                     ? "Preview — Clear Fields"
-                    : "Preview — Standardize"}
+                    : mode === "history"
+                      ? "Session Changes"
+                      : "Preview — Standardize"}
           </h2>
           <p className="text-xs text-muted-foreground">
-            {changedCount} change{changedCount === 1 ? "" : "s"} across{" "}
-            {new Set(rows.filter((r) => r.changed).map((r) => r.path)).size} file(s) — nothing is
-            written until you apply
+            {readOnly
+              ? `${changedCount} change${changedCount === 1 ? "" : "s"} across ${new Set(rows.map((r) => r.path)).size} file(s) this session — already applied`
+              : `${changedCount} change${changedCount === 1 ? "" : "s"} across ${new Set(rows.filter((r) => r.changed).map((r) => r.path)).size} file(s) — nothing is written until you apply`}
           </p>
         </div>
         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -81,7 +84,7 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
               <th className="px-3 py-2 font-medium">Field</th>
               <th className="px-3 py-2 font-medium">Before</th>
               <th className="px-3 py-2 font-medium">After</th>
-              <th className="px-3 py-2 text-center font-medium">Include</th>
+              {!readOnly && <th className="px-3 py-2 text-center font-medium">Include</th>}
             </tr>
           </thead>
           <tbody>
@@ -113,8 +116,10 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
                     {row.before || <span className="italic opacity-60">(empty)</span>}
                   </td>
                   <td className="max-w-[280px] px-3 py-1.5">
-                    {row.kind === "remove" ? (
-                      <span className="italic text-destructive">{row.after}</span>
+                    {row.kind === "remove" || readOnly ? (
+                      <span className={cn(row.kind === "remove" && "italic text-destructive")}>
+                        {row.after || <span className="italic opacity-60">(empty)</span>}
+                      </span>
                     ) : (
                       <input
                         value={row.after}
@@ -126,23 +131,25 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
                       />
                     )}
                   </td>
-                  <td className="px-3 py-1.5 text-center">
-                    {row.changed && (
-                      <input
-                        type="checkbox"
-                        className="accent-[var(--primary)]"
-                        checked={row.include}
-                        onChange={(e) => setInclude(row.id, e.target.checked)}
-                      />
-                    )}
-                  </td>
+                  {!readOnly && (
+                    <td className="px-3 py-1.5 text-center">
+                      {row.changed && (
+                        <input
+                          type="checkbox"
+                          className="accent-[var(--primary)]"
+                          checked={row.include}
+                          onChange={(e) => setInclude(row.id, e.target.checked)}
+                        />
+                      )}
+                    </td>
+                  )}
                 </tr>
               );
             })}
             {visible.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">
-                  No changes to show — these files are already clean.
+                <td colSpan={readOnly ? 4 : 5} className="px-3 py-8 text-center text-muted-foreground">
+                  {readOnly ? "No changes made yet this session." : "No changes to show — these files are already clean."}
                 </td>
               </tr>
             )}
@@ -151,22 +158,28 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
       </div>
 
       <div className="flex items-center justify-between border-t px-4 py-3">
-        <div className="flex gap-2">
-          <Button variant="secondary" size="sm" onClick={() => setAll(true)}>
-            ✓ Select All
-          </Button>
-          <Button variant="secondary" size="sm" onClick={() => setAll(false)}>
-            ✗ Deselect All
-          </Button>
-        </div>
+        {readOnly ? (
+          <div />
+        ) : (
+          <div className="flex gap-2">
+            <Button variant="secondary" size="sm" onClick={() => setAll(true)}>
+              ✓ Select All
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => setAll(false)}>
+              ✗ Deselect All
+            </Button>
+          </div>
+        )}
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>
-            Cancel
+            {readOnly ? "Close" : "Cancel"}
           </Button>
-          <Button size="sm" onClick={onApply} disabled={busy || includedCount === 0}>
-            Apply Selected ({includedCount} change{includedCount === 1 ? "" : "s"}, {fileCount}{" "}
-            file{fileCount === 1 ? "" : "s"})
-          </Button>
+          {!readOnly && (
+            <Button size="sm" onClick={onApply} disabled={busy || includedCount === 0}>
+              Apply Selected ({includedCount} change{includedCount === 1 ? "" : "s"}, {fileCount}{" "}
+              file{fileCount === 1 ? "" : "s"})
+            </Button>
+          )}
         </div>
       </div>
     </div>
