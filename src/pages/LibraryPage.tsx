@@ -166,7 +166,9 @@ export function LibraryPage({
   // AI/Standardize/Genre/Clear previews are shown inline in the table itself.
   // Strip keeps the dedicated table below, since it removes arbitrary custom
   // tag fields that have no corresponding column to show a diff in.
-  const inlinePreview = !!pending && previewMode !== "strip";
+  // "history" is a read-only session diff and "strip" needs its own table, so
+  // neither gets the inline editable preview (or its Apply bar).
+  const inlinePreview = !!pending && previewMode !== "strip" && previewMode !== "history";
   const changedCount = pending?.filter((r) => r.changed).length ?? 0;
   const includedCount = pending?.filter((r) => r.changed && r.include).length ?? 0;
   const fileCount = pending
@@ -225,7 +227,9 @@ export function LibraryPage({
             <p className="text-xs text-muted-foreground">
               {includedCount} of {changedCount} change{changedCount === 1 ? "" : "s"} selected across{" "}
               {fileCount} file{fileCount === 1 ? "" : "s"} — nothing is written until you apply.
-              Click a highlighted cell to include/exclude it, double-click to edit the new value.
+              Click a highlighted cell to include/exclude it, or the box in a column header to do
+              the whole column. Select rows first (Shift/Ctrl+click) and one click covers that
+              column across the selection. Double-click a cell to edit the new value.
             </p>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -373,9 +377,18 @@ export function LibraryPage({
               Stop AI
             </Button>
           ) : (
-            <Button variant="violet" onClick={onAIClean} disabled={noSel}>
+            <Button
+              variant="violet"
+              onClick={onAIClean}
+              disabled={noSel}
+              title={
+                settings.aiBackend === "manual"
+                  ? "Copy the prompt into any AI (ChatGPT, Claude, Gemini…) and paste its answer back"
+                  : "Clean Artist, Title, Year and Genre with the local Ollama model"
+              }
+            >
               <Sparkles />
-              AI Clean
+              AI Clean{settings.aiBackend === "manual" ? " (manual)" : ""}
             </Button>
           )}
 
@@ -405,7 +418,17 @@ export function LibraryPage({
             <Trash2 />
             Clear Fields
           </Button>
-          <Button variant="secondary" size="sm" onClick={onGenre} disabled={noSel}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onGenre}
+            disabled={noSel}
+            title={
+              settings.aiBackend === "manual"
+                ? `Match each genre to the "${settings.activeGenrePreset}" preset by copy/paste into any AI`
+                : `Match each genre to the "${settings.activeGenrePreset}" preset using the local model`
+            }
+          >
             <Tags />
             Genre: {settings.activeGenrePreset}
           </Button>
@@ -423,12 +446,12 @@ export function LibraryPage({
 
           <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
             <SquarePen className="h-3.5 w-3.5" />
-            Double-click a field to edit · artwork for all tags
+            Click to select, Shift/Ctrl to extend · tick the box to choose targets
           </span>
         </div>
       )}
 
-      {pending && previewMode === "strip" ? (
+      {pending && (previewMode === "strip" || previewMode === "history") ? (
         <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
           <PreviewTable
             rows={pending}

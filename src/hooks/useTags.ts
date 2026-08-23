@@ -17,6 +17,28 @@ function backupArg(s: Settings): string | null {
   return s.searchableBackup ? s.backupField : null;
 }
 
+/**
+ * Builds the argument object for the `write_tags` command. Every call site goes
+ * through here: the keys must match write_tags' Rust parameter names exactly,
+ * and a mismatched optional key (e.g. `backupField`) deserializes to None
+ * rather than erroring, which silently disables the searchable backup.
+ */
+function writeTagsArgs(
+  path: string,
+  tags: TagData,
+  settings: Settings,
+  keepExtra: string[],
+): Record<string, unknown> {
+  return {
+    path,
+    tags,
+    backup: settings.backupBeforeChanges,
+    keepExtra,
+    preserveArt: settings.preserveCoverArt,
+    backupField: backupArg(settings),
+  };
+}
+
 export interface ApplyResult {
   written: number;
   errors: string[];
@@ -184,14 +206,7 @@ export function useTags() {
       if (!removals.some((r) => r.include)) continue; // nothing to strip for this file
       const keepExtra = removals.filter((r) => !r.include).map((r) => r.field);
       try {
-        await invoke("write_tags", {
-          path,
-          tags,
-          backup: settings.backupBeforeChanges,
-          keepExtra,
-          preserveArt: settings.preserveCoverArt,
-          backupField: backupArg(settings),
-        });
+        await invoke("write_tags", writeTagsArgs(path, tags, settings, keepExtra));
         written++;
       } catch (e) {
         errors.push(`${basename(path)}: ${e}`);
@@ -226,14 +241,7 @@ export function useTags() {
       // over untouched; otherwise the write also strips (per settings).
       const keepExtra = keepAllExtras || !settings.stripToCommon ? preserveExtras(current) : [];
       try {
-        await invoke("write_tags", {
-          path,
-          tags,
-          backup: settings.backupBeforeChanges,
-          keepExtra,
-          preserveArt: settings.preserveCoverArt,
-          backupField: backupArg(settings),
-        });
+        await invoke("write_tags", writeTagsArgs(path, tags, settings, keepExtra));
         written++;
       } catch (e) {
         errors.push(`${basename(path)}: ${e}`);
@@ -251,14 +259,7 @@ export function useTags() {
     settings: Settings,
   ): Promise<void> => {
     const tags = { ...current, [field]: value } as TagData;
-    await invoke("write_tags", {
-      path,
-      tags,
-      backup: settings.backupBeforeChanges,
-      keepExtra: preserveExtras(current),
-      preserveArt: settings.preserveCoverArt,
-      searchableBackup: settings.searchableBackup,
-    });
+    await invoke("write_tags", writeTagsArgs(path, tags, settings, preserveExtras(current)));
   };
 
   /**

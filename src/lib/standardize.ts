@@ -129,13 +129,29 @@ export function buildRenameStem(
   return parts.join(" - ");
 }
 
+/**
+ * Clamps a user-supplied track-id width to a usable range. `digits` reaches
+ * these helpers straight from settings, and an out-of-range or non-numeric
+ * value would otherwise build an invalid RegExp (throwing) or a nonsensical
+ * padding width.
+ */
+export function safeTrackIdDigits(digits: number): number {
+  if (!Number.isFinite(digits)) return 6;
+  return Math.min(12, Math.max(1, Math.floor(digits)));
+}
+
 /** A track number counts as a generated UID if it is exactly `digits` digits long. */
 export function isUid(value: string | undefined, digits = 6): boolean {
-  return !!value && new RegExp(`^\\d{${digits}}$`).test(value.trim());
+  if (!value) return false;
+  const trimmed = value.trim();
+  const n = safeTrackIdDigits(digits);
+  return trimmed.length === n && /^\d+$/.test(trimmed);
 }
 
 /** Formats a sequential id as a zero-padded `digits`-digit string (0 -> "000...0"). */
 export function formatTrackId(n: number, digits = 6): string {
-  const max = 10 ** digits;
-  return String(Math.max(0, Math.floor(n)) % max).padStart(digits, "0");
+  const width = safeTrackIdDigits(digits);
+  const max = 10 ** width;
+  const value = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  return String(value % max).padStart(width, "0");
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AudioFile } from "../types";
 
@@ -9,6 +9,9 @@ import type { AudioFile } from "../types";
  */
 export function useCovers(files: AudioFile[]) {
   const [covers, setCovers] = useState<Record<string, string | null>>({});
+  // Bumped by invalidate() so the loader re-runs — dropping cache entries alone
+  // would not, since `files` keeps its identity when only the art changed.
+  const [reloadToken, setReloadToken] = useState(0);
   const coversRef = useRef(covers);
   coversRef.current = covers;
 
@@ -34,16 +37,18 @@ export function useCovers(files: AudioFile[]) {
     return () => {
       cancelled = true;
     };
-  }, [files]);
+  }, [files, reloadToken]);
 
   /** Drops cached art for paths that changed (after a write), forcing a reload. */
-  const invalidate = (paths: string[]) => {
+  const invalidate = useCallback((paths: string[]) => {
+    if (!paths.length) return;
     setCovers((prev) => {
       const next = { ...prev };
       for (const p of paths) delete next[p];
       return next;
     });
-  };
+    setReloadToken((t) => t + 1);
+  }, []);
 
   return { covers, invalidate };
 }

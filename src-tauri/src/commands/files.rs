@@ -92,51 +92,66 @@ fn file_info(path: &Path) -> AudioFile {
     }
 }
 
+// scan_folder / list_files / import_paths each parse every file they touch, so
+// they run on the blocking pool. Their duration scales with the folder size, so
+// they intentionally skip run_blocking's fixed per-operation timeout.
 #[tauri::command]
 pub async fn scan_folder(path: String, recursive: bool) -> Result<Vec<AudioFile>, String> {
-    let root = Path::new(&path);
-    if !root.is_dir() {
-        return Err(format!("Not a folder: {path}"));
-    }
-    let max_depth = if recursive { usize::MAX } else { 1 };
-    let mut files: Vec<AudioFile> = WalkDir::new(root)
-        .max_depth(max_depth)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-        .map(|e| file_info(e.path()))
-        .collect();
-    files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
-    Ok(files)
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = Path::new(&path);
+        if !root.is_dir() {
+            return Err(format!("Not a folder: {path}"));
+        }
+        let max_depth = if recursive { usize::MAX } else { 1 };
+        let mut files: Vec<AudioFile> = WalkDir::new(root)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_audio(e.path()))
+            .map(|e| file_info(e.path()))
+            .collect();
+        files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        Ok(files)
+    })
+    .await
+    .map_err(|_| "Scanning the folder failed unexpectedly".to_string())?
 }
 
 #[tauri::command]
 pub async fn list_files(paths: Vec<String>) -> Vec<AudioFile> {
-    paths.iter().map(|p| file_info(Path::new(p))).collect()
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.iter().map(|p| file_info(Path::new(p))).collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Imports a mix of files and folders (as produced by a drag-and-drop),
 /// recursing into any folders. Non-audio paths are ignored.
 #[tauri::command]
 pub async fn import_paths(paths: Vec<String>, recursive: bool) -> Vec<AudioFile> {
-    let max_depth = if recursive { usize::MAX } else { 1 };
-    let mut out: Vec<AudioFile> = Vec::new();
-    for p in paths {
-        let path = Path::new(&p);
-        if path.is_dir() {
-            out.extend(
-                WalkDir::new(path)
-                    .max_depth(max_depth)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-                    .map(|e| file_info(e.path())),
-            );
-        } else if path.is_file() && is_audio(path) {
-            out.push(file_info(path));
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_depth = if recursive { usize::MAX } else { 1 };
+        let mut out: Vec<AudioFile> = Vec::new();
+        for p in paths {
+            let path = Path::new(&p);
+            if path.is_dir() {
+                out.extend(
+                    WalkDir::new(path)
+                        .max_depth(max_depth)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file() && is_audio(e.path()))
+                        .map(|e| file_info(e.path())),
+                );
+            } else if path.is_file() && is_audio(path) {
+                out.push(file_info(path));
+            }
         }
-    }
-    out
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
@@ -303,26 +318,45 @@ fn build_searchable_backup(
 
 #[tauri::command]
 pub async fn read_tags(path: String) -> Result<TagData, String> {
-    read_tags_impl(&path)
+    run_blocking(move || read_tags_impl(&path)).await
 }
 
+/// Reads many files' tags off the async runtime. Deliberately *not* wrapped in
+/// `run_blocking`: its timeout is per-operation, and a legitimately large batch
+/// can outlast it. Each file still reports its own error, so one unreadable
+/// file never fails the batch.
 #[tauri::command]
 pub async fn read_tags_batch(paths: Vec<String>) -> Vec<TagReadResult> {
-    paths
-        .into_iter()
-        .map(|p| match read_tags_impl(&p) {
-            Ok(tags) => TagReadResult {
-                path: p,
-                tags: Some(tags),
-                error: None,
-            },
-            Err(e) => TagReadResult {
+    let fallback: Vec<String> = paths.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| match read_tags_impl(&p) {
+                Ok(tags) => TagReadResult {
+                    path: p,
+                    tags: Some(tags),
+                    error: None,
+                },
+                Err(e) => TagReadResult {
+                    path: p,
+                    tags: None,
+                    error: Some(e),
+                },
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    joined.unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|p| TagReadResult {
                 path: p,
                 tags: None,
-                error: Some(e),
-            },
-        })
-        .collect()
+                error: Some("Reading tags failed unexpectedly".to_string()),
+            })
+            .collect()
+    })
 }
 
 /// Writes the common fields in `tags`, dropping everything else.
@@ -347,7 +381,21 @@ pub async fn write_tags(
     preserve_art: bool,
     backup_field: Option<String>,
 ) -> Result<(), String> {
-    let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    run_blocking(move || {
+        write_tags_blocking(&path, tags, backup, keep_extra, preserve_art, backup_field)
+    })
+    .await
+}
+
+fn write_tags_blocking(
+    path: &str,
+    tags: TagData,
+    backup: bool,
+    keep_extra: Vec<String>,
+    preserve_art: bool,
+    backup_field: Option<String>,
+) -> Result<(), String> {
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     // Prefer the format's canonical tag so fields aren't lost to a limited
     // secondary tag (e.g. ID3v1) that happened to be present.
     let tag_type = tagged
@@ -401,7 +449,7 @@ pub async fn write_tags(
                 None => (None, None, None),
             };
             // Always write — the filename slot alone is a valid backup.
-            new_tag.insert_text(key, build_searchable_backup(&path, artist, title, year));
+            new_tag.insert_text(key, build_searchable_backup(path, artist, title, year));
         }
     }
 
@@ -440,11 +488,11 @@ pub async fn write_tags(
     drop(tagged);
     for tt in other_types {
         Tag::new(tt)
-            .remove_from_path(&path)
+            .remove_from_path(path)
             .map_err(|e| e.to_string())?;
     }
     new_tag
-        .save_to_path(&path, WriteOptions::default())
+        .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())
 }
 
@@ -455,7 +503,11 @@ pub async fn write_tags(
 /// `allFields` can surface, known or unknown to lofty.
 #[tauri::command]
 pub async fn write_raw_field(path: String, field_key: String, value: String) -> Result<(), String> {
-    let mut tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    run_blocking(move || write_raw_field_blocking(&path, &field_key, &value)).await
+}
+
+fn write_raw_field_blocking(path: &str, field_key: &str, value: &str) -> Result<(), String> {
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let tag_type = tagged
         .primary_tag()
         .map(|t| t.tag_type())
@@ -477,7 +529,7 @@ pub async fn write_raw_field(path: String, field_key: String, value: String) -> 
         tag.insert_text(existing_key, value.to_string());
     }
     tagged
-        .save_to_path(&path, WriteOptions::default())
+        .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())
 }
 
@@ -547,8 +599,12 @@ fn backup_file_blocking(path: &str, backup_field: &str) -> Result<(), String> {
 /// has no cover art. Used for lazy thumbnail loading in the track table.
 #[tauri::command]
 pub async fn read_cover_art(path: String) -> Result<Option<String>, String> {
+    run_blocking(move || read_cover_art_blocking(&path)).await
+}
+
+fn read_cover_art_blocking(path: &str) -> Result<Option<String>, String> {
     use base64::Engine;
-    let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(None);
     };
@@ -568,7 +624,11 @@ pub async fn read_cover_art(path: String) -> Result<Option<String>, String> {
 /// the picture bytes with the `image` crate (lofty exposes the mime/bytes only).
 #[tauri::command]
 pub async fn image_info(path: String) -> Result<Option<ImageInfo>, String> {
-    let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+    run_blocking(move || image_info_blocking(&path)).await
+}
+
+fn image_info_blocking(path: &str) -> Result<Option<ImageInfo>, String> {
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(None);
     };
@@ -658,15 +718,18 @@ fn remove_all_pictures(path: &str) -> Result<(), String> {
 /// Embeds `image_path` as the file's cover art, replacing any existing picture.
 #[tauri::command]
 pub async fn set_cover_art(path: String, image_path: String) -> Result<(), String> {
-    let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
-    let mime = mime_from_extension(&image_path);
-    embed_picture_bytes(&path, mime, bytes)
+    run_blocking(move || {
+        let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+        let mime = mime_from_extension(&image_path);
+        embed_picture_bytes(&path, mime, bytes)
+    })
+    .await
 }
 
 /// Removes all embedded cover art from the file.
 #[tauri::command]
 pub async fn remove_cover_art(path: String) -> Result<(), String> {
-    remove_all_pictures(&path)
+    run_blocking(move || remove_all_pictures(&path)).await
 }
 
 /// Re-embeds (or removes, if `data_url` is `None`/empty) cover art from a
@@ -674,26 +737,33 @@ pub async fn remove_cover_art(path: String) -> Result<(), String> {
 /// without needing to keep the original source file around.
 #[tauri::command]
 pub async fn restore_cover_art(path: String, data_url: Option<String>) -> Result<(), String> {
-    use base64::Engine;
-    let Some(url) = data_url.filter(|u| !u.is_empty()) else {
-        return remove_all_pictures(&path);
-    };
-    let (meta, b64) = url.split_once(',').ok_or("Malformed image data")?;
-    let mime_str = meta
-        .strip_prefix("data:")
-        .and_then(|m| m.strip_suffix(";base64"))
-        .unwrap_or("image/jpeg");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| e.to_string())?;
-    embed_picture_bytes(&path, mime_from_data_url_type(mime_str), bytes)
+    run_blocking(move || {
+        use base64::Engine;
+        let Some(url) = data_url.filter(|u| !u.is_empty()) else {
+            return remove_all_pictures(&path);
+        };
+        let (meta, b64) = url.split_once(',').ok_or("Malformed image data")?;
+        let mime_str = meta
+            .strip_prefix("data:")
+            .and_then(|m| m.strip_suffix(";base64"))
+            .unwrap_or("image/jpeg");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| e.to_string())?;
+        embed_picture_bytes(&path, mime_from_data_url_type(mime_str), bytes)
+    })
+    .await
 }
 
 /// Renames the file to `new_stem` (extension preserved), resolving collisions
 /// by appending " (2)", " (3)", … Returns the new absolute path.
 #[tauri::command]
 pub async fn rename_file(path: String, new_stem: String) -> Result<String, String> {
-    let src = Path::new(&path);
+    run_blocking(move || rename_file_blocking(&path, &new_stem)).await
+}
+
+fn rename_file_blocking(path: &str, new_stem: &str) -> Result<String, String> {
+    let src = Path::new(path);
     if !src.is_file() {
         return Err(format!("File not found: {path}"));
     }
@@ -715,7 +785,7 @@ pub async fn rename_file(path: String, new_stem: String) -> Result<String, Strin
     let mut target = build(stem);
     // Same path (case-insensitive no-op rename) — nothing to do.
     if target == src {
-        return Ok(path);
+        return Ok(path.to_string());
     }
     let mut n = 2;
     while target.exists() {
@@ -730,11 +800,14 @@ pub async fn rename_file(path: String, new_stem: String) -> Result<String, Strin
 /// permanently, so a mistaken delete from the app can still be recovered.
 #[tauri::command]
 pub async fn delete_file(path: String) -> Result<(), String> {
-    let src = Path::new(&path);
-    if !src.is_file() {
-        return Err(format!("File not found: {path}"));
-    }
-    trash::delete(src).map_err(|e| e.to_string())
+    run_blocking(move || {
+        let src = Path::new(&path);
+        if !src.is_file() {
+            return Err(format!("File not found: {path}"));
+        }
+        trash::delete(src).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Generic text file write, used for exporting settings to a user-chosen path.

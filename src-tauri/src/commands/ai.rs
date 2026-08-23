@@ -98,6 +98,50 @@ pub fn ai_preview_prompt(transliterate_scripts: Vec<String>) -> String {
     build_system_prompt(&transliterate_scripts)
 }
 
+/// The complete prompt — the rules above plus the track list — that
+/// `ai_clean_batch` posts to Ollama.
+fn build_clean_prompt(tracks: &[TrackInput], transliterate: &[String]) -> Result<String, String> {
+    let track_list = serde_json::to_string_pretty(tracks).map_err(|e| e.to_string())?;
+    let system_prompt = build_system_prompt(transliterate);
+    Ok(format!("{system_prompt}\n\nTrack list to clean:\n{track_list}"))
+}
+
+/// Manual mode: hands the frontend the very same prompt `ai_clean_batch`
+/// would send, so the user can paste it into any AI they like and bring the
+/// answer back. Sharing one builder is the point — a hand-written copy of
+/// the rules would drift out of sync with the automated path.
+#[tauri::command]
+pub fn ai_clean_prompt(
+    tracks: Vec<TrackInput>,
+    transliterate_scripts: Vec<String>,
+) -> Result<String, String> {
+    build_clean_prompt(&tracks, &transliterate_scripts)
+}
+
+/// Manual mode: the genre-matching counterpart of `ai_clean_prompt`.
+#[tauri::command]
+pub fn ai_genre_prompt(tracks: Vec<GenreInput>, genres: Vec<String>) -> Result<String, String> {
+    build_genre_prompt(&tracks, &genres)
+}
+
+/// Manual mode: parses a response the user pasted back from an outside AI
+/// with the same tolerant parser the Ollama path uses, so markdown fences,
+/// reasoning blocks and `{"tracks": [...]}` wrappers are all accepted.
+#[tauri::command]
+pub fn ai_parse_clean_response(text: String) -> Result<Vec<CleanedTrack>, String> {
+    parse_cleaned(&text)
+}
+
+/// Manual mode: parses a pasted genre response, snapping every value to the
+/// user's preset exactly as `ai_map_genre_batch` does.
+#[tauri::command]
+pub fn ai_parse_genre_response(
+    text: String,
+    genres: Vec<String>,
+) -> Result<Vec<GenreResult>, String> {
+    parse_genres(&text, &genres)
+}
+
 #[tauri::command]
 pub async fn check_ollama(url: String) -> OllamaStatus {
     let client = match reqwest::Client::builder()
@@ -160,9 +204,7 @@ pub async fn ai_clean_batch(
     transliterate_scripts: Vec<String>,
 ) -> Result<Vec<CleanedTrack>, String> {
     let track_count = tracks.len();
-    let track_list = serde_json::to_string_pretty(&tracks).map_err(|e| e.to_string())?;
-    let system_prompt = build_system_prompt(&transliterate_scripts);
-    let prompt = format!("{system_prompt}\n\nTrack list to clean:\n{track_list}");
+    let prompt = build_clean_prompt(&tracks, &transliterate_scripts)?;
     let body = json!({
         "model": model,
         "prompt": prompt,
@@ -199,6 +241,24 @@ pub async fn ai_clean_batch(
     parse_cleaned(text)
 }
 
+/// The complete genre-matching prompt, shared by the Ollama path and manual
+/// mode so both ask for exactly the same thing.
+fn build_genre_prompt(tracks: &[GenreInput], genres: &[String]) -> Result<String, String> {
+    let track_list = serde_json::to_string_pretty(tracks).map_err(|e| e.to_string())?;
+    let allowed = genres.join(", ");
+    Ok(format!(
+        "You are a music genre classifier. For each track, choose the SINGLE best-fitting \
+genre from THIS EXACT LIST and no others:\n[{allowed}]\n\n\
+Rules:\n\
+- You MUST return one of the listed genres verbatim (exact spelling) for every track.\n\
+- Use the artist, title, and any existing genre to decide.\n\
+- If unsure, pick the closest match from the list.\n\
+OUTPUT: Return ONLY a JSON array like \
+[{{\"index\":1,\"genre\":\"Genre From List\"}}], no prose.\n\n\
+Tracks:\n{track_list}"
+    ))
+}
+
 /// Maps each track's genre to the single best fit from `genres` (the user's
 /// preset). The model must choose from the list — never invent a genre.
 #[tauri::command]
@@ -210,19 +270,7 @@ pub async fn ai_map_genre_batch(
     genres: Vec<String>,
 ) -> Result<Vec<GenreResult>, String> {
     let track_count = tracks.len();
-    let track_list = serde_json::to_string_pretty(&tracks).map_err(|e| e.to_string())?;
-    let allowed = genres.join(", ");
-    let prompt = format!(
-        "You are a music genre classifier. For each track, choose the SINGLE best-fitting \
-genre from THIS EXACT LIST and no others:\n[{allowed}]\n\n\
-Rules:\n\
-- You MUST return one of the listed genres verbatim (exact spelling) for every track.\n\
-- Use the artist, title, and any existing genre to decide.\n\
-- If unsure, pick the closest match from the list.\n\
-OUTPUT: Return ONLY a JSON array like \
-[{{\"index\":1,\"genre\":\"Genre From List\"}}], no prose.\n\n\
-Tracks:\n{track_list}"
-    );
+    let prompt = build_genre_prompt(&tracks, &genres)?;
     let body = json!({
         "model": model,
         "prompt": prompt,

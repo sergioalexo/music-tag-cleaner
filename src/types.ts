@@ -98,7 +98,11 @@ export interface GenrePreset {
 }
 
 export interface Settings {
-  aiBackend: "ollama" | "claude";
+  /**
+   * "ollama" runs the local model; "manual" hands you the prompt to paste into
+   * any AI (ChatGPT, Claude, Gemini…) and takes its answer back by paste.
+   */
+  aiBackend: "ollama" | "manual";
   ollamaUrl: string;
   ollamaModel: string;
   batchSize: number;
@@ -146,6 +150,8 @@ export interface Settings {
   standardizeFields: string[];
   /** When true, Standardize also renames the file using the same rules. */
   standardizeFilename: boolean;
+  /** Tracks per copy/paste batch in manual AI mode. */
+  manualChunkSize: number;
 }
 
 /** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */

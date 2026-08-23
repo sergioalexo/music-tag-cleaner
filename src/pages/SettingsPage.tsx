@@ -216,22 +216,52 @@ export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
               onChange={() => set("aiBackend", "ollama")}
             />
           </Row>
-          <div
-            className="cursor-not-allowed opacity-50"
-            title="Claude API integration coming in a future update"
+          <Row
+            label="Manual — use any AI"
+            hint="Copy the prompt into ChatGPT, Claude, Gemini… then paste the answer back"
           >
-            <Row label="Claude API" hint="Cloud-based cleanup">
-              <span className="flex items-center gap-2">
-                <Badge className="bg-secondary text-amber-500">Coming Soon</Badge>
-                <input type="radio" name="backend" disabled />
-              </span>
-            </Row>
-          </div>
+            <input
+              type="radio"
+              name="backend"
+              className="accent-[var(--primary)]"
+              checked={settings.aiBackend === "manual"}
+              onChange={() => set("aiBackend", "manual")}
+            />
+          </Row>
+          {settings.aiBackend === "manual" && (
+            <>
+              <p className="pb-2 text-xs text-muted-foreground">
+                AI Clean and Genre now open a copy/paste window instead of calling Ollama. The
+                prompt is the exact same one the local model gets, and the answer is parsed the same
+                way — so the preview, the diffs and Undo all behave identically. Nothing is sent
+                anywhere by the app itself.
+              </p>
+              <Row
+                label="Tracks per batch"
+                hint="How many tracks go into one copy/paste round — lower it if the AI truncates its answer"
+              >
+                <select
+                  className={selectClass}
+                  value={settings.manualChunkSize}
+                  onChange={(e) => set("manualChunkSize", Number(e.target.value))}
+                >
+                  {[10, 25, 50, 100, 250].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </Row>
+            </>
+          )}
         </div>
       </Card>
 
       <Card>
-        <CardHeader title="Ollama" />
+        <CardHeader
+          title="Ollama"
+          hint={settings.aiBackend === "manual" ? "Unused while the manual backend is selected" : undefined}
+        />
         <div className="px-5 py-3">
           <Row label="URL">
             <input

@@ -170,6 +170,39 @@ interface Props {
   onPendingChange: (rows: PendingChange[]) => void;
 }
 
+/**
+ * Include/exclude every proposed change in one column. Shown in the header
+ * only while a preview is on screen and that column actually has suggestions.
+ */
+function ColumnIncludeToggle({
+  state,
+  label,
+  onChange,
+}: {
+  state?: { ids: Set<string>; included: number; total: number };
+  label: string;
+  onChange: (include: boolean) => void;
+}) {
+  if (!state) return null;
+  const all = state.included === state.total;
+  return (
+    <input
+      type="checkbox"
+      className="accent-[var(--primary)]"
+      checked={all}
+      ref={(el) => {
+        // Partially included reads as a dash rather than a misleading tick.
+        if (el) el.indeterminate = state.included > 0 && !all;
+      }}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => onChange(e.target.checked)}
+      title={`${all ? "Exclude" : "Include"} all ${state.total} proposed ${label} change${
+        state.total === 1 ? "" : "s"
+      }`}
+    />
+  );
+}
+
 export function TrackTable({
   files,
   tags,
@@ -205,14 +238,33 @@ export function TrackTable({
   pending,
   onPendingChange,
 }: Props) {
+  // Local mirror of the persisted widths so a drag can update at pointer speed
+  // without a settings write per frame; re-synced when the prop changes from
+  // the outside (settings import/restore, defaults reset).
   const [widths, setWidths] = useState<Record<string, number>>(columnWidths);
   const widthsRef = useRef(widths);
   widthsRef.current = widths;
+  const draggingWidthRef = useRef(false);
+  useEffect(() => {
+    if (!draggingWidthRef.current) setWidths(columnWidths);
+  }, [columnWidths]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [onlyFlagged, setOnlyFlagged] = useState(false);
   const [onlyUnresolved, setOnlyUnresolved] = useState(false);
-  const [activePath, setActivePath] = useState<string | null>(null);
+  /**
+   * Highlight selection — the rows the user has picked out by clicking. This
+   * is deliberately NOT the checkbox state (`selected`): actions run on the
+   * ticked rows, while this drives bulk ticking and multi-row edits.
+   */
+  const [rowSel, setRowSel] = useState<Set<string>>(new Set());
+  const rowSelRef = useRef(rowSel);
+  rowSelRef.current = rowSel;
+  /** Last row clicked — anchor for Shift ranges and target for the Space key. */
   const [anchorPath, setAnchorPath] = useState<string | null>(null);
+  const anchorRef = useRef(anchorPath);
+  anchorRef.current = anchorPath;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   const [editing, setEditing] = useState<{ path: string; field: string } | null>(null);
   const [draft, setDraft] = useState("");
   const [sortCol, setSortCol] = useState<string | null>(null);
@@ -240,19 +292,30 @@ export function TrackTable({
         e.preventDefault();
         setSearchOpen(true);
         requestAnimationFrame(() => searchInputRef.current?.focus());
+        return;
+      }
+      // Space ticks the whole highlight selection (or just the anchor row when
+      // nothing is selected). Only when nothing else holds focus, so it never
+      // steals Space from an input or a button.
+      if (e.key === " " && e.target === document.body) {
+        const sel = rowSelRef.current;
+        const targets = sel.size ? [...sel] : anchorRef.current ? [anchorRef.current] : [];
+        if (!targets.length) return;
+        e.preventDefault();
+        onSetMany(targets, !selectedRef.current.has(targets[0]));
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [shortcuts]);
+  }, [shortcuts, onSetMany]);
 
   const rh = ROW_STYLE[rowHeight];
   // Order follows visibleColumns (drag-and-drop reorders that array), not
   // ALL_COLUMNS' fixed definition order.
-  const curatedColumnById = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
-  const curatedColumns = visibleColumns
-    .map((id) => curatedColumnById.get(id))
-    .filter((c): c is ColumnDef => !!c);
+  const curatedColumns = useMemo(() => {
+    const byId = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
+    return visibleColumns.map((id) => byId.get(id)).filter((c): c is ColumnDef => !!c);
+  }, [visibleColumns]);
 
   const flagged = useMemo(() => {
     const set = new Set<string>();
@@ -263,9 +326,12 @@ export function TrackTable({
     return set;
   }, [files, tags]);
 
-  let rows = files;
-  if (onlyFlagged) rows = rows.filter((f) => flagged.has(f.path));
-  if (onlyUnresolved) rows = rows.filter((f) => unresolved.has(f.path));
+  const filteredRows = useMemo(() => {
+    let out = files;
+    if (onlyFlagged) out = out.filter((f) => flagged.has(f.path));
+    if (onlyUnresolved) out = out.filter((f) => unresolved.has(f.path));
+    return out;
+  }, [files, onlyFlagged, onlyUnresolved, flagged, unresolved]);
 
   /**
    * Raw tag keys (from TagData.allFields) not already shown as a curated
@@ -275,7 +341,7 @@ export function TrackTable({
   const extraColumns: ColumnDef[] = useMemo(() => {
     if (!showAllTags) return [];
     const keys = new Set<string>();
-    for (const f of rows) {
+    for (const f of filteredRows) {
       const extra = tags[f.path]?.allFields;
       if (!extra) continue;
       for (const [k, v] of Object.entries(extra)) if (v) keys.add(k);
@@ -288,39 +354,52 @@ export function TrackTable({
       rawKey: key,
       value: (_f: AudioFile, t?: TagData) => t?.allFields?.[key] ?? "",
     }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAllTags, rows, tags]);
+  }, [showAllTags, filteredRows, tags]);
 
-  const columns = [...curatedColumns, ...extraColumns];
-  const columnById = new Map(columns.map((c) => [c.id, c]));
+  const columns = useMemo(
+    () => [...curatedColumns, ...extraColumns],
+    [curatedColumns, extraColumns],
+  );
+  const columnById = useMemo(() => new Map(columns.map((c) => [c.id, c])), [columns]);
   const widthOf = (c: ColumnDef) => (c.dynamic ? c.width : (widths[c.id] ?? c.width));
   const totalWidth = 36 + rh.art + 32 + columns.reduce((sum, c) => sum + widthOf(c), 0);
 
-  /** Comparable primitive for a cell — numeric where that makes sense, else lowercased text. */
-  const sortValue = (col: ColumnDef, f: AudioFile): string | number => {
-    const t = tags[f.path];
-    if (col.id === "rating") return t?.rating ?? 0;
-    if (col.id === "size") return f.size;
-    if (col.id === "preview") return f.durationSecs ?? -1;
-    if (col.id === "imageInfo") return imageInfo[f.path]?.sizeBytes ?? 0;
-    if (col.id === "year" || col.id === "trackNumber" || col.id === "discNumber") {
-      const n = parseInt(col.value(f, t), 10);
-      return Number.isNaN(n) ? -Infinity : n;
-    }
-    return col.value(f, t).toLowerCase();
-  };
-
-  if (sortCol) {
+  /**
+   * Display order. Sorting is memoized because it is O(n log n) over the whole
+   * library with a per-comparison map lookup — re-running it on every render
+   * (including every keystroke in the search box) is very visible on big lists.
+   */
+  const rows = useMemo(() => {
+    if (!sortCol) return filteredRows;
     const col = columnById.get(sortCol);
-    if (col) {
-      rows = [...rows].sort((a, b) => {
-        const av = sortValue(col, a);
-        const bv = sortValue(col, b);
-        const cmp = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv));
-        return sortDir === "asc" ? cmp : -cmp;
-      });
-    }
-  }
+    if (!col) return filteredRows;
+
+    /** Comparable primitive for a cell — numeric where that makes sense, else lowercased text. */
+    const sortValue = (f: AudioFile): string | number => {
+      const t = tags[f.path];
+      if (col.id === "rating") return t?.rating ?? 0;
+      if (col.id === "size") return f.size;
+      if (col.id === "preview") return f.durationSecs ?? -1;
+      if (col.id === "imageInfo") return imageInfo[f.path]?.sizeBytes ?? 0;
+      if (col.id === "year" || col.id === "trackNumber" || col.id === "discNumber") {
+        const n = parseInt(col.value(f, t), 10);
+        return Number.isNaN(n) ? -Infinity : n;
+      }
+      return col.value(f, t).toLowerCase();
+    };
+
+    // Decorate-sort-undecorate: sortValue re-parses tags per comparison
+    // otherwise, which is the expensive part for large libraries.
+    const keyed = filteredRows.map((f) => ({ f, k: sortValue(f) }));
+    keyed.sort((a, b) => {
+      const cmp =
+        typeof a.k === "number" && typeof b.k === "number"
+          ? a.k - b.k
+          : String(a.k).localeCompare(String(b.k));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return keyed.map((x) => x.f);
+  }, [filteredRows, sortCol, sortDir, columnById, tags, imageInfo]);
 
   const toggleSort = (colId: string) => {
     onTrack(`sortColumn:${colId}`);
@@ -332,21 +411,52 @@ export function TrackTable({
     }
   };
 
+  /** The rows between the anchor and `path`, in display order. */
+  const rangeTo = (path: string): string[] => {
+    const idxA = rows.findIndex((r) => r.path === anchorPath);
+    const idxB = rows.findIndex((r) => r.path === path);
+    if (idxA === -1 || idxB === -1) return [path];
+    const [lo, hi] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
+    return rows.slice(lo, hi + 1).map((r) => r.path);
+  };
+
+  /**
+   * Clicking a row selects it — Shift extends a range, Ctrl adds/removes one.
+   * Selecting never ticks anything: the checkbox is a separate state, so
+   * editing or inspecting a field cannot change what an action will run on.
+   */
   const handleRowClick = (e: React.MouseEvent, path: string) => {
-    setActivePath(path);
     if (e.shiftKey && anchorPath) {
-      const idxA = rows.findIndex((r) => r.path === anchorPath);
-      const idxB = rows.findIndex((r) => r.path === path);
-      if (idxA !== -1 && idxB !== -1) {
-        const [lo, hi] = idxA < idxB ? [idxA, idxB] : [idxB, idxA];
-        onSetMany(
-          rows.slice(lo, hi + 1).map((r) => r.path),
-          true,
-        );
-        return;
-      }
+      setRowSel(new Set(rangeTo(path)));
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      setRowSel((prev) => {
+        const next = new Set(prev);
+        if (next.has(path)) next.delete(path);
+        else next.add(path);
+        return next;
+      });
+      setAnchorPath(path);
+      return;
+    }
+    setRowSel(new Set([path]));
+    setAnchorPath(path);
+  };
+
+  /**
+   * Checkbox cell. Ticking a row that is part of the highlight selection
+   * applies to the whole selection; ticking a row outside it affects only that
+   * row and drops the selection, so the tick always matches what you can see.
+   */
+  const handleCheckClick = (path: string) => {
+    const next = !selected.has(path);
+    if (rowSel.has(path)) {
+      onSetMany([...rowSel], next);
+      return;
     }
     onToggle(path);
+    setRowSel(new Set());
     setAnchorPath(path);
   };
 
@@ -365,7 +475,6 @@ export function TrackTable({
       if (hit) out.push(f.path);
     }
     return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, tags, columns, searchQuery]);
 
   useEffect(() => {
@@ -397,6 +506,7 @@ export function TrackTable({
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
+    draggingWidthRef.current = true;
     const onMove = (ev: MouseEvent) => {
       resizingRef.current = true;
       const next = Math.max(MIN_WIDTH, startWidth + ev.clientX - startX);
@@ -404,7 +514,16 @@ export function TrackTable({
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
-      onColumnWidthsChange(widthsRef.current);
+      draggingWidthRef.current = false;
+      const dragged = resizingRef.current;
+      if (dragged) onColumnWidthsChange(widthsRef.current);
+      // The click that follows this mouseup is swallowed by the header handler
+      // to avoid sorting; clear the flag afterwards so a later plain click on
+      // the same header still sorts. Without this a drag that ends off-header
+      // leaves the flag set and eats the next legitimate click.
+      setTimeout(() => {
+        resizingRef.current = false;
+      }, 0);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp, { once: true });
@@ -433,14 +552,54 @@ export function TrackTable({
     onVisibleColumnsChange(order);
   };
 
+  /** Proposed changes grouped by column — drives the header include/exclude box. */
+  const pendingByColumn = useMemo(() => {
+    const map = new Map<string, { ids: Set<string>; included: number; total: number }>();
+    for (const r of pending ?? []) {
+      if (!r.changed) continue;
+      const entry = map.get(r.field) ?? { ids: new Set<string>(), included: 0, total: 0 };
+      entry.ids.add(r.id);
+      entry.total++;
+      if (r.include) entry.included++;
+      map.set(r.field, entry);
+    }
+    return map;
+  }, [pending]);
+
   const beginEdit = (path: string, field: string, value: string) => {
     setEditing({ path, field });
     setDraft(value);
   };
 
-  /** A multi-selected row's edit applies to every selected row, not just the one clicked. */
+  /** An edit on a highlighted row applies to the whole selection, not just it. */
   const targetPaths = (path: string): string[] =>
-    selected.has(path) && selected.size > 1 ? [...selected] : [path];
+    rowSel.has(path) && rowSel.size > 1 ? [...rowSel] : [path];
+
+  /** Sets `include` on the given pending-change ids in one pass. */
+  const setIncludeForIds = (ids: Set<string>, include: boolean) => {
+    if (!pending || !ids.size) return;
+    onPendingChange(pending.map((r) => (ids.has(r.id) ? { ...r, include } : r)));
+  };
+
+  /**
+   * A proposed change's checkbox. With rows highlighted, it toggles that one
+   * column across the whole selection — so you can knock out, say, every Year
+   * suggestion for a block of tracks without touching their other fields.
+   */
+  const togglePendingCell = (path: string, field: string, id: string, include: boolean) => {
+    const next = !include;
+    if (rowSel.has(path)) {
+      const ids = new Set(
+        (pending ?? [])
+          .filter((r) => r.changed && r.field === field && rowSel.has(r.path))
+          .map((r) => r.id),
+      );
+      setIncludeForIds(ids, next);
+      return;
+    }
+    setIncludeForIds(new Set([id]), next);
+    setRowSel(new Set());
+  };
 
   /** Edits the proposed "after" value of a pending change instead of writing to disk. */
   const editPendingAfter = (id: string, after: string) => {
@@ -464,7 +623,14 @@ export function TrackTable({
     }
     const editingCol = columnById.get(editing.field);
     if (editingCol?.dynamic && editingCol.rawKey) {
-      const original = editingCol.value(files.find((x) => x.path === editing.path)!, tags[editing.path]);
+      // The row can disappear mid-edit (delete, filter change, rename), so
+      // bail out rather than dereferencing a missing file.
+      const editingFile = files.find((x) => x.path === editing.path);
+      if (!editingFile) {
+        setEditing(null);
+        return;
+      }
+      const original = editingCol.value(editingFile, tags[editing.path]);
       if (value !== original) {
         const paths = scope === "single" ? [editing.path] : targetPaths(editing.path);
         onEditRawField(paths, editingCol.rawKey, value);
@@ -744,10 +910,9 @@ export function TrackTable({
                           }
                     }
                     onClick={() => {
-                      if (resizingRef.current) {
-                        resizingRef.current = false;
-                        return;
-                      }
+                      // Suppress the synthetic click that follows a resize drag
+                      // (the flag is cleared by startResize's mouseup handler).
+                      if (resizingRef.current) return;
                       toggleSort(c.id);
                     }}
                     className={cn(
@@ -768,7 +933,14 @@ export function TrackTable({
                           : "Click to sort — drag to reorder"
                     }
                   >
-                    <span className="inline-flex items-center gap-0.5">
+                    <span className="inline-flex items-center gap-1">
+                      <ColumnIncludeToggle
+                        state={pendingByColumn.get(c.id)}
+                        label={c.label}
+                        onChange={(include) =>
+                          setIncludeForIds(pendingByColumn.get(c.id)?.ids ?? new Set(), include)
+                        }
+                      />
                       {c.label}
                       {c.id === backupFieldId && (
                         <span className="text-[9px] font-normal text-amber-500">(Backup)</span>
@@ -800,39 +972,45 @@ export function TrackTable({
                 const t = tags[f.path];
                 const cover = covers[f.path];
                 const isUnresolved = unresolved.has(f.path);
-                const rowBg = selected.has(f.path)
-                  ? "bg-accent/60"
-                  : isUnresolved
-                    ? "bg-amber-500/10 hover:bg-amber-500/20"
-                    : activePath === f.path
-                      ? "bg-accent/30"
-                      : "hover:bg-accent/20";
-                // Same states, but with a resting `bg-card` in the default case — the
-                // sticky checkbox cell needs an always-opaque background so columns
-                // scrolling underneath it don't show through.
-                const stickyBg = selected.has(f.path)
-                  ? "bg-accent/60"
-                  : isUnresolved
-                    ? "bg-amber-500/10 hover:bg-amber-500/20"
-                    : activePath === f.path
-                      ? "bg-accent/30"
-                      : "bg-card hover:bg-accent/20";
+                // The highlight selection reads first; whether a row is ticked
+                // stays legible in its checkbox rather than competing for colour.
+                const shared = rowSel.has(f.path)
+                  ? "bg-primary/20 hover:bg-primary/25"
+                  : selected.has(f.path)
+                    ? "bg-accent/60"
+                    : isUnresolved
+                      ? "bg-amber-500/10 hover:bg-amber-500/20"
+                      : null;
+                const rowBg = shared ?? "hover:bg-accent/20";
+                // The sticky checkbox cell needs an always-opaque resting
+                // background so columns scrolling under it don't show through.
+                const stickyBg = shared ?? "bg-card hover:bg-accent/20";
                 return (
                   <tr
                     key={f.path}
                     data-path={f.path}
-                    className={cn("cursor-pointer border-b border-border/50 transition-colors", rowBg)}
+                    className={cn("border-b border-border/50 transition-colors", rowBg)}
                     onClick={(e) => handleRowClick(e, f.path)}
                   >
                     <td
-                      className={cn("sticky left-0 z-10 px-2", rh.py, stickyBg)}
-                      onClick={(e) => e.stopPropagation()}
+                      className={cn("sticky left-0 z-10 cursor-pointer px-2", rh.py, stickyBg)}
+                      title={
+                        rowSel.has(f.path) && rowSel.size > 1
+                          ? `Tick or untick all ${rowSel.size} selected tracks`
+                          : "Tick to include this track in the toolbar actions (Space toggles the selection)"
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleCheckClick(f.path);
+                      }}
                     >
                       <input
                         type="checkbox"
-                        className="accent-[var(--primary)]"
+                        // The cell owns the click so the hit area covers the whole
+                        // cell and Shift+click ranges go through one code path.
+                        className="pointer-events-none accent-[var(--primary)]"
                         checked={selected.has(f.path)}
-                        onChange={() => onToggle(f.path)}
+                        readOnly
                       />
                     </td>
                     <td
@@ -842,7 +1020,7 @@ export function TrackTable({
                         e.stopPropagation();
                         onInspect(f);
                       }}
-                      title="Click to select — double-click for all tag fields"
+                      title="Double-click for all tag fields"
                     >
                       <div className="group relative mx-auto w-fit">
                         <div
@@ -994,18 +1172,18 @@ export function TrackTable({
                                 }}
                                 title={
                                   editing.field !== "filename" &&
-                                  selected.has(f.path) &&
-                                  selected.size > 1
-                                    ? `Enter applies to all ${selected.size} selected — Alt+Enter applies to just this row`
+                                  rowSel.has(f.path) &&
+                                  rowSel.size > 1
+                                    ? `Enter applies to all ${rowSel.size} selected — Alt+Enter applies to just this row`
                                     : undefined
                                 }
                                 className="w-full min-w-0 flex-1 rounded border border-primary bg-background px-1 py-0.5 text-xs outline-none"
                               />
-                              {editing.field !== "filename" && selected.has(f.path) && selected.size > 1 && (
+                              {editing.field !== "filename" && rowSel.has(f.path) && rowSel.size > 1 && (
                                 <button
                                   onMouseDown={(e) => e.preventDefault()}
                                   onClick={() => commitEdit(undefined, "single")}
-                                  title={`Apply to just this row instead of all ${selected.size} selected (or press Alt+Enter)`}
+                                  title={`Apply to just this row instead of all ${rowSel.size} selected (or press Alt+Enter)`}
                                   className="shrink-0 whitespace-nowrap rounded bg-secondary px-1.5 py-0.5 text-[10px] text-secondary-foreground hover:bg-accent"
                                 >
                                   just this
@@ -1013,21 +1191,20 @@ export function TrackTable({
                               )}
                             </div>
                           ) : pend ? (
-                            <label
-                              className="flex items-center gap-1"
-                              onClick={(e) => e.stopPropagation()}
+                            <span
+                              className="flex cursor-pointer items-center gap-1"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                togglePendingCell(f.path, c.id, pend.id, pend.include);
+                              }}
                             >
                               <input
                                 type="checkbox"
-                                className="shrink-0 accent-[var(--primary)]"
+                                // The cell owns the click so one code path covers
+                                // both the single row and the whole selection.
+                                className="pointer-events-none shrink-0 accent-[var(--primary)]"
                                 checked={pend.include}
-                                onChange={() =>
-                                  onPendingChange(
-                                    pending!.map((r) =>
-                                      r.id === pend.id ? { ...r, include: !r.include } : r,
-                                    ),
-                                  )
-                                }
+                                readOnly
                               />
                               <span className={cn("truncate", !pend.include && "opacity-50")}>
                                 {pend.kind === "remove" ? (
@@ -1044,7 +1221,7 @@ export function TrackTable({
                                   </>
                                 )}
                               </span>
-                            </label>
+                            </span>
                           ) : t || !c.field ? (
                             renderCellValue(c, value)
                           ) : (

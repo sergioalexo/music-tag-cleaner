@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AUDIO_EXTENSIONS, type AudioFile } from "../types";
@@ -14,6 +14,10 @@ export function useFiles(
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
+  // Async callers (refresh/refreshPaths) run long after the render that created
+  // them, so read the live list here instead of a captured `files` snapshot.
+  const filesRef = useRef(files);
+  filesRef.current = files;
 
   const merge = (incoming: AudioFile[]) => {
     setFiles((prev) => {
@@ -119,16 +123,35 @@ export function useFiles(
     setSelected(new Set());
   };
 
-  /** Re-reads file info (size, hasBackup) after writes. */
+  /** Re-reads file info (size, hasBackup, duration) for every loaded file. */
   const refresh = async () => {
-    if (!files.length) return;
+    if (!filesRef.current.length) return;
     try {
       const updated = await invoke<AudioFile[]>("list_files", {
-        paths: files.map((f) => f.path),
+        paths: filesRef.current.map((f) => f.path),
       });
       setFiles(updated);
     } catch (e) {
       console.error("Failed to refresh file list:", e);
+    }
+  };
+
+  /**
+   * Re-reads only `paths`, merging the results in place. Each entry costs a
+   * full tag parse on the Rust side, so a whole-library `refresh()` after
+   * touching one file is O(library) disk I/O — use this when the set of
+   * affected files is known.
+   */
+  const refreshPaths = async (paths: string[]) => {
+    const known = new Set(filesRef.current.map((f) => f.path));
+    const wanted = [...new Set(paths)].filter((p) => known.has(p));
+    if (!wanted.length) return;
+    try {
+      const updated = await invoke<AudioFile[]>("list_files", { paths: wanted });
+      const byPath = new Map(updated.map((f) => [f.path, f]));
+      setFiles((prev) => prev.map((f) => byPath.get(f.path) ?? f));
+    } catch (e) {
+      console.error("Failed to refresh files:", e);
     }
   };
 
@@ -173,6 +196,7 @@ export function useFiles(
     setManySelected,
     clearList,
     refresh,
+    refreshPaths,
     remap,
     removeFiles,
   };

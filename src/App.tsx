@@ -7,8 +7,13 @@ import { Upload, X } from "lucide-react";
 
 import { Sidebar, type Page } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
+import {
+  ManualAIDialog,
+  type ManualMode,
+  type ManualResults,
+} from "./components/ManualAIDialog";
 import { Card, cn } from "./components/ui";
-import { useAI } from "./hooks/useAI";
+import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
 import { useImageInfo } from "./hooks/useImageInfo";
 import { useAnalytics } from "./hooks/useAnalytics";
@@ -67,7 +72,7 @@ const HISTORY_LIMIT = 50;
 let toastId = 0;
 
 export default function App() {
-  const { settings, save, loaded } = useSettings();
+  const { settings, save, update, loaded } = useSettings();
   const [page, setPage] = useState<Page>("library");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -86,7 +91,7 @@ export default function App() {
   const filesApi = useFiles(
     settings.recursive,
     notify,
-    (folder) => save({ ...settingsRef.current, lastFolder: folder }),
+    (folder) => void update((prev) => ({ ...prev, lastFolder: folder })),
     settings.lastFolder,
   );
   const tagsApi = useTags();
@@ -158,7 +163,7 @@ export default function App() {
       setHistory((h) => h.slice(0, -1));
       setRedoStack((r) => [...r, entry]);
       setLibraryTags({});
-      await filesApi.refresh();
+      await filesApi.refreshPaths(entry.changes.map((c) => c.path));
       notify(`Undid: ${entry.label}`, "success");
     } catch (e) {
       notify(String(e), "error");
@@ -176,7 +181,7 @@ export default function App() {
       setRedoStack((r) => r.slice(0, -1));
       setHistory((h) => [...h, entry]);
       setLibraryTags({});
-      await filesApi.refresh();
+      await filesApi.refreshPaths(entry.changes.map((c) => c.path));
       notify(`Redid: ${entry.label}`, "success");
     } catch (e) {
       notify(String(e), "error");
@@ -242,6 +247,13 @@ export default function App() {
   const [inspected, setInspected] = useState<{ file: AudioFile; tags: TagData } | null>(null);
   // Tracks the AI could not identify from tags or filename — flagged for manual edit.
   const [unresolved, setUnresolved] = useState<Set<string>>(new Set());
+  /** Open manual-AI session: the tracks and tags the copy/paste dialog works on. */
+  const [manual, setManual] = useState<{
+    mode: ManualMode;
+    paths: string[];
+    map: Record<string, TagData>;
+    genres: string[];
+  } | null>(null);
 
   const clearUnresolved = (path: string) =>
     setUnresolved((prev) => {
@@ -270,8 +282,10 @@ export default function App() {
       tracks: number;
     }>("ai-usage", (e) => {
       const { promptEvalCount, evalCount, tracks } = e.payload;
-      const prev = settingsRef.current;
-      save({
+      // Accumulate against the newest settings, not a render snapshot — batches
+      // can complete faster than React re-renders, and a plain read-modify-write
+      // on settingsRef would drop every count but the last.
+      void update((prev) => ({
         ...prev,
         usage: {
           totalPromptTokens: prev.usage.totalPromptTokens + promptEvalCount,
@@ -279,7 +293,7 @@ export default function App() {
           totalCalls: prev.usage.totalCalls + 1,
           songsProcessed: prev.usage.songsProcessed + tracks,
         },
-      });
+      }));
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -329,7 +343,9 @@ export default function App() {
     setInspected(null);
     setLibraryTags({});
     if (affected.length) invalidateCovers(affected);
-    await filesApi.refresh();
+    // Refresh only what we touched — each entry costs a tag parse on disk.
+    if (affected.length) await filesApi.refreshPaths(affected);
+    else await filesApi.refresh();
   };
 
   const runCleanTags = async () => {
@@ -400,12 +416,62 @@ export default function App() {
       `No "${settingsRef.current.removeChars}" characters found`,
     );
 
+  /**
+   * Manual backend: read the tags, then hand the tracks to the copy/paste
+   * dialog instead of calling Ollama. Nothing leaves the app on its own — the
+   * user pastes the prompt into whichever AI they like.
+   */
+  const openManual = async (mode: ManualMode, genres: string[] = []) => {
+    const paths = filesApi.selectedPaths;
+    setBusy(true);
+    try {
+      const { map, errors } = await tagsApi.read(paths);
+      errors.forEach((e) => notify(e, "error"));
+      const valid = paths.filter((p) => map[p]);
+      if (!valid.length) return notify("Could not read tags for the selected files", "error");
+      setManual({ mode, paths: valid, map, genres });
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Turns the answers pasted into the dialog into the usual preview rows. */
+  const applyManualResults = (results: ManualResults) => {
+    if (!manual) return;
+    const { paths, map } = manual;
+    setTagsMap(map);
+    if (results.mode === "clean") {
+      const { rows, unresolved: unresolvedPaths } = buildCleanRows(paths, map, results.byIndex);
+      setPreviewMode("ai");
+      setUnresolved(new Set(unresolvedPaths));
+      setPending(rows);
+      if (!rows.some((r) => r.changed)) notify("That answer changes nothing", "info");
+      if (unresolvedPaths.length)
+        notify(
+          `${unresolvedPaths.length} track${
+            unresolvedPaths.length === 1 ? "" : "s"
+          } couldn't be identified — highlighted in amber. Edit them manually.`,
+          "error",
+        );
+    } else {
+      const rows = buildGenreRows(paths, map, results.byIndex);
+      setPreviewMode("genre");
+      setPending(rows);
+      if (!rows.some((r) => r.changed)) notify("Genres already match the preset", "info");
+    }
+    setManual(null);
+  };
+
   const runGenre = async () => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
     const preset = activePreset(settings.genrePresets, settings.activeGenrePreset);
     if (!preset || preset.genres.length === 0)
       return notify("The active genre preset has no genres — add some in Settings", "info");
+
+    if (settings.aiBackend === "manual") return openManual("genre", preset.genres);
 
     const status = await ai.check(settings.ollamaUrl);
     if (!status.running) {
@@ -460,6 +526,8 @@ export default function App() {
   const runAIClean = async () => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
+
+    if (settings.aiBackend === "manual") return openManual("clean");
 
     const status = await ai.check(settings.ollamaUrl);
     if (!status.running) {
@@ -520,6 +588,10 @@ export default function App() {
 
   const applyPending = async () => {
     if (!pending) return;
+    // The Compare view reuses `pending` to render a read-only session diff. Its
+    // rows carry synthetic fields (__coverArt, __raw:*) and no matching tagsMap,
+    // so they must never be written back.
+    if (previewMode === "history") return setPending(null);
     const affected = [...new Set(pending.map((r) => r.path))];
     setBusy(true);
     try {
@@ -584,7 +656,7 @@ export default function App() {
       errors.forEach((e) => notify(e, "error"));
       const result = await tagsApi.generateIds(paths, map, settings);
       result.errors.forEach((e) => notify(e, "error"));
-      if (result.assigned) save({ ...settingsRef.current, nextTrackId: result.nextId });
+      if (result.assigned) void update((prev) => ({ ...prev, nextTrackId: result.nextId }));
       notify(
         result.assigned
           ? `Assigned ${result.assigned} ID${result.assigned === 1 ? "" : "s"} (next: ${result.nextId
@@ -742,8 +814,8 @@ export default function App() {
           label: `Edit ${FIELD_LABELS[field] ?? field}${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
           changes,
         });
+        await filesApi.refreshPaths(changes.map((c) => c.path));
       }
-      await filesApi.refresh();
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -780,6 +852,7 @@ export default function App() {
           label: `Edit ${rawKey}${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
           changes,
         });
+        await filesApi.refreshPaths(changes.map((c) => c.path));
       }
     } catch (e) {
       notify(String(e), "error");
@@ -810,8 +883,8 @@ export default function App() {
           label: `Set rating${changes.length > 1 ? ` (${changes.length} tracks)` : ""}`,
           changes,
         });
+        await filesApi.refreshPaths(changes.map((c) => c.path));
       }
-      await filesApi.refresh();
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -898,6 +971,8 @@ export default function App() {
         );
       if (result.stopped) notify("Restore stopped", "info");
       await afterWrite(paths);
+    } catch (e) {
+      notify(String(e), "error");
     } finally {
       setProgress(null);
       setBackupRunning(false);
@@ -939,8 +1014,12 @@ export default function App() {
   };
 
   // Keyboard shortcuts: customizable via settings.shortcuts (see lib/shortcuts.ts), Escape close.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
+  // The handler closes over state that changes constantly (busy, pending, …), so
+  // it lives in a ref that is refreshed each render while the listener itself is
+  // attached only once — re-binding a window listener on every render is pure waste.
+  const keyHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  keyHandlerRef.current = (e: KeyboardEvent) => {
+    {
       const target = e.target as HTMLElement | null;
       // Let the browser handle native undo/redo while typing in a cell editor
       // or any other text field instead of hijacking it for tag history.
@@ -968,10 +1047,14 @@ export default function App() {
         if (inspected) setInspected(null);
         else if (pending) setPending(null);
       }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  });
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => keyHandlerRef.current(e);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="flex h-screen flex-col">
@@ -1077,6 +1160,20 @@ export default function App() {
             <span className="text-sm font-medium">Drop audio files or folders to add them</span>
           </div>
         </div>
+      )}
+
+      {manual && (
+        <ManualAIDialog
+          mode={manual.mode}
+          paths={manual.paths}
+          tags={manual.map}
+          transliterateScripts={settings.transliterateScripts}
+          genres={manual.genres}
+          chunkSize={settings.manualChunkSize}
+          onChunkSizeChange={(size) => void update((prev) => ({ ...prev, manualChunkSize: size }))}
+          onCancel={() => setManual(null)}
+          onDone={applyManualResults}
+        />
       )}
 
       {inspected && (
