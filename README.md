@@ -46,8 +46,9 @@ hands you the same prompt to paste into any AI you already use.
   included). With rows selected, clicking one proposed change toggles *that
   column* across the selection, so you can drop every Year suggestion for a
   block of tracks without touching their other fields.
-- Keyboard shortcuts: `Ctrl+O` open folder, `Ctrl+A` select all files,
-  `Space` tick the focused row, `Escape` close modal / cancel preview.
+- Keyboard shortcuts: `Ctrl+O` open folder, `Ctrl+A` highlight every row
+  (does not tick — press `Space` after to tick the highlighted rows),
+  `Space` tick the selection / focused row, `Escape` close modal / cancel preview.
 
 ## Prerequisites
 

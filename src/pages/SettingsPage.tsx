@@ -393,6 +393,40 @@ export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
               onChange={(v) => set("preserveCoverArt", v)}
             />
           </Row>
+          <Row
+            label="Standardize Art — max size"
+            hint="Longest side the Standardize Art button scales cover art down to (never up)"
+          >
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                min={64}
+                max={4000}
+                step={100}
+                className={cn(inputClass, "w-24 text-center font-mono")}
+                value={settings.artworkMaxDim}
+                onChange={(e) =>
+                  set("artworkMaxDim", Math.min(4000, Math.max(64, Number(e.target.value) || 1000)))
+                }
+              />
+              <span className="text-xs text-muted-foreground">px</span>
+            </div>
+          </Row>
+          <Row
+            label="Standardize Art — JPEG quality"
+            hint="1–100; 80–88 is a good balance of size and quality"
+          >
+            <input
+              type="number"
+              min={40}
+              max={100}
+              className={cn(inputClass, "w-20 text-center font-mono")}
+              value={settings.artworkJpegQuality}
+              onChange={(e) =>
+                set("artworkJpegQuality", Math.min(100, Math.max(40, Number(e.target.value) || 85)))
+              }
+            />
+          </Row>
           <Row label="Process subdirectories recursively">
             <Toggle checked={settings.recursive} onChange={(v) => set("recursive", v)} />
           </Row>
@@ -430,7 +464,7 @@ export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
                     o.value === "upper"
                       ? "UPPERCASE"
                       : o.value === "title"
-                        ? "Title Case"
+                        ? "Capitalize Each Word"
                         : o.value === "lower"
                           ? "lowercase"
                           : "Leave as is"
@@ -715,7 +749,7 @@ export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
       <Card>
         <CardHeader
           title="Track IDs"
-          hint={`Sequential ${settings.trackIdDigits}-digit IDs written to the Track # field`}
+          hint={`Sequential ${settings.trackIdDigits}-digit IDs written to a private Track ID field (not Track Number)`}
         />
         <div className="px-5 py-3">
           <Row label="ID length" hint="How many digits Generate IDs zero-pads to">

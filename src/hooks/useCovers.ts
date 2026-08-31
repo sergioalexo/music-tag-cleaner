@@ -2,10 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AudioFile } from "../types";
 
+/** Longest side (px) of the table thumbnails — 2× the largest rendered size. */
+const THUMB_SIZE = 128;
+
 /**
- * Lazily loads embedded cover art for the given files, one at a time to keep
- * the UI responsive, and caches the results by path. A null cache entry means
- * "loaded, no art"; undefined means "not yet loaded".
+ * Lazily loads small cover-art thumbnails for the given files, one at a time to
+ * keep the UI responsive, and caches them by path. Thumbnails (not the full
+ * embedded art) so a few hundred files cost ~1 MB of base64 rather than
+ * hundreds; state is flushed in batches so the table re-renders ~20× fewer
+ * times. A null cache entry means "loaded, no art"; undefined means "not yet
+ * loaded".
  */
 export function useCovers(files: AudioFile[]) {
   const [covers, setCovers] = useState<Record<string, string | null>>({});
@@ -21,17 +27,26 @@ export function useCovers(files: AudioFile[]) {
     if (queue.length === 0) return;
 
     (async () => {
-      for (const f of queue) {
+      let batch: Record<string, string | null> = {};
+      const flush = () => {
+        if (cancelled || !Object.keys(batch).length) return;
+        const pending = batch;
+        batch = {};
+        setCovers((prev) => ({ ...prev, ...pending }));
+      };
+      for (let i = 0; i < queue.length; i++) {
         if (cancelled) return;
         try {
-          const url = await invoke<string | null>("read_cover_art", { path: f.path });
-          if (cancelled) return;
-          setCovers((prev) => ({ ...prev, [f.path]: url }));
+          batch[queue[i].path] = await invoke<string | null>("read_cover_thumbnail", {
+            path: queue[i].path,
+            size: THUMB_SIZE,
+          });
         } catch {
-          if (cancelled) return;
-          setCovers((prev) => ({ ...prev, [f.path]: null }));
+          batch[queue[i].path] = null;
         }
+        if ((i + 1) % 20 === 0) flush();
       }
+      flush();
     })();
 
     return () => {

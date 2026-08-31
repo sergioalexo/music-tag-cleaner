@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   Eraser,
@@ -7,6 +7,7 @@ import {
   GitCompare,
   Hash,
   History,
+  ImageDown,
   Paintbrush,
   RotateCcw,
   RotateCw,
@@ -20,11 +21,13 @@ import {
   Wand2,
 } from "lucide-react";
 import type { AudioFile, PendingChange, PreviewMode, RowHeight, Settings, TagData } from "../types";
+import { KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { activePreset } from "../lib/genres";
 import { shortcutFor } from "../lib/shortcuts";
 import { TrackTable } from "../components/TrackTable";
 import PreviewTable from "../components/PreviewTable";
+import { ClearFieldsMenu } from "../components/ClearFieldsMenu";
 import { Button } from "../components/ui";
 
 interface FilesApi {
@@ -71,8 +74,9 @@ interface Props {
   onRemoveChars: () => void;
   onGenre: () => void;
   onGenerateIds: () => void;
+  onStandardizeArt: () => void;
   onRename: () => void;
-  onClearFields: () => void;
+  onClearFields: (fields: string[]) => void;
   onAddGenre: (genre: string) => void;
   onRenameGenre: (oldName: string, newName: string) => void;
   onBackup: () => void;
@@ -124,6 +128,7 @@ export function LibraryPage({
   onRemoveChars,
   onGenre,
   onGenerateIds,
+  onStandardizeArt,
   onRename,
   onClearFields,
   onAddGenre,
@@ -151,6 +156,18 @@ export function LibraryPage({
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
   ).length;
   const genreOptions = activePreset(settings.genrePresets, settings.activeGenrePreset)?.genres ?? [];
+
+  // Extra tag-frame keys present on the currently selected files, offered as
+  // additional Clear Fields targets (curated fields already have their own).
+  const clearableRawKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const path of filesApi.selectedPaths) {
+      const extra = libraryTags[path]?.allFields;
+      if (!extra) continue;
+      for (const [k, v] of Object.entries(extra)) if (v && !KEPT_FIELD_KEYS.has(k)) keys.add(k);
+    }
+    return [...keys].sort();
+  }, [filesApi.selectedPaths, libraryTags]);
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement | null>(null);
@@ -408,16 +425,13 @@ export function LibraryPage({
             <Eraser />
             Remove {settings.removeChars || "chars"}
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={onClearFields}
+          <ClearFieldsMenu
+            selected={settings.clearFields}
+            rawKeys={clearableRawKeys}
             disabled={noSel}
-            title={`Erase these fields: ${settings.clearFields.join(", ") || "(none set)"}`}
-          >
-            <Trash2 />
-            Clear Fields
-          </Button>
+            backupFieldKey={backupFieldId ?? undefined}
+            onRun={onClearFields}
+          />
           <Button
             variant="secondary"
             size="sm"
@@ -438,6 +452,16 @@ export function LibraryPage({
           <Button variant="secondary" size="sm" onClick={onGenerateIds} disabled={noSel}>
             <Hash />
             Generate IDs
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onStandardizeArt}
+            disabled={noSel}
+            title={`Re-encode embedded cover art to JPEG q${settings.artworkJpegQuality}, longest side ≤ ${settings.artworkMaxDim}px`}
+          >
+            <ImageDown />
+            Standardize Art
           </Button>
           <Button variant="secondary" size="sm" onClick={onRename} disabled={noSel}>
             <Type />

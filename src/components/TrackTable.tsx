@@ -15,10 +15,11 @@ import {
   ZoomIn,
 } from "lucide-react";
 import type { AudioFile, PendingChange, RowHeight, TagData } from "../types";
-import { formatBytes } from "../types";
+import { formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
+import { useVirtualRows } from "../hooks/useVirtualRows";
 import { AudioPreview } from "./AudioPreview";
 import { Combobox } from "./Combobox";
 import { Stars } from "./Stars";
@@ -57,10 +58,17 @@ export const ALL_COLUMNS: ColumnDef[] = [
   { id: "rating", label: "Rating", width: 100, value: () => "", custom: "rating" },
   {
     id: "trackNumber",
-    label: "Track # / ID",
-    width: 90,
+    label: "Track #",
+    width: 80,
     field: "trackNumber",
     value: (_f, t) => t?.trackNumber ?? "",
+  },
+  {
+    id: "trackId",
+    label: "Track ID",
+    width: 96,
+    field: "trackId",
+    value: (_f, t) => t?.trackId ?? "",
   },
   {
     id: "discNumber",
@@ -294,6 +302,17 @@ export function TrackTable({
         requestAnimationFrame(() => searchInputRef.current?.focus());
         return;
       }
+      // Ctrl/Cmd+A highlights every visible row (it does NOT tick them) so the
+      // user can then Space / click a box to tick the whole selection.
+      if (matchesShortcut(e, "selectAll", shortcuts)) {
+        const t = e.target as HTMLElement | null;
+        if (t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable) return;
+        e.preventDefault();
+        const paths = rowsRef.current.map((f) => f.path);
+        setRowSel(new Set(paths));
+        setAnchorPath(paths[paths.length - 1] ?? null);
+        return;
+      }
       // Space ticks the whole highlight selection (or just the anchor row when
       // nothing is selected). Only when nothing else holds focus, so it never
       // steals Space from an input or a button.
@@ -337,6 +356,10 @@ export function TrackTable({
    * Raw tag keys (from TagData.allFields) not already shown as a curated
    * column, one dynamic column per key found on any currently visible row,
    * auto-hidden the moment no visible row has a value for that key anymore.
+   *
+   * Keys in KEPT_FIELD_KEYS (TrackTitle, TrackArtist, Year, …) are the raw
+   * frames the curated Title/Artist/Year columns already show, so they're
+   * skipped here — otherwise every common field appears twice.
    */
   const extraColumns: ColumnDef[] = useMemo(() => {
     if (!showAllTags) return [];
@@ -344,7 +367,7 @@ export function TrackTable({
     for (const f of filteredRows) {
       const extra = tags[f.path]?.allFields;
       if (!extra) continue;
-      for (const [k, v] of Object.entries(extra)) if (v) keys.add(k);
+      for (const [k, v] of Object.entries(extra)) if (v && !KEPT_FIELD_KEYS.has(k)) keys.add(k);
     }
     return [...keys].sort().map((key) => ({
       id: `extra:${key}`,
@@ -361,7 +384,7 @@ export function TrackTable({
     [curatedColumns, extraColumns],
   );
   const columnById = useMemo(() => new Map(columns.map((c) => [c.id, c])), [columns]);
-  const widthOf = (c: ColumnDef) => (c.dynamic ? c.width : (widths[c.id] ?? c.width));
+  const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
   const totalWidth = 36 + rh.art + 32 + columns.reduce((sum, c) => sum + widthOf(c), 0);
 
   /**
@@ -401,6 +424,19 @@ export function TrackTable({
     return keyed.map((x) => x.f);
   }, [filteredRows, sortCol, sortDir, columnById, tags, imageInfo]);
 
+  // Current display rows, for the window keydown handler (which is bound once).
+  const rowsRef = useRef<AudioFile[]>(rows);
+  rowsRef.current = rows;
+
+  // Only render the rows near the viewport once the list gets long — below
+  // that the spacer rows aren't worth the (tiny) layout risk.
+  const virtual = useVirtualRows(scrollRef, rows.length, {
+    estimateRowHeight: rh.art + 8,
+    enabled: rows.length > 60,
+  });
+  const visibleRows = rows.slice(virtual.start, virtual.end);
+  const bodyColSpan = 3 + columns.length;
+
   const toggleSort = (colId: string) => {
     onTrack(`sortColumn:${colId}`);
     if (sortCol === colId) {
@@ -424,6 +460,11 @@ export function TrackTable({
    * Clicking a row selects it — Shift extends a range, Ctrl adds/removes one.
    * Selecting never ticks anything: the checkbox is a separate state, so
    * editing or inspecting a field cannot change what an action will run on.
+   *
+   * A plain click on a row that is already part of a multi-row selection
+   * keeps that selection intact (only the anchor moves), so a follow-up
+   * double-click to edit a field lands on every selected row. To drop a
+   * single row from the selection, Ctrl+click it.
    */
   const handleRowClick = (e: React.MouseEvent, path: string) => {
     if (e.shiftKey && anchorPath) {
@@ -437,6 +478,10 @@ export function TrackTable({
         else next.add(path);
         return next;
       });
+      setAnchorPath(path);
+      return;
+    }
+    if (rowSel.has(path) && rowSel.size > 1) {
       setAnchorPath(path);
       return;
     }
@@ -485,10 +530,8 @@ export function TrackTable({
     if (!searchMatches.length) return;
     const next = (matchIndex + delta + searchMatches.length) % searchMatches.length;
     setMatchIndex(next);
-    const path = searchMatches[next];
-    scrollRef.current
-      ?.querySelector(`[data-path="${CSS.escape(path)}"]`)
-      ?.scrollIntoView({ block: "center" });
+    const idx = rows.findIndex((r) => r.path === searchMatches[next]);
+    if (idx >= 0) virtual.scrollToIndex(idx);
   };
 
   /** Pending AI/Standardize/Genre/Clear changes, keyed by "path::field" for O(1) cell lookup. */
@@ -861,9 +904,9 @@ export function TrackTable({
                 <col key={c.id} style={{ width: widthOf(c) }} />
               ))}
             </colgroup>
-            <thead className="sticky top-0 z-10 bg-card">
+            <thead className="sticky top-0 z-20 bg-card">
               <tr className="border-b">
-                <th className={cn("sticky left-0 z-20 bg-card px-2 py-2", headerSep)}>
+                <th className={cn("sticky left-0 z-30 bg-card px-2 py-2", headerSep)}>
                   <input
                     type="checkbox"
                     className="accent-[var(--primary)]"
@@ -916,7 +959,7 @@ export function TrackTable({
                       toggleSort(c.id);
                     }}
                     className={cn(
-                      "relative cursor-pointer select-none whitespace-nowrap px-3 py-2 font-medium text-muted-foreground",
+                      "relative cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground",
                       !c.dynamic && "cursor-move",
                       headerSep,
                       c.align === "right" && "text-right",
@@ -929,11 +972,11 @@ export function TrackTable({
                       c.id === "preview"
                         ? "Click to sort by track length — drag to reorder"
                         : c.dynamic
-                          ? "Raw tag field — click to sort"
+                          ? `${c.label} — raw tag field, click to sort, drag edge to resize`
                           : "Click to sort — drag to reorder"
                     }
                   >
-                    <span className="inline-flex items-center gap-1">
+                    <span className="flex items-center gap-1 overflow-hidden">
                       <ColumnIncludeToggle
                         state={pendingByColumn.get(c.id)}
                         label={c.label}
@@ -941,34 +984,37 @@ export function TrackTable({
                           setIncludeForIds(pendingByColumn.get(c.id)?.ids ?? new Set(), include)
                         }
                       />
-                      {c.label}
+                      <span className="min-w-0 flex-1 truncate">{c.label}</span>
                       {c.id === backupFieldId && (
-                        <span className="text-[9px] font-normal text-amber-500">(Backup)</span>
+                        <span className="shrink-0 text-[9px] font-normal text-amber-500">(Backup)</span>
                       )}
                       {sortCol === c.id &&
                         (sortDir === "asc" ? (
-                          <ChevronUp className="h-3 w-3" />
+                          <ChevronUp className="h-3 w-3 shrink-0" />
                         ) : (
-                          <ChevronDown className="h-3 w-3" />
+                          <ChevronDown className="h-3 w-3 shrink-0" />
                         ))}
                     </span>
-                    {!c.dynamic && (
-                      <span
-                        className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
-                        draggable
-                        onDragStart={(e) => e.preventDefault()}
-                        onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
-                        title="Drag to resize"
-                      >
-                        <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
-                      </span>
-                    )}
+                    <span
+                      className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
+                      draggable
+                      onDragStart={(e) => e.preventDefault()}
+                      onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
+                      title="Drag to resize"
+                    >
+                      <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
+                    </span>
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map((f) => {
+              {virtual.padTop > 0 && (
+                <tr aria-hidden>
+                  <td colSpan={bodyColSpan} style={{ height: virtual.padTop, padding: 0, border: 0 }} />
+                </tr>
+              )}
+              {visibleRows.map((f) => {
                 const t = tags[f.path];
                 const cover = covers[f.path];
                 const isUnresolved = unresolved.has(f.path);
@@ -1233,6 +1279,14 @@ export function TrackTable({
                   </tr>
                 );
               })}
+              {virtual.padBottom > 0 && (
+                <tr aria-hidden>
+                  <td
+                    colSpan={bodyColSpan}
+                    style={{ height: virtual.padBottom, padding: 0, border: 0 }}
+                  />
+                </tr>
+              )}
             </tbody>
           </table>
         )}

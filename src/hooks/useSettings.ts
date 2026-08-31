@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-export const CURRENT_SETTINGS_VERSION = 3;
+export const CURRENT_SETTINGS_VERSION = 4;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -14,6 +14,8 @@ export const DEFAULT_SETTINGS: Settings = {
   backupBeforeChanges: true,
   stripToCommon: true,
   preserveCoverArt: true,
+  artworkMaxDim: 1000,
+  artworkJpegQuality: 85,
   recursive: true,
   searchableBackup: true,
   backupField: "Composer",
@@ -29,6 +31,7 @@ export const DEFAULT_SETTINGS: Settings = {
     "genre",
     "rating",
     "trackNumber",
+    "trackId",
   ],
   columnWidths: {},
   rowHeight: "normal",
@@ -57,6 +60,8 @@ const STORE_FILE = "settings.json";
  * Brings older saved settings up to date. v2 ensures the Preview and Rating
  * columns (added after some users' settings were first saved) are visible.
  * v3 retires the never-shipped "claude" backend in favour of "manual".
+ * v4 adds the dedicated "Track ID" column (Generate IDs no longer writes to
+ * Track Number).
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -72,6 +77,13 @@ export function migrate(s: Settings, savedVersion: number): Settings {
   }
   if (savedVersion < 3 && next.aiBackend !== "ollama" && next.aiBackend !== "manual") {
     next.aiBackend = "ollama";
+  }
+  if (savedVersion < 4 && !next.visibleColumns.includes("trackId")) {
+    const cols = [...next.visibleColumns];
+    const ti = cols.indexOf("trackNumber");
+    if (ti >= 0) cols.splice(ti + 1, 0, "trackId");
+    else cols.push("trackId");
+    next.visibleColumns = cols;
   }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;

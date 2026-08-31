@@ -7,7 +7,7 @@ export interface ShortcutAction {
 
 export const SHORTCUTS: ShortcutAction[] = [
   { id: "selectFolder", label: "Select folder", defaultKey: "Ctrl+O" },
-  { id: "selectAll", label: "Select all tracks", defaultKey: "Ctrl+A" },
+  { id: "selectAll", label: "Highlight all tracks", defaultKey: "Ctrl+A" },
   { id: "undo", label: "Undo", defaultKey: "Ctrl+Z" },
   { id: "redo", label: "Redo", defaultKey: "Ctrl+Shift+Z" },
   { id: "find", label: "Find in table", defaultKey: "Ctrl+F" },

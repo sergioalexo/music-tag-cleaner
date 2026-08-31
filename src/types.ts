@@ -19,6 +19,8 @@ export interface TagData {
   comment?: string;
   composer?: string;
   originalArtist?: string;
+  /** App-assigned unique id (from "Generate IDs"), kept in a private TXXX:TRACKID frame. */
+  trackId?: string;
   /** Rating in stars, 0-5. */
   rating?: number;
   hasCoverArt: boolean;
@@ -109,6 +111,10 @@ export interface Settings {
   backupBeforeChanges: boolean;
   stripToCommon: boolean;
   preserveCoverArt: boolean;
+  /** "Standardize Art" downscales the longest side of embedded cover art to this many px. */
+  artworkMaxDim: number;
+  /** JPEG quality (1-100) "Standardize Art" re-encodes cover art at. */
+  artworkJpegQuality: number;
   recursive: boolean;
   /** When true, write "file name | | artist | | title | | year" into the backup field. */
   searchableBackup: boolean;
@@ -174,6 +180,7 @@ export const CLEARABLE_FIELDS = [
   "year",
   "discNumber",
   "trackNumber",
+  "trackId",
   "composer",
   "originalArtist",
 ] as const;
@@ -189,6 +196,12 @@ export interface PendingChange {
   include: boolean;
   changed: boolean;
   kind: "update" | "remove";
+  /**
+   * When true, `field` is a raw tag-frame key (see `TagData.allFields`), not a
+   * `TagData` field — the write path clears it by dropping the frame rather
+   * than by setting a value.
+   */
+  raw?: boolean;
 }
 
 export const AUDIO_EXTENSIONS = ["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
@@ -211,6 +224,9 @@ export const KEPT_FIELD_KEYS = new Set([
   "OriginalArtist",
   "Composer",
   "Popularimeter",
+  // Private app-assigned track id — surfaced as its own "Track ID" column,
+  // so it must not also appear as a raw "All Tags" column or a strip removal.
+  "Unknown(TRACKID)",
 ]);
 
 export const FIELD_LABELS: Record<string, string> = {
@@ -218,7 +234,8 @@ export const FIELD_LABELS: Record<string, string> = {
   artist: "Artist",
   album: "Album",
   albumArtist: "Album Artist",
-  trackNumber: "Track # / ID",
+  trackNumber: "Track #",
+  trackId: "Track ID",
   discNumber: "Disc #",
   year: "Year",
   genre: "Genre",

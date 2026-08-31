@@ -132,20 +132,25 @@ export function useTags() {
       if (!tags) continue;
       const filename = basename(path);
       for (const field of fields) {
+        const isRaw = field.startsWith("raw:");
+        const key = isRaw ? field.slice(4) : field;
         const before = String(
-          (tags as unknown as Record<string, string | undefined>)[field] ?? "",
+          isRaw
+            ? (tags.allFields?.[key] ?? "")
+            : ((tags as unknown as Record<string, string | undefined>)[key] ?? ""),
         ).trim();
         const changed = before.length > 0;
         rows.push({
           id: `${path}::clear::${field}`,
           path,
           filename,
-          field,
+          field: key,
           before,
           after: "",
           include: changed,
           changed,
-          kind: "update",
+          kind: isRaw ? "remove" : "update",
+          raw: isRaw,
         });
       }
     }
@@ -234,12 +239,17 @@ export function useTags() {
       const included = fileRows.filter((r) => r.changed && r.include);
       if (!included.length) continue;
       const tags: TagData = { ...current };
+      const clearedRaw = new Set<string>();
       for (const r of included) {
-        (tags as unknown as Record<string, string>)[r.field] = r.after;
+        if (r.raw) clearedRaw.add(r.field);
+        else (tags as unknown as Record<string, string>)[r.field] = r.after;
       }
       // When stripping is disabled (or forced), carry every non-common field
-      // over untouched; otherwise the write also strips (per settings).
-      const keepExtra = keepAllExtras || !settings.stripToCommon ? preserveExtras(current) : [];
+      // over untouched; otherwise the write also strips (per settings). Raw
+      // fields the user asked to clear are dropped from that carry-over list —
+      // an extra frame is cleared by not preserving it.
+      let keepExtra = keepAllExtras || !settings.stripToCommon ? preserveExtras(current) : [];
+      if (clearedRaw.size) keepExtra = keepExtra.filter((k) => !clearedRaw.has(k));
       try {
         await invoke("write_tags", writeTagsArgs(path, tags, settings, keepExtra));
         written++;
@@ -263,10 +273,11 @@ export function useTags() {
   };
 
   /**
-   * Assigns sequential zero-padded 6-digit ids to the Track Number of each
-   * selected file, starting from `settings.nextTrackId` and overwriting any
-   * existing value. Returns the next unused counter so it can be persisted;
-   * reset it in Settings to regenerate from a chosen number.
+   * Assigns sequential zero-padded 6-digit ids to the Track ID of each
+   * selected file (a private TXXX:TRACKID frame — never Track Number, which
+   * players use for album/playlist order), starting from `settings.nextTrackId`
+   * and overwriting any existing value. Returns the next unused counter so it
+   * can be persisted; reset it in Settings to regenerate from a chosen number.
    */
   const generateIds = async (
     paths: string[],
@@ -281,7 +292,7 @@ export function useTags() {
       if (!current) continue;
       const id = formatTrackId(counter, settings.trackIdDigits);
       try {
-        await updateField(path, current, "trackNumber", id, settings);
+        await updateField(path, current, "trackId", id, settings);
         written++;
         counter++;
       } catch (e) {
@@ -306,7 +317,7 @@ export function useTags() {
     for (const file of files) {
       const tags = map[file.path];
       if (!tags) continue;
-      const uid = isUid(tags.trackNumber, trackIdDigits) ? tags.trackNumber : undefined;
+      const uid = isUid(tags.trackId, trackIdDigits) ? tags.trackId : undefined;
       const stem = buildRenameStem(tags.artist, tags.title, uid);
       if (!stem) {
         errors.push(`${file.filename}: no artist/title to build a name from`);

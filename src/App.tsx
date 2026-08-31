@@ -34,6 +34,7 @@ import { matchesShortcut } from "./lib/shortcuts";
 import {
   basename,
   FIELD_LABELS,
+  formatBytes,
   type AudioFile,
   type PendingChange,
   type PreviewMode,
@@ -334,6 +335,27 @@ export default function App() {
       }
     });
     return () => {
+      promise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // Files the app was launched with ("Open with MusicTagCleaner" in Explorer,
+  // or a path on the command line). The Rust side keeps a queue; we drain it on
+  // mount, whenever the "open-files" event nudges us (a later "Open with"), and
+  // a couple more times to catch the burst of processes a multi-file selection
+  // spawns before this webview had a listener.
+  useEffect(() => {
+    const drain = () =>
+      invoke<string[]>("take_opened_files")
+        .then((paths) => {
+          if (paths.length) void importPathsRef.current(paths);
+        })
+        .catch(() => {});
+    const promise = listen("open-files", drain);
+    drain();
+    const timers = [setTimeout(drain, 800), setTimeout(drain, 2500)];
+    return () => {
+      timers.forEach(clearTimeout);
       promise.then((unlisten) => unlisten());
     };
   }, []);
@@ -769,6 +791,62 @@ export default function App() {
     }
   };
 
+  const standardizeArtwork = async () => {
+    const paths = filesApi.selectedPaths;
+    if (!paths.length) return notify("No files selected", "info");
+    const { artworkMaxDim, artworkJpegQuality } = settingsRef.current;
+    setBusy(true);
+    setProgress({ done: 0, total: paths.length, label: `Compressing artwork 0 of ${paths.length}` });
+    const changes: HistoryChange[] = [];
+    let savedBytes = 0;
+    try {
+      for (let i = 0; i < paths.length; i++) {
+        const path = paths[i];
+        try {
+          const res = await invoke<{
+            beforeDataUrl: string;
+            afterDataUrl: string;
+            beforeBytes: number;
+            afterBytes: number;
+          } | null>("standardize_artwork", {
+            path,
+            maxDim: artworkMaxDim,
+            quality: artworkJpegQuality,
+          });
+          if (res) {
+            changes.push({ path, field: "__coverArt", before: res.beforeDataUrl, after: res.afterDataUrl });
+            savedBytes += Math.max(0, res.beforeBytes - res.afterBytes);
+          }
+        } catch (e) {
+          notify(`${basename(path)}: ${e}`, "error");
+        }
+        setProgress({
+          done: i + 1,
+          total: paths.length,
+          label: `Compressing artwork ${Math.min(i + 1, paths.length)} of ${paths.length}`,
+        });
+      }
+      if (changes.length) {
+        invalidateCovers(changes.map((c) => c.path));
+        imageInfoApi.invalidate(changes.map((c) => c.path));
+        pushHistory({ label: `Standardize artwork (${changes.length})`, changes });
+      }
+      notify(
+        changes.length
+          ? `Recompressed ${changes.length} cover${changes.length === 1 ? "" : "s"}${
+              savedBytes > 0 ? `, saved ${formatBytes(savedBytes)}` : ""
+            }`
+          : "Every selected cover already meets the target",
+        changes.length ? "success" : "info",
+      );
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setProgress(null);
+      setBusy(false);
+    }
+  };
+
   const renameSingleFile = async (path: string, newStem: string) => {
     try {
       const newPath = await invoke<string>("rename_file", { path, newStem });
@@ -915,25 +993,28 @@ export default function App() {
     }
   };
 
-  const runClearFields = async () => {
+  const runClearFields = async (fields: string[]) => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
-    if (!settings.clearFields.length)
-      return notify("No fields chosen to clear — pick some in Settings", "info");
+    if (!fields.length) return notify("No fields chosen to clear", "info");
     const backupFieldKey =
       settings.backupField.charAt(0).toLowerCase() + settings.backupField.slice(1);
-    if (settings.searchableBackup && settings.clearFields.includes(backupFieldKey)) {
+    if (settings.searchableBackup && fields.includes(backupFieldKey)) {
       const ok = await confirm(
-        `Your Clear Fields settings include "${backupFieldKey}", which currently holds your searchable backup text. Clearing it will erase that backup — continue?`,
+        `"${backupFieldKey}" currently holds your searchable backup text. Clearing it will erase that backup — continue?`,
         { title: "Clearing the backup field", kind: "warning" },
       );
       if (!ok) return;
+    }
+    // Remember this pick as the new default for next time.
+    if (fields.slice().sort().join("\n") !== settingsRef.current.clearFields.slice().sort().join("\n")) {
+      void update((prev) => ({ ...prev, clearFields: fields }));
     }
     setBusy(true);
     try {
       const { map, errors } = await tagsApi.read(paths);
       errors.forEach((e) => notify(e, "error"));
-      const rows = tagsApi.buildClearPreview(paths, map, settings.clearFields);
+      const rows = tagsApi.buildClearPreview(paths, map, fields);
       setTagsMap(map);
       setPreviewMode("clear");
       setPending(rows);
@@ -1030,9 +1111,6 @@ export default function App() {
       if (matchesShortcut(e, "selectFolder", overrides)) {
         e.preventDefault();
         if (!busy) filesApi.selectFolder();
-      } else if (!isEditable && matchesShortcut(e, "selectAll", overrides)) {
-        e.preventDefault();
-        filesApi.setAll(true);
       } else if (!isEditable && matchesShortcut(e, "undo", overrides)) {
         e.preventDefault();
         void undo();
@@ -1101,8 +1179,9 @@ export default function App() {
               onRemoveChars={withTrack("removeChars", runRemoveChars)}
               onGenre={withTrack("genre", runGenre)}
               onGenerateIds={withTrack("generateIds", generateIds)}
+              onStandardizeArt={withTrack("standardizeArt", standardizeArtwork)}
               onRename={withTrack("renameToStandard", renameToStandard)}
-              onClearFields={withTrack("clearFields", runClearFields)}
+              onClearFields={withTrack1("clearFields", runClearFields)}
               onAddGenre={addGenreToPreset}
               onRenameGenre={renameGenreInPreset}
               onBackup={withTrack("backup", runBackup)}
