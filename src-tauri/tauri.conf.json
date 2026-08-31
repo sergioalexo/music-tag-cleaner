@@ -38,7 +38,15 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "fileAssociations": [
+      {
+        "ext": ["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"],
+        "name": "MusicTagCleaner Audio",
+        "description": "Audio file",
+        "role": "Editor"
+      }
+    ]
   },
   "plugins": {
     "updater": {

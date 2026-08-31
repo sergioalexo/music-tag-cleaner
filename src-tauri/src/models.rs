@@ -27,6 +27,9 @@ pub struct TagData {
     pub comment: Option<String>,
     pub composer: Option<String>,
     pub original_artist: Option<String>,
+    /// App-assigned unique id (from "Generate IDs"), stored in a private
+    /// `TXXX:TRACKID` frame so it never collides with Track Number.
+    pub track_id: Option<String>,
     /// Rating in stars, 0-5 (mapped from the POPM/rating byte).
     pub rating: Option<u8>,
     pub has_cover_art: bool,
@@ -50,6 +53,23 @@ pub struct ImageInfo {
     pub size_bytes: u64,
     pub width: u32,
     pub height: u32,
+}
+
+/// Result of recompressing one file's cover art. `None` from the command means
+/// nothing was done (no art, or it already meets the target).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtworkChange {
+    /// `data:<mime>;base64,…` of the picture before and after — carried into
+    /// the undo/redo history exactly like a manual artwork swap.
+    pub before_data_url: String,
+    pub after_data_url: String,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub before_width: u32,
+    pub before_height: u32,
+    pub after_width: u32,
+    pub after_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

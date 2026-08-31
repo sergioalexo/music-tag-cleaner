@@ -16,6 +16,13 @@ pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav
 
 const FILE_OP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// `key_name()` of the private frame that holds the app-assigned track id.
+const TRACK_ID_FIELD: &str = "Unknown(TRACKID)";
+
+fn track_id_key() -> ItemKey {
+    ItemKey::Unknown("TRACKID".to_string())
+}
+
 /// Runs blocking file I/O off the async runtime with a timeout, so a single
 /// locked file (open in another app) or a cloud-storage placeholder that
 /// hasn't downloaded yet fails fast with a clear message instead of hanging
@@ -34,6 +41,27 @@ where
             FILE_OP_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Maps `f` over `items` across a few threads. Each tag parse is an
+/// independent file read + decode, so a folder scan or a batch tag read of a
+/// few hundred files is otherwise a multi-second sequential stall. Small
+/// inputs stay single-threaded to avoid the spawn overhead.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    const MAX_THREADS: usize = 8;
+    if items.len() <= 16 {
+        return items.iter().map(&f).collect();
+    }
+    let chunk = items.len().div_ceil(MAX_THREADS.min(items.len()));
+    std::thread::scope(|s| {
+        items
+            .chunks(chunk)
+            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 /// Canonical, format-independent name for a tag key. Used for the
@@ -103,14 +131,15 @@ pub async fn scan_folder(path: String, recursive: bool) -> Result<Vec<AudioFile>
             return Err(format!("Not a folder: {path}"));
         }
         let max_depth = if recursive { usize::MAX } else { 1 };
-        let mut files: Vec<AudioFile> = WalkDir::new(root)
+        let paths: Vec<std::path::PathBuf> = WalkDir::new(root)
             .max_depth(max_depth)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-            .map(|e| file_info(e.path()))
+            .map(|e| e.into_path())
             .collect();
-        files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        let mut files = par_map(&paths, |p| file_info(p));
+        files.sort_by_cached_key(|f| f.path.to_lowercase());
         Ok(files)
     })
     .await
@@ -119,11 +148,9 @@ pub async fn scan_folder(path: String, recursive: bool) -> Result<Vec<AudioFile>
 
 #[tauri::command]
 pub async fn list_files(paths: Vec<String>) -> Vec<AudioFile> {
-    tauri::async_runtime::spawn_blocking(move || {
-        paths.iter().map(|p| file_info(Path::new(p))).collect()
-    })
-    .await
-    .unwrap_or_default()
+    tauri::async_runtime::spawn_blocking(move || par_map(&paths, |p| file_info(Path::new(p))))
+        .await
+        .unwrap_or_default()
 }
 
 /// Imports a mix of files and folders (as produced by a drag-and-drop),
@@ -132,23 +159,23 @@ pub async fn list_files(paths: Vec<String>) -> Vec<AudioFile> {
 pub async fn import_paths(paths: Vec<String>, recursive: bool) -> Vec<AudioFile> {
     tauri::async_runtime::spawn_blocking(move || {
         let max_depth = if recursive { usize::MAX } else { 1 };
-        let mut out: Vec<AudioFile> = Vec::new();
+        let mut targets: Vec<std::path::PathBuf> = Vec::new();
         for p in paths {
             let path = Path::new(&p);
             if path.is_dir() {
-                out.extend(
+                targets.extend(
                     WalkDir::new(path)
                         .max_depth(max_depth)
                         .into_iter()
                         .filter_map(|e| e.ok())
                         .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-                        .map(|e| file_info(e.path())),
+                        .map(|e| e.into_path()),
                 );
             } else if path.is_file() && is_audio(path) {
-                out.push(file_info(path));
+                targets.push(path.to_path_buf());
             }
         }
-        out
+        par_map(&targets, |p| file_info(p))
     })
     .await
     .unwrap_or_default()
@@ -180,6 +207,7 @@ pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
     data.comment = tag.comment().map(|c| c.to_string());
     data.composer = get_text(tag, &ItemKey::Composer);
     data.original_artist = get_text(tag, &ItemKey::OriginalArtist);
+    data.track_id = get_text(tag, &track_id_key());
     data.rating = read_rating(tag);
     data.has_cover_art = !tag.pictures().is_empty();
 
@@ -199,6 +227,11 @@ pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
                 })
                 .or_insert(text);
         }
+    }
+    // Fallback in case this format surfaces the private frame under a name the
+    // typed accessor above missed.
+    if data.track_id.is_none() {
+        data.track_id = data.all_fields.get(TRACK_ID_FIELD).cloned();
     }
     Ok(data)
 }
@@ -329,21 +362,18 @@ pub async fn read_tags(path: String) -> Result<TagData, String> {
 pub async fn read_tags_batch(paths: Vec<String>) -> Vec<TagReadResult> {
     let fallback: Vec<String> = paths.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|p| match read_tags_impl(&p) {
-                Ok(tags) => TagReadResult {
-                    path: p,
-                    tags: Some(tags),
-                    error: None,
-                },
-                Err(e) => TagReadResult {
-                    path: p,
-                    tags: None,
-                    error: Some(e),
-                },
-            })
-            .collect::<Vec<_>>()
+        par_map(&paths, |p| match read_tags_impl(p) {
+            Ok(tags) => TagReadResult {
+                path: p.clone(),
+                tags: Some(tags),
+                error: None,
+            },
+            Err(e) => TagReadResult {
+                path: p.clone(),
+                tags: None,
+                error: Some(e),
+            },
+        })
     })
     .await;
 
@@ -426,6 +456,7 @@ fn write_tags_blocking(
     );
     set_text(&mut new_tag, ItemKey::Composer, &tags.composer);
     set_text(&mut new_tag, ItemKey::OriginalArtist, &tags.original_artist);
+    set_text(&mut new_tag, track_id_key(), &tags.track_id);
     if let Some(stars) = tags.rating {
         write_rating(&mut new_tag, tag_type, stars);
     }
@@ -619,6 +650,42 @@ fn read_cover_art_blocking(path: &str) -> Result<Option<String>, String> {
     Ok(Some(format!("data:{mime};base64,{b64}")))
 }
 
+/// Returns a small JPEG data URL of the first embedded picture — for the track
+/// table's tiny thumbnails, where handing back the full-resolution art (via
+/// `read_cover_art`) for hundreds of rows at once would use hundreds of MB of
+/// base64 and freeze the UI. `size` is the longest side in px (clamped 16–512).
+#[tauri::command]
+pub async fn read_cover_thumbnail(path: String, size: u32) -> Result<Option<String>, String> {
+    run_blocking(move || {
+        use base64::Engine;
+        use image::GenericImageView;
+
+        let size = size.clamp(16, 512);
+        let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
+        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+            return Ok(None);
+        };
+        let Some(pic) = tag.pictures().first() else {
+            return Ok(None);
+        };
+        let img = image::load_from_memory(pic.data()).map_err(|e| e.to_string())?;
+        let thumb = if img.dimensions().0.max(img.dimensions().1) > size {
+            img.resize(size, size, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 78)
+            .encode_image(&thumb.to_rgb8())
+            .map_err(|e| e.to_string())?;
+        Ok(Some(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&out)
+        )))
+    })
+    .await
+}
+
 /// Returns byte size, pixel dimensions, and mime type of the first embedded
 /// picture, or None if the file has no cover art. Dimensions are decoded from
 /// the picture bytes with the `image` crate (lofty exposes the mime/bytes only).
@@ -755,6 +822,114 @@ pub async fn restore_cover_art(path: String, data_url: Option<String>) -> Result
     .await
 }
 
+/// Recompresses one file's cover art to a standard form: JPEG at `quality`,
+/// scaled so the longest side is at most `max_dim` (never upscaled). Returns
+/// `None` when the file has no art, or the art is already JPEG, within size,
+/// and re-encoding it would not shrink it. The before/after data URLs let the
+/// caller record the change in the undo/redo history like a manual swap.
+#[tauri::command]
+pub async fn standardize_artwork(
+    path: String,
+    max_dim: u32,
+    quality: u8,
+) -> Result<Option<crate::models::ArtworkChange>, String> {
+    run_blocking(move || standardize_artwork_blocking(&path, max_dim, quality)).await
+}
+
+/// A standardized cover: the new JPEG bytes plus the source and result pixel
+/// sizes (for the history entry's before/after summary).
+struct RecompressedCover {
+    jpeg: Vec<u8>,
+    from: (u32, u32),
+    to: (u32, u32),
+}
+
+/// The pixel transform behind `standardize_artwork`, split out so it can be
+/// tested without an audio container. Given the original picture bytes,
+/// returns the standardized JPEG plus its dimensions — or `None` when the
+/// original is already a JPEG within `max_dim` that a re-encode would not
+/// shrink.
+fn recompress_cover(
+    orig: &[u8],
+    is_jpeg: bool,
+    max_dim: u32,
+    quality: u8,
+) -> Result<Option<RecompressedCover>, String> {
+    use image::GenericImageView;
+
+    let max_dim = max_dim.clamp(64, 4000);
+    let quality = quality.clamp(40, 100);
+
+    let img = image::load_from_memory(orig).map_err(|e| format!("Unreadable cover art: {e}"))?;
+    let (w, h) = img.dimensions();
+
+    let needs_resize = w.max(h) > max_dim;
+    let scaled = if needs_resize {
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let (nw, nh) = scaled.dimensions();
+
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(&scaled.to_rgb8())
+        .map_err(|e| format!("JPEG encode failed: {e}"))?;
+
+    // Leave a JPEG that is already within bounds alone unless the re-encode
+    // saves real space (>10%) — a marginal shave isn't worth a generation of
+    // quality loss.
+    if !needs_resize && is_jpeg && (out.len() as f64) > (orig.len() as f64) * 0.9 {
+        return Ok(None);
+    }
+    Ok(Some(RecompressedCover {
+        jpeg: out,
+        from: (w, h),
+        to: (nw, nh),
+    }))
+}
+
+fn standardize_artwork_blocking(
+    path: &str,
+    max_dim: u32,
+    quality: u8,
+) -> Result<Option<crate::models::ArtworkChange>, String> {
+    use base64::Engine;
+
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(None);
+    };
+    let Some(pic) = tag.pictures().first() else {
+        return Ok(None);
+    };
+    let orig = pic.data().to_vec();
+    let is_jpeg = matches!(pic.mime_type(), Some(lofty::picture::MimeType::Jpeg));
+    let before_mime = pic
+        .mime_type()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "image/jpeg".to_string());
+    drop(tagged);
+
+    let Some(new) = recompress_cover(&orig, is_jpeg, max_dim, quality)? else {
+        return Ok(None);
+    };
+
+    embed_picture_bytes(path, lofty::picture::MimeType::Jpeg, new.jpeg.clone())?;
+
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(Some(crate::models::ArtworkChange {
+        before_data_url: format!("data:{before_mime};base64,{}", b64(&orig)),
+        after_data_url: format!("data:image/jpeg;base64,{}", b64(&new.jpeg)),
+        before_bytes: orig.len() as u64,
+        after_bytes: new.jpeg.len() as u64,
+        before_width: new.from.0,
+        before_height: new.from.1,
+        after_width: new.to.0,
+        after_height: new.to.1,
+    }))
+}
+
 /// Renames the file to `new_stem` (extension preserved), resolving collisions
 /// by appending " (2)", " (3)", … Returns the new absolute path.
 #[tauri::command]
@@ -783,15 +958,32 @@ fn rename_file_blocking(path: &str, new_stem: &str) -> Result<String, String> {
     };
 
     let mut target = build(stem);
-    // Same path (case-insensitive no-op rename) — nothing to do.
+    // Byte-identical path — nothing to do.
     if target == src {
         return Ok(path.to_string());
     }
+
+    // Does `p` resolve to the very file we're renaming? On a case-insensitive
+    // volume (Windows, default macOS) "Bonobo - Kerala.mp3" and an on-disk
+    // "bonobo - kerala.mp3" are the same file, so `target.exists()` is true
+    // even though the paths differ. Without this check the loop below would
+    // treat the file as colliding with itself and append " (2)".
+    let src_canon = std::fs::canonicalize(src).ok();
+    let is_self = |p: &std::path::Path| {
+        matches!(
+            (std::fs::canonicalize(p).ok(), src_canon.as_ref()),
+            (Some(a), Some(b)) if a == *b
+        )
+    };
+
     let mut n = 2;
-    while target.exists() {
+    while target.exists() && !is_self(&target) {
         target = build(&format!("{stem} ({n})"));
         n += 1;
     }
+    // A case-only / normalization-only change lands here with `target` still
+    // pointing at `src`; fs::rename applies it (a case-only rename is fine on
+    // Windows and macOS).
     std::fs::rename(src, &target).map_err(|e| e.to_string())?;
     Ok(target.to_string_lossy().to_string())
 }
@@ -846,5 +1038,90 @@ fn set_numbered(tag: &mut Tag, num_key: ItemKey, total_key: ItemKey, value: &Opt
         }
     } else {
         tag.insert_text(num_key, v.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mtc-test-{}-{:?}",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rename_case_only_change_does_not_append_suffix() {
+        let dir = scratch("case");
+        let src = dir.join("bonobo - kerala.mp3");
+        std::fs::write(&src, b"x").unwrap();
+
+        let out = rename_file_blocking(src.to_str().unwrap(), "Bonobo - Kerala").unwrap();
+
+        assert!(
+            !out.contains("(2)"),
+            "case-only rename should not collide with itself: {out}"
+        );
+        assert!(out.ends_with("Bonobo - Kerala.mp3"));
+        // Exactly one file in the dir (the renamed one), not a stale duplicate.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_real_collision_still_appends_suffix() {
+        let dir = scratch("collision");
+        let a = dir.join("song a.mp3");
+        let b = dir.join("song b.mp3");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let out = rename_file_blocking(b.to_str().unwrap(), "song a").unwrap();
+
+        assert!(out.ends_with("song a (2).mp3"), "got {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn recompress_downscales_oversized_art() {
+        let out = recompress_cover(&png_bytes(2000, 1500), false, 1000, 85).unwrap().unwrap();
+        assert_eq!(out.from, (2000, 1500));
+        assert_eq!(out.to, (1000, 750)); // longest side clamped, aspect kept
+        assert_eq!(&out.jpeg[..3], b"\xFF\xD8\xFF"); // JPEG magic
+    }
+
+    #[test]
+    fn recompress_converts_non_jpeg_even_when_small() {
+        let res = recompress_cover(&png_bytes(400, 400), false, 1000, 85).unwrap();
+        assert!(res.is_some(), "a PNG should still be converted to JPEG");
+        assert_eq!(res.unwrap().to, (400, 400)); // not upscaled
+    }
+
+    #[test]
+    fn recompress_skips_a_conformant_jpeg() {
+        // Encode a small JPEG, then feed it back in as an existing JPEG.
+        let jpeg = recompress_cover(&png_bytes(500, 500), false, 1000, 85).unwrap().unwrap().jpeg;
+        let again = recompress_cover(&jpeg, true, 1000, 85).unwrap();
+        assert!(again.is_none(), "a JPEG within bounds should not be rewritten");
     }
 }
