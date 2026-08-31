@@ -39,11 +39,6 @@ export function removeCharsFrom(value: string, chars: string): string {
   return collapseSpaces(out);
 }
 
-const SMALL_WORDS = new Set([
-  "a", "an", "and", "as", "at", "but", "by", "for", "in", "nor", "of", "on", "or",
-  "the", "to", "vs", "via", "with",
-]);
-
 export function applyCapitalization(value: string, mode: Capitalization): string {
   switch (mode) {
     case "upper":
@@ -57,29 +52,71 @@ export function applyCapitalization(value: string, mode: Capitalization): string
   }
 }
 
-function toTitleCase(value: string): string {
-  const words = value.split(/(\s+)/); // keep the whitespace runs
-  const wordIndexes = words
-    .map((token, i) => (/^\s+$/.test(token) || token === "" ? -1 : i))
-    .filter((i) => i !== -1);
-  const lastWordIndex = wordIndexes[wordIndexes.length - 1];
-  let seenWord = 0;
-  return words
-    .map((token, i) => {
-      if (/^\s+$/.test(token) || token === "") return token;
-      const lower = token.toLowerCase();
-      const isFirstOrLast = seenWord === 0 || i === lastWordIndex;
-      seenWord++;
-      if (!isFirstOrLast && SMALL_WORDS.has(lower)) return lower;
-      return capitalizeWord(token);
-    })
-    .join("");
+/**
+ * Roman numerals I–XX, capped low on purpose: past XX the forms start
+ * colliding with real words ("MIX", "DIV", "CIV"), and track titles never
+ * need "Part XLII".
+ */
+const ROMAN_NUMERAL = /^(i{1,3}|iv|vi{0,3}|ix|xi{0,3}|xiv|xvi{0,3}|xix|xx)$/i;
+
+function isRomanNumeral(token: string): boolean {
+  const letters = token.replace(/[^\p{L}]/gu, "");
+  return (
+    letters === letters.toUpperCase() &&
+    letters !== letters.toLowerCase() &&
+    ROMAN_NUMERAL.test(letters)
+  );
 }
 
-function capitalizeWord(word: string): string {
-  // Capitalize the first letter after any leading punctuation, e.g. (hello) -> (Hello).
-  return word.replace(/\p{L}/u, (c) => c.toUpperCase()).replace(/(\p{L})(.*)/u, (_m, first, rest) => {
-    return first + (rest as string).toLowerCase();
+/**
+ * True for a caps token we should leave exactly as written rather than
+ * re-case: an existing all-caps run that reads as an initialism (DJ, MC, UK,
+ * EDM, MGMT, SBTRKT). Deliberately conservative — a shouted ordinary word
+ * like "LOVE" is *not* kept, so it normalizes to "Love".
+ */
+function keepAsWritten(token: string): boolean {
+  const letters = token.replace(/[^\p{L}]/gu, "");
+  if (letters.length < 2) return false;
+  const allCaps = letters === letters.toUpperCase() && letters !== letters.toLowerCase();
+  if (!allCaps) return false;
+  if (letters.length <= 3) return true; // DJ, MC, UK, EP, RMX, VIP, EDM …
+  return !/[AEIOU]/.test(letters); // longer runs only when vowel-less (MGMT, SBTRKT)
+}
+
+/** Uppercases the first letter of a run and lowercases the rest ("rIVERS" -> "Rivers"). */
+function recaseWord(word: string): string {
+  let seenLetter = false;
+  let out = "";
+  for (const ch of word) {
+    if (/\p{L}/u.test(ch)) {
+      out += seenLetter ? ch.toLowerCase() : ch.toUpperCase();
+      seenLetter = true;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/**
+ * Capitalizes the first letter of every word. Letter runs separated by spaces,
+ * hyphens or slashes each count as a word, so "rock-n-roll" -> "Rock-N-Roll"
+ * and "ac/dc" -> "Ac/Dc". An already-uppercase roman numeral is kept
+ * ("Part III" stays) and mixed-case initialisms are kept ("DJ Snake"). There
+ * is intentionally no "small words stay lowercase" rule: "Rivers Flow In You"
+ * stays fully capitalized.
+ *
+ * When the whole value is already shouting ("RIVERS FLOW IN YOU") the
+ * keep-initialism rule is skipped — every word is recased — since otherwise
+ * short real words like "IN"/"YOU" would be mistaken for initialisms.
+ */
+function toTitleCase(value: string): string {
+  const cased = value.replace(/[^\p{L}]/gu, "");
+  const shouting = cased.length > 1 && cased === cased.toUpperCase() && cased !== cased.toLowerCase();
+  return value.replace(/\p{L}[\p{L}\p{M}\p{N}'’]*/gu, (word) => {
+    if (isRomanNumeral(word)) return word.toUpperCase();
+    if (!shouting && keepAsWritten(word)) return word;
+    return recaseWord(word);
   });
 }
 
