@@ -193,6 +193,15 @@ spacer-row technique keeps `<colgroup>` widths, `table-layout: fixed`, the
 sticky header and sticky first column all working; verified in Chromium that
 an empty `<td colSpan height>` takes the requested height.
 
+### 14. No way to clear the selection (0.5.1)
+After `Ctrl+A` highlighted every row there was no gesture to clear the
+highlight, and the header checkbox ticked-all on the first click even when
+some rows were already ticked.
+
+**Fix** (`src/components/TrackTable.tsx`): `Escape` (with the table focused)
+clears the row highlight; the header checkbox shows an indeterminate dash
+when partly ticked and one click there clears every tick.
+
 ## Backlog
 
 - Optional one-click "move Track Number ids into Track ID" for pre-v4

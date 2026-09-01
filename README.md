@@ -48,7 +48,9 @@ hands you the same prompt to paste into any AI you already use.
   block of tracks without touching their other fields.
 - Keyboard shortcuts: `Ctrl+O` open folder, `Ctrl+A` highlight every row
   (does not tick — press `Space` after to tick the highlighted rows),
-  `Space` tick the selection / focused row, `Escape` close modal / cancel preview.
+  `Space` tick the selection / focused row, `Escape` clear the highlight /
+  close modal / cancel preview. The header checkbox ticks all, or — when only
+  some rows are ticked — clears them.
 
 ## Prerequisites
 

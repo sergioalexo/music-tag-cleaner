@@ -323,6 +323,12 @@ export function TrackTable({
         e.preventDefault();
         onSetMany(targets, !selectedRef.current.has(targets[0]));
       }
+      // Escape clears the row highlight. Guarded to the body so it never
+      // fights the inline editor or a dialog for the key.
+      if (e.key === "Escape" && e.target === document.body && rowSelRef.current.size > 0) {
+        setRowSel(new Set());
+        setAnchorPath(null);
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -699,6 +705,7 @@ export function TrackTable({
   };
 
   const allChecked = files.length > 0 && files.every((f) => selected.has(f.path));
+  const someChecked = files.some((f) => selected.has(f.path));
 
   const renderCellValue = (col: ColumnDef, value: string) => {
     if (searchQuery.trim() && value) {
@@ -911,7 +918,13 @@ export function TrackTable({
                     type="checkbox"
                     className="accent-[var(--primary)]"
                     checked={allChecked}
-                    onChange={(e) => onSetAll(e.target.checked)}
+                    ref={(el) => {
+                      // Partly ticked reads as a dash, and one click there
+                      // clears everything rather than ticking the rest.
+                      if (el) el.indeterminate = someChecked && !allChecked;
+                    }}
+                    title={someChecked ? "Untick all" : "Tick all"}
+                    onChange={() => onSetAll(!someChecked)}
                   />
                 </th>
                 <th className={cn("px-1 py-2 text-center text-[10px] font-medium text-muted-foreground", headerSep)}>
