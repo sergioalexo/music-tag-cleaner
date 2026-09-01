@@ -14,8 +14,8 @@ import {
   X,
   ZoomIn,
 } from "lucide-react";
-import type { AudioFile, PendingChange, RowHeight, TagData } from "../types";
-import { formatBytes, KEPT_FIELD_KEYS } from "../types";
+import type { AudioFile, PendingChange, PreviewMode, RowHeight, TagData } from "../types";
+import { basename, FIELD_LABELS, formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
@@ -176,6 +176,8 @@ interface Props {
   /** Non-strip pending changes (AI/Standardize/Genre/Clear) shown inline as before → after diffs. */
   pending: PendingChange[] | null;
   onPendingChange: (rows: PendingChange[]) => void;
+  /** Which action the current `pending` belongs to — drives the Clear Fields add-a-column boxes. */
+  previewMode: PreviewMode;
 }
 
 /**
@@ -245,6 +247,7 @@ export function TrackTable({
   onTrack,
   pending,
   onPendingChange,
+  previewMode,
 }: Props) {
   // Local mirror of the persisted widths so a drag can update at pointer speed
   // without a settings write per frame; re-synced when the prop changes from
@@ -385,9 +388,40 @@ export function TrackTable({
     }));
   }, [showAllTags, filteredRows, tags]);
 
+  /**
+   * Temporary columns for a preview (Clear Fields, AI Clean, …) that touches a
+   * field with no column on screen — a hidden curated field like Comment, or a
+   * raw frame like Publisher. Without this you'd get a preview with a Cancel
+   * bar but nothing to see or uncheck. Gone the moment the preview closes.
+   */
+  const previewColumns = useMemo<ColumnDef[]>(() => {
+    if (!pending) return [];
+    const shown = new Set<string>();
+    for (const c of curatedColumns) shown.add(c.field ?? c.id);
+    for (const c of extraColumns) shown.add(c.rawKey ?? c.id);
+    const byId = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
+    const seen = new Set<string>();
+    const out: ColumnDef[] = [];
+    for (const r of pending) {
+      if (!r.changed || shown.has(r.field) || seen.has(r.field)) continue;
+      seen.add(r.field);
+      out.push(
+        byId.get(r.field) ?? {
+          id: r.field,
+          label: FIELD_LABELS[r.field] ?? r.field,
+          width: 150,
+          dynamic: true,
+          rawKey: r.field,
+          value: (_f: AudioFile, t?: TagData) => t?.allFields?.[r.field] ?? "",
+        },
+      );
+    }
+    return out;
+  }, [pending, curatedColumns, extraColumns]);
+
   const columns = useMemo(
-    () => [...curatedColumns, ...extraColumns],
-    [curatedColumns, extraColumns],
+    () => [...curatedColumns, ...previewColumns, ...extraColumns],
+    [curatedColumns, previewColumns, extraColumns],
   );
   const columnById = useMemo(() => new Map(columns.map((c) => [c.id, c])), [columns]);
   const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
@@ -618,6 +652,42 @@ export function TrackTable({
   const beginEdit = (path: string, field: string, value: string) => {
     setEditing({ path, field });
     setDraft(value);
+  };
+
+  /**
+   * Clear Fields preview: tick a column that isn't being cleared yet to add it,
+   * building removal rows for the same files the preview already covers. Raw
+   * ("All Tags") columns are pulled from `allFields`, curated ones from the
+   * typed tag.
+   */
+  const addClearColumn = (c: ColumnDef) => {
+    const key = c.field ?? c.rawKey;
+    if (!key || !pending) return;
+    const isRaw = !c.field && !!c.rawKey;
+    const paths = [...new Set(pending.map((r) => r.path))];
+    const rows: PendingChange[] = [];
+    for (const path of paths) {
+      const t = tags[path];
+      if (!t) continue;
+      const before = String(
+        isRaw
+          ? (t.allFields?.[key] ?? "")
+          : ((t as unknown as Record<string, string | undefined>)[key] ?? ""),
+      ).trim();
+      rows.push({
+        id: `${path}::clear::${isRaw ? "raw:" : ""}${key}`,
+        path,
+        filename: basename(path),
+        field: key,
+        before,
+        after: "",
+        include: before.length > 0,
+        changed: before.length > 0,
+        kind: "remove",
+        raw: isRaw,
+      });
+    }
+    onPendingChange([...pending, ...rows]);
   };
 
   /** An edit on a highlighted row applies to the whole selection, not just it. */
@@ -991,12 +1061,28 @@ export function TrackTable({
                   >
                     <span className="flex items-center gap-1 overflow-hidden">
                       <ColumnIncludeToggle
-                        state={pendingByColumn.get(c.id)}
+                        state={pendingByColumn.get(c.field ?? c.rawKey ?? c.id)}
                         label={c.label}
                         onChange={(include) =>
-                          setIncludeForIds(pendingByColumn.get(c.id)?.ids ?? new Set(), include)
+                          setIncludeForIds(
+                            pendingByColumn.get(c.field ?? c.rawKey ?? c.id)?.ids ?? new Set(),
+                            include,
+                          )
                         }
                       />
+                      {pending &&
+                        previewMode === "clear" &&
+                        (c.field || c.rawKey) &&
+                        !pendingByColumn.get(c.field ?? c.rawKey ?? c.id) && (
+                          <input
+                            type="checkbox"
+                            className="shrink-0 accent-[var(--primary)] opacity-40 hover:opacity-100"
+                            checked={false}
+                            title={`Also clear ${c.label} on these tracks`}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={() => addClearColumn(c)}
+                          />
+                        )}
                       <span className="min-w-0 flex-1 truncate">{c.label}</span>
                       {c.id === backupFieldId && (
                         <span className="shrink-0 text-[9px] font-normal text-amber-500">(Backup)</span>
@@ -1176,7 +1262,10 @@ export function TrackTable({
                         editing.field === c.id &&
                         (c.field || c.id === "filename" || c.dynamic);
                       const value = c.value(f, t);
-                      const pend = c.field ? pendingByKey.get(`${f.path}::${c.id}`) : undefined;
+                      const pendField = c.field ?? c.rawKey;
+                      const pend = pendField
+                        ? pendingByKey.get(`${f.path}::${pendField}`)
+                        : undefined;
                       return (
                         <td
                           key={c.id}
@@ -1254,7 +1343,7 @@ export function TrackTable({
                               className="flex cursor-pointer items-center gap-1"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                togglePendingCell(f.path, c.id, pend.id, pend.include);
+                                togglePendingCell(f.path, c.field ?? c.rawKey ?? c.id, pend.id, pend.include);
                               }}
                             >
                               <input

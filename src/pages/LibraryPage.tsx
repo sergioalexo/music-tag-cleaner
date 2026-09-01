@@ -470,7 +470,7 @@ export function LibraryPage({
 
           <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
             <SquarePen className="h-3.5 w-3.5" />
-            Click to select, Shift/Ctrl to extend · tick the box to choose targets
+            Click to select, Shift/Ctrl to extend, Esc to clear · tick the box to choose targets
           </span>
         </div>
       )}
@@ -521,6 +521,7 @@ export function LibraryPage({
           onTrack={onTrack}
           pending={inlinePreview ? pending : null}
           onPendingChange={onPendingChange}
+          previewMode={previewMode}
         />
       )}
     </div>

@@ -616,11 +616,19 @@ export default function App() {
     if (previewMode === "history") return setPending(null);
     const affected = [...new Set(pending.map((r) => r.path))];
     setBusy(true);
+    const onWriteProgress = (done: number, total: number) =>
+      setProgress({ done, total, label: `Writing ${Math.min(done, total)} of ${total}` });
     try {
       const result =
         previewMode === "strip"
-          ? await tagsApi.applyStrip(pending, tagsMap, settings)
-          : await tagsApi.applyUpdates(pending, tagsMap, settings, previewMode === "clear");
+          ? await tagsApi.applyStrip(pending, tagsMap, settings, onWriteProgress)
+          : await tagsApi.applyUpdates(
+              pending,
+              tagsMap,
+              settings,
+              previewMode === "clear",
+              onWriteProgress,
+            );
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(`Updated ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
@@ -628,8 +636,17 @@ export default function App() {
       // for beyond what's shown here, so it isn't added to the undo stack —
       // "Restore Backup" is the full-fidelity revert path for that action.
       if (previewMode !== "strip") {
+        // Cleared raw frames stay out of history (they can't be re-created by
+        // key alone — "Restore Backup" is their revert path, as with strip);
+        // curated clears are `kind: "remove"` now, so match those too.
         const changes = pending
-          .filter((r) => r.kind === "update" && r.changed && r.include)
+          .filter(
+            (r) =>
+              r.changed &&
+              r.include &&
+              !r.raw &&
+              (r.kind === "update" || previewMode === "clear"),
+          )
           .map((r) => ({ path: r.path, field: r.field, before: r.before, after: r.after }));
         pushHistory({ label: `Apply ${previewMode}`, changes });
       }
@@ -640,6 +657,7 @@ export default function App() {
     } catch (e) {
       notify(String(e), "error");
     } finally {
+      setProgress(null);
       setBusy(false);
     }
   };
@@ -848,6 +866,7 @@ export default function App() {
   };
 
   const renameSingleFile = async (path: string, newStem: string) => {
+    setBusy(true);
     try {
       const newPath = await invoke<string>("rename_file", { path, newStem });
       const [updated] = await invoke<AudioFile[]>("list_files", { paths: [newPath] });
@@ -865,6 +884,8 @@ export default function App() {
       }
     } catch (e) {
       notify(String(e), "error");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1230,6 +1251,7 @@ export default function App() {
         totalSize={filesApi.totalSize}
         ollama={ai.status}
         progress={progress}
+        busy={busy || filesApi.scanning || backupRunning || aiRunning}
       />
 
       {dropActive && (

@@ -149,7 +149,9 @@ export function useTags() {
           after: "",
           include: changed,
           changed,
-          kind: isRaw ? "remove" : "update",
+          // Every cleared field reads as a removal in the preview, curated or
+          // raw — the value is struck through and gone.
+          kind: "remove",
           raw: isRaw,
         });
       }
@@ -201,10 +203,15 @@ export function useTags() {
     rows: PendingChange[],
     map: Record<string, TagData>,
     settings: Settings,
+    onProgress?: Progress,
   ): Promise<ApplyResult> => {
     let written = 0;
     const errors: string[] = [];
-    for (const [path, fileRows] of groupByPath(rows)) {
+    const groups = groupByPath(rows);
+    let done = 0;
+    for (const [path, fileRows] of groups) {
+      done++;
+      onProgress?.(done, groups.size);
       const tags = map[path];
       if (!tags) continue;
       const removals = fileRows.filter((r) => r.kind === "remove");
@@ -230,10 +237,15 @@ export function useTags() {
     map: Record<string, TagData>,
     settings: Settings,
     keepAllExtras = false,
+    onProgress?: Progress,
   ): Promise<ApplyResult> => {
     let written = 0;
     const errors: string[] = [];
-    for (const [path, fileRows] of groupByPath(rows)) {
+    const groups = groupByPath(rows);
+    let done = 0;
+    for (const [path, fileRows] of groups) {
+      done++;
+      onProgress?.(done, groups.size);
       const current = map[path];
       if (!current) continue;
       const included = fileRows.filter((r) => r.changed && r.include);

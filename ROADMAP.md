@@ -202,6 +202,39 @@ some rows were already ticked.
 clears the row highlight; the header checkbox shows an indeterminate dash
 when partly ticked and one click there clears every tick.
 
+### 15. Clear Fields preview couldn't show fields with no column (0.5.2)
+The inline preview only rendered the per-column checkbox + per-cell "spare
+this one" checkbox for fields that had a visible column. Clearing a hidden
+curated field (Comment, Composer, …) or a raw frame (Publisher, ISRC)
+previewed as an empty table with just a Cancel bar.
+
+**Fix** (`src/components/TrackTable.tsx`):
+- A `previewColumns` memo adds a temporary column for any pending field with
+  no column on screen — the hidden curated column from `ALL_COLUMNS`, or a
+  synthesized one for a raw key. Cell and header pending lookups fall back to
+  `c.rawKey`, so dynamic columns light up too.
+- Every cleared field reads as a struck-through removal (`buildClearPreview`
+  uses `kind: "remove"` for curated fields as well). `applyPending`'s history
+  filter was widened to keep curated clears undoable despite the kind change;
+  cleared raw frames stay out of history (Restore Backup reverts those).
+- During a Clear Fields preview every tag column (visible ones without a
+  pending change) shows a faint checkbox — ticking it adds that field to the
+  clear for the previewed files.
+- The temporary columns and add-boxes vanish when the preview closes.
+
+Plus: the toolbar selection hint now mentions `Esc` clears the highlight.
+
+### 16. "Working…" indicator so writes don't look like a freeze (0.5.2)
+Only AI / artwork / backup ran a status-bar progress bar; every other write
+(Apply for strip / standardize / genre / clear, Generate IDs, Rename, inline
+edits, preview builds) just disabled the toolbar with no visible sign the app
+was doing anything.
+
+**Fix:** the status bar shows a spinning `Loader2` + "Working…" whenever
+`busy` (or scanning / backup / AI) is set and there's no detailed progress.
+`applyStrip` / `applyUpdates` now take an `onProgress` callback so **Apply**
+shows "Writing N of M" with the bar; `renameSingleFile` sets `busy`.
+
 ## Backlog
 
 - Optional one-click "move Track Number ids into Track ID" for pre-v4
