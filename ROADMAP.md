@@ -456,12 +456,36 @@ collection is never misleading. Only table headers were wired up; the Clear
 Fields checklist and the strip preview still show the friendly name
 regardless of this setting — left as a follow-up rather than done partway.
 
+### 28. Primary / secondary DJ app — v0.7
+Settings → **DJ Software**: Primary and Secondary pickers (Rekordbox,
+Serato DJ, Traktor, Engine DJ, VirtualDJ, djay, Mixxx, Other/none) — stored
+now, for the recommended backup field below and as the app's own record of
+the user's setup ahead of the v0.9 export targets.
+
+- `recommendedBackupField(app)` in [types.ts](src/types.ts): Rekordbox
+  reads Original Artist for the searchable backup; every other app here
+  relies on Comment. When the current `backupField` doesn't match the
+  primary app's recommendation, a note explains the mismatch with a one-click
+  **Use it** button — it never silently changes the setting itself.
+- Traktor's 0–255 internal rating scale is noted next to the picker (it's
+  still shown/edited as 0–5 stars here either way — this is informational,
+  not a scale-conversion feature).
+
+**Simplified vs. the original plan:** the secondary app is stored but
+nothing is written to a second field yet — "the secondary app's field
+written too when the two differ" needs `write_tags_blocking` and
+`backup_file_blocking` to accept and write a *second* backup field
+(currently one `Option<String>` each), which is real Rust surface area
+without a second real-world backup target to test against yet. Left for
+whichever v0.9 export item first needs it, rather than built speculatively
+now.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented except items 24–27 above (Genre
-Mode, strict filenames, genre auto-detect, raw field names). Ordered by
-release. Each item notes the suspected cause where the code has already
-been read, so the fix doesn't start from zero.
+Planning only; nothing below is implemented except items 24–28 above (Genre
+Mode, strict filenames, genre auto-detect, raw field names, DJ app profile).
+Ordered by release. Each item notes the suspected cause where the code has
+already been read, so the fix doesn't start from zero.
 
 ---
 
@@ -496,21 +520,6 @@ folder / genre / artist fast), separate from the existing track search.
 Selection is a filter over the loaded collection — no disk rescan. Ctrl-click
 for unions. Follows the Media Fetch sidebar design language.
 
-### U7. Primary / secondary DJ app
-Settings → **DJ software**: a primary and an optional secondary pick from
-Rekordbox, Serato, Traktor, Engine DJ, VirtualDJ, djay, Mixxx, "Other". Stored
-now, used for:
-
-- which field holds the searchable backup — Rekordbox reads Original Artist
-  (`TOPE`), Serato and Traktor don't and need Comment. Today's hardcoded
-  Original Artist behaviour becomes "whatever the primary app reads", with the
-  secondary app's field written too when the two differ.
-- default field visibility and rating scale (Rekordbox/Serato 0–5,
-  Traktor 0–255)
-- the export targets offered in v0.9 (F4/F5)
-
-A one-line explanation under the picker states exactly which fields the choice
-changes — no silent behaviour switches.
 
 ---
 

@@ -19,6 +19,7 @@ export const DEFAULT_SETTINGS: Settings = {
   recursive: true,
   searchableBackup: true,
   backupField: "Composer",
+  djApp: { primary: "other", secondary: "other" },
   lastFolder: "",
   theme: "dark",
   visibleColumns: [

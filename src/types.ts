@@ -74,6 +74,48 @@ export type Capitalization = "asis" | "upper" | "title" | "lower";
 
 export type BackupField = "Composer" | "OriginalArtist" | "Comment" | "Album" | "AlbumArtist" | "Genre";
 
+export type DjApp =
+  | "rekordbox"
+  | "serato"
+  | "traktor"
+  | "enginedj"
+  | "virtualdj"
+  | "djay"
+  | "mixxx"
+  | "other";
+
+export const DJ_APP_LABELS: Record<DjApp, string> = {
+  rekordbox: "Rekordbox",
+  serato: "Serato DJ",
+  traktor: "Traktor",
+  enginedj: "Engine DJ",
+  virtualdj: "VirtualDJ",
+  djay: "djay",
+  mixxx: "Mixxx",
+  other: "Other / none",
+};
+
+/** 0-5 stars everywhere except Traktor, which stores 0-255 internally. */
+export const DJ_APP_RATING_SCALE: Record<DjApp, string> = {
+  rekordbox: "0–5 stars",
+  serato: "0–5 stars",
+  traktor: "0–255 (shown as 0–5 stars here)",
+  enginedj: "0–5 stars",
+  virtualdj: "0–5 stars",
+  djay: "0–5 stars",
+  mixxx: "0–5 stars",
+  other: "0–5 stars",
+};
+
+/**
+ * Which field a DJ app reads for the searchable backup ("file name | |
+ * artist | | title | | year"): Rekordbox reads Original Artist (TOPE);
+ * Serato, Traktor and everything else here rely on Comment instead.
+ */
+export function recommendedBackupField(app: DjApp): BackupField {
+  return app === "rekordbox" ? "OriginalArtist" : "Comment";
+}
+
 export type RowHeight = "compact" | "normal" | "tall";
 
 /** Cumulative local Ollama usage — tracked for the usage dashboard, not billed. */
@@ -120,6 +162,8 @@ export interface Settings {
   searchableBackup: boolean;
   /** Tag field the searchable backup is written into. */
   backupField: BackupField;
+  /** DJ software used, for a recommended backup field and (future) export targets. */
+  djApp: { primary: DjApp; secondary: DjApp };
   lastFolder: string;
   theme: "dark" | "light";
   visibleColumns: string[];

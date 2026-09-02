@@ -5,11 +5,19 @@ import { Download, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
 import type {
   Capitalization,
   CharReplacement,
+  DjApp,
   GenrePreset,
   OllamaStatus,
   Settings,
 } from "../types";
-import { CLEARABLE_FIELDS, FIELD_LABELS, TRANSLITERATE_SCRIPTS } from "../types";
+import {
+  CLEARABLE_FIELDS,
+  DJ_APP_LABELS,
+  DJ_APP_RATING_SCALE,
+  FIELD_LABELS,
+  recommendedBackupField,
+  TRANSLITERATE_SCRIPTS,
+} from "../types";
 import { migrate, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
 import { STANDARDIZE_FIELDS } from "../hooks/useTags";
 import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
@@ -503,6 +511,64 @@ export function SettingsPage({
                 </label>
               ))}
             </div>
+          </div>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="DJ Software"
+          hint="Stored for a recommended backup field below, and for cross-platform export targets planned later"
+        />
+        <div className="px-5 py-2">
+          <Row label="Primary">
+            <select
+              className={cn(selectClass, "w-40")}
+              value={settings.djApp.primary}
+              onChange={(e) =>
+                set("djApp", { ...settings.djApp, primary: e.target.value as DjApp })
+              }
+            >
+              {(Object.keys(DJ_APP_LABELS) as DjApp[]).map((app) => (
+                <option key={app} value={app}>
+                  {DJ_APP_LABELS[app]}
+                </option>
+              ))}
+            </select>
+          </Row>
+          <Row label="Secondary" hint="Optional — a second app you also load tracks into">
+            <select
+              className={cn(selectClass, "w-40")}
+              value={settings.djApp.secondary}
+              onChange={(e) =>
+                set("djApp", { ...settings.djApp, secondary: e.target.value as DjApp })
+              }
+            >
+              {(Object.keys(DJ_APP_LABELS) as DjApp[]).map((app) => (
+                <option key={app} value={app}>
+                  {DJ_APP_LABELS[app]}
+                </option>
+              ))}
+            </select>
+          </Row>
+          <div className="py-1.5 text-xs text-muted-foreground">
+            Rating scale: {DJ_APP_RATING_SCALE[settings.djApp.primary]}.{" "}
+            {settings.backupField === recommendedBackupField(settings.djApp.primary) ? (
+              <>Backup field below already matches {DJ_APP_LABELS[settings.djApp.primary]}.</>
+            ) : (
+              <>
+                {DJ_APP_LABELS[settings.djApp.primary]} reads{" "}
+                <b>{recommendedBackupField(settings.djApp.primary) === "OriginalArtist" ? "Original Artist" : "Comment"}</b>{" "}
+                for the searchable backup, not the current "{settings.backupField}".{" "}
+                <button
+                  className="font-medium text-primary underline underline-offset-2"
+                  onClick={() => set("backupField", recommendedBackupField(settings.djApp.primary))}
+                >
+                  Use it
+                </button>
+                .
+              </>
+            )}
           </div>
         </div>
       </Card>
