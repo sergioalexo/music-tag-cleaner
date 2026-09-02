@@ -70,7 +70,15 @@ export interface CharReplacement {
   caseSensitive?: boolean;
 }
 
-export type Capitalization = "asis" | "upper" | "title" | "lower";
+export type Capitalization = "asis" | "upper" | "title" | "lower" | "sentence";
+
+export const CAP_OPTIONS: { value: Capitalization; label: string }[] = [
+  { value: "asis", label: "Leave as is" },
+  { value: "upper", label: "AA" },
+  { value: "title", label: "Aa" },
+  { value: "lower", label: "aa" },
+  { value: "sentence", label: "Sentence case" },
+];
 
 export type BackupField = "Composer" | "OriginalArtist" | "Comment" | "Album" | "AlbumArtist" | "Genre";
 

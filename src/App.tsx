@@ -39,6 +39,7 @@ import {
   FIELD_LABELS,
   formatBytes,
   type AudioFile,
+  type Capitalization,
   type PendingChange,
   type PreviewMode,
   type TagData,
@@ -468,6 +469,33 @@ export default function App() {
       "standardize",
       (value) => removeCharsFrom(value, settingsRef.current.removeChars),
       `No "${settingsRef.current.removeChars}" characters found`,
+    );
+
+  /**
+   * Capitalization pulled out of Standardize as its own action (CapitalizationMenu):
+   * runs `mode` immediately and remembers it as the new default, same split-button
+   * pattern as Clear Fields.
+   */
+  const runCapitalizationOnly = (mode: Capitalization) => {
+    void save({ ...settings, capitalization: mode });
+    runStandardize(
+      "standardize",
+      (value) => applyCapitalization(value, mode),
+      "Nothing to change with this capitalization",
+    );
+  };
+
+  /**
+   * The character/separator rules (feat. normalization, bracket style, dash
+   * spacing, junk-suffix removal, whitespace collapse) pulled out of
+   * Standardize as their own action — everything Standardize does *except*
+   * recasing.
+   */
+  const runCharacterRules = () =>
+    runStandardize(
+      "standardize",
+      (value) => applyReplacements(value, settingsRef.current.replacements),
+      "Nothing to change with the current character rules",
     );
 
   /**
@@ -1321,6 +1349,8 @@ export default function App() {
               onAIClean={withTrack("aiClean", runAIClean)}
               onStopAI={ai.stop}
               onStandardize={withTrack("standardize", runStandardizeRules)}
+              onCapitalization={withTrack1<Capitalization>("capitalization", runCapitalizationOnly)}
+              onCharacterRules={withTrack("characterRules", runCharacterRules)}
               onRemoveChars={withTrack("removeChars", runRemoveChars)}
               onGenre={withTrack("genre", runGenre)}
               onGenerateIds={withTrack("generateIds", generateIds)}

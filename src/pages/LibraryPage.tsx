@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
+  Braces,
   Eraser,
   FilePlus2,
   FolderOpen,
@@ -20,7 +21,15 @@ import {
   Undo2,
   Wand2,
 } from "lucide-react";
-import type { AudioFile, PendingChange, PreviewMode, RowHeight, Settings, TagData } from "../types";
+import type {
+  AudioFile,
+  Capitalization,
+  PendingChange,
+  PreviewMode,
+  RowHeight,
+  Settings,
+  TagData,
+} from "../types";
 import { KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { activePreset } from "../lib/genres";
@@ -28,6 +37,7 @@ import { shortcutFor } from "../lib/shortcuts";
 import { TrackTable } from "../components/TrackTable";
 import PreviewTable from "../components/PreviewTable";
 import { ClearFieldsMenu } from "../components/ClearFieldsMenu";
+import { CapitalizationMenu } from "../components/CapitalizationMenu";
 import { Button } from "../components/ui";
 
 interface FilesApi {
@@ -71,6 +81,8 @@ interface Props {
   onAIClean: () => void;
   onStopAI: () => void;
   onStandardize: () => void;
+  onCapitalization: (mode: Capitalization) => void;
+  onCharacterRules: () => void;
   onRemoveChars: () => void;
   onGenre: () => void;
   onGenerateIds: () => void;
@@ -125,6 +137,8 @@ export function LibraryPage({
   onAIClean,
   onStopAI,
   onStandardize,
+  onCapitalization,
+  onCharacterRules,
   onRemoveChars,
   onGenre,
   onGenerateIds,
@@ -411,7 +425,28 @@ export function LibraryPage({
 
           <span className="mx-1 h-6 w-px bg-border" />
 
-          <Button variant="secondary" size="sm" onClick={onStandardize} disabled={noSel}>
+          <CapitalizationMenu
+            mode={settings.capitalization}
+            disabled={noSel}
+            onRun={onCapitalization}
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onCharacterRules}
+            disabled={noSel}
+            title="Apply the character/separator rules from Settings (feat. style, brackets, dashes, junk suffixes, whitespace) — not recasing"
+          >
+            <Braces />
+            Characters
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onStandardize}
+            disabled={noSel}
+            title="Runs both Capitalization and Characters together, in one pass"
+          >
             <Wand2 />
             Standardize
           </Button>

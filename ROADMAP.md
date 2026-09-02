@@ -480,10 +480,39 @@ without a second real-world backup target to test against yet. Left for
 whichever v0.9 export item first needs it, rather than built speculatively
 now.
 
+### 29. Split Standardize into separate Capitalization / Characters tools — v0.7
+The old **Standardize** button ran `applyReplacements()` (character/separator
+rules) and `applyCapitalization()` back to back with no way to run just one.
+It turned out **Remove Chars** was already its own button (a *different*,
+narrower thing — stripping a fixed literal character set from Settings, not
+the feat./bracket/dash/junk-suffix rules) — so the real gap was pulling
+capitalization and the character rules apart from each other, not from
+Remove Chars.
+
+- New [CapitalizationMenu.tsx](src/components/CapitalizationMenu.tsx) — the
+  same split-button pattern as `ClearFieldsMenu`: the left half re-runs the
+  remembered mode, the caret opens a one-click list of every mode. Picking
+  one runs it immediately and becomes the new remembered default
+  (`settings.capitalization`).
+- Added the missing **Sentence case** mode to `applyCapitalization()`
+  ([standardize.ts](src/lib/standardize.ts)) and the `Capitalization` type —
+  the roadmap listed it but it didn't exist yet.
+- New **Characters** button runs just `applyReplacements()` — the feat./
+  bracket/dash/junk-suffix/whitespace rules from Settings, with no recasing.
+- **Standardize** is unchanged: still runs both together in one pass, for
+  the original one-click behaviour.
+- `CAP_OPTIONS` moved from SettingsPage.tsx into types.ts (next to the
+  `Capitalization` type) so the new toolbar component isn't importing
+  constants out of a page module.
+
+All three still build the same before/after pending-change preview as
+before — no changes were needed there.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented except items 24–28 above (Genre
-Mode, strict filenames, genre auto-detect, raw field names, DJ app profile).
+Planning only; nothing below is implemented except items 24–29 above (Genre
+Mode, strict filenames, genre auto-detect, raw field names, DJ app profile,
+Standardize split) — U6 (library browser sidebar) is the only v0.7 item left.
 Ordered by release. Each item notes the suspected cause where the code has
 already been read, so the fix doesn't start from zero.
 
@@ -491,20 +520,6 @@ already been read, so the fix doesn't start from zero.
 
 # v0.7 — Editing UX
 
-### U3. Split Standardize into three tools
-Today one button does everything. Break it into:
-
-1. **Capitalization** — split button with a dropdown (`Aa` Capitalize Each Word,
-   `ALL CAPS`, `lowercase`, `Sentence case`, `Leave as-is`). The choice persists
-   and the left half re-runs the remembered mode — exactly how Clear Fields
-   already works.
-2. **Characters** — the character/separator rules (feat. normalization, bracket
-   style, dash spacing, junk-suffix removal, whitespace collapse), each
-   toggleable, run as its own button.
-3. **Standardize** — kept as "run everything currently enabled", for the old
-   one-click behaviour.
-
-All three still preview through the existing pending-change pipeline.
 
 ### U6. Library browser sidebar
 A second, narrow pane on the left of the Library page (collapsible, resizable,

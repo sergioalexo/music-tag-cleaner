@@ -47,6 +47,12 @@ export function applyCapitalization(value: string, mode: Capitalization): string
       return value.toLowerCase();
     case "title":
       return toTitleCase(value);
+    case "sentence": {
+      const lower = value.toLowerCase();
+      const idx = lower.search(/\p{L}/u);
+      if (idx === -1) return lower;
+      return lower.slice(0, idx) + lower[idx].toUpperCase() + lower.slice(idx + 1);
+    }
     default:
       return value;
   }

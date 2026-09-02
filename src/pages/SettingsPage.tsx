@@ -2,15 +2,9 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { Download, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
-import type {
-  Capitalization,
-  CharReplacement,
-  DjApp,
-  GenrePreset,
-  OllamaStatus,
-  Settings,
-} from "../types";
+import type { CharReplacement, DjApp, GenrePreset, OllamaStatus, Settings } from "../types";
 import {
+  CAP_OPTIONS,
   CLEARABLE_FIELDS,
   DJ_APP_LABELS,
   DJ_APP_RATING_SCALE,
@@ -41,13 +35,6 @@ interface Props {
 }
 
 const BATCH_SIZES = [10, 25, 50, 100];
-
-const CAP_OPTIONS: { value: Capitalization; label: string }[] = [
-  { value: "asis", label: "Leave as is" },
-  { value: "upper", label: "AA" },
-  { value: "title", label: "Aa" },
-  { value: "lower", label: "aa" },
-];
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
   return (
