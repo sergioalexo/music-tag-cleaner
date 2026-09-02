@@ -197,7 +197,13 @@ export function Combobox({
                     e.stopPropagation();
                     if (e.key === "Enter") {
                       const next = editDraft.trim();
-                      if (next && next !== o) onEditOption?.(o, next);
+                      if (next && next !== o) {
+                        onEditOption?.(o, next);
+                        // Renaming the option currently applied to this field
+                        // should update the field too — otherwise the rename
+                        // silently leaves the field pointing at the old name.
+                        if (o === value) commit(next);
+                      }
                       setEditingOption(null);
                     } else if (e.key === "Escape") {
                       setEditingOption(null);
@@ -205,7 +211,10 @@ export function Combobox({
                   }}
                   onBlur={() => {
                     const next = editDraft.trim();
-                    if (next && next !== o) onEditOption?.(o, next);
+                    if (next && next !== o) {
+                      onEditOption?.(o, next);
+                      if (o === value) commit(next);
+                    }
                     setEditingOption(null);
                   }}
                   className="w-full rounded border border-primary bg-background px-2 py-1.5 text-xs outline-none"

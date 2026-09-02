@@ -502,7 +502,11 @@ fn write_tags_blocking(
     if backup {
         let backup_str = find_backup_in_file(&tagged)
             .unwrap_or_else(|| make_backup_string(old_tag.as_ref(), tag_type));
-        new_tag.insert(TagItem::new(
+        // `insert` (checked) silently drops ItemKey::Unknown keys the format
+        // doesn't already map — see the comment on `set_text` — which meant
+        // this JSON snapshot never actually made it into ID3v2 files, and
+        // "Restore Backup" had nothing to restore from.
+        new_tag.insert_unchecked(TagItem::new(
             ItemKey::Unknown(BACKUP_KEY.to_string()),
             ItemValue::Text(backup_str),
         ));
@@ -557,7 +561,10 @@ fn write_raw_field_blocking(path: &str, field_key: &str, value: &str) -> Result<
     if value.is_empty() {
         tag.remove_key(&existing_key);
     } else {
-        tag.insert_text(existing_key, value.to_string());
+        // `existing_key` is very often ItemKey::Unknown for a raw/"All Tags"
+        // field — same silent-drop issue as set_text above, so this must go
+        // through insert_unchecked too.
+        tag.insert_unchecked(TagItem::new(existing_key, ItemValue::Text(value.to_string())));
     }
     tagged
         .save_to_path(path, WriteOptions::default())
@@ -616,7 +623,9 @@ fn backup_file_blocking(path: &str, backup_field: &str) -> Result<(), String> {
         .expect("tag of tag_type was just ensured");
     tag.insert_text(key, searchable);
     if let Some(json) = json_backup {
-        tag.insert(TagItem::new(
+        // See the matching fix in write_tags_blocking: this must be
+        // insert_unchecked, or the snapshot silently never gets written.
+        tag.insert_unchecked(TagItem::new(
             ItemKey::Unknown(BACKUP_KEY.to_string()),
             ItemValue::Text(json),
         ));
@@ -1018,7 +1027,16 @@ fn set_text(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
     if let Some(v) = value {
         let v = v.trim();
         if !v.is_empty() {
-            tag.insert_text(key, v.to_string());
+            // `Tag::insert_text` goes through `Tag::insert`, which calls
+            // `ItemKey::re_map` with `allow_unknown: false` — so it silently
+            // drops any `ItemKey::Unknown` (e.g. our private TRACKID field)
+            // that isn't in the format's own key map, *before* the item is
+            // even added to the tag. `insert_unchecked` is lofty's documented
+            // way to write such keys; the format-specific writer still
+            // rejects a genuinely out-of-spec key at save time, so this
+            // doesn't bypass validation, just the redundant pre-check that
+            // has no entry for private keys anyway.
+            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(v.to_string())));
         }
     }
 }
@@ -1123,5 +1141,104 @@ mod tests {
         let jpeg = recompress_cover(&png_bytes(500, 500), false, 1000, 85).unwrap().unwrap().jpeg;
         let again = recompress_cover(&jpeg, true, 1000, 85).unwrap();
         assert!(again.is_none(), "a JPEG within bounds should not be rewritten");
+    }
+
+    /// A minimal valid MPEG-1 Layer III frame (128kbps / 44100Hz / stereo,
+    /// no CRC), repeated so lofty's format prober has enough consecutive
+    /// frames to identify the file as MP3.
+    fn minimal_mp3_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..20 {
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            bytes.extend(std::iter::repeat(0u8).take(413));
+        }
+        bytes
+    }
+
+    // Regression test for "Generate IDs" writing a Track ID that never shows
+    // up on read-back: ItemKey::Unknown("TRACKID") is 7 bytes, not a valid
+    // 4-byte ID3v2 frame id, so it must round-trip as a TXXX frame with
+    // description "TRACKID" rather than being silently dropped.
+    #[test]
+    fn track_id_round_trips_through_id3v2() {
+        let dir = scratch("trackid");
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut tags = TagData::default();
+        tags.track_id = Some("000123".to_string());
+        write_tags_blocking(&path_str, tags, false, vec![], false, None)
+            .expect("write_tags_blocking should succeed");
+
+        let read_back = read_tags_impl(&path_str).expect("read_tags_impl should succeed");
+        assert_eq!(
+            read_back.track_id.as_deref(),
+            Some("000123"),
+            "Track ID did not round-trip through ID3v2"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Same class of bug as the Track ID one above, hitting the searchable
+    // backup: the JSON snapshot is stored under `ItemKey::Unknown(BACKUP_KEY)`
+    // ("TAGBACKUP"), an unmapped private key, so it must go through
+    // `insert_unchecked` too or it's silently dropped and "Restore Backup"
+    // has nothing to restore from.
+    #[test]
+    fn backup_blob_round_trips_through_id3v2() {
+        let dir = scratch("backupblob");
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut tags = TagData::default();
+        tags.title = Some("Kerala".to_string());
+        write_tags_blocking(&path_str, tags, true, vec![], false, None)
+            .expect("write_tags_blocking should succeed");
+
+        let tagged = lofty::read_from_path(&path_str).unwrap();
+        assert!(
+            find_backup_in_file(&tagged).is_some(),
+            "searchable backup blob did not round-trip through ID3v2"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Same class of bug again: editing a raw "All Tags" field whose key
+    // lofty doesn't have a built-in mapping for (e.g. a custom TXXX
+    // description) went through checked `insert_text` and was silently
+    // dropped instead of actually changing the value on disk.
+    #[test]
+    fn raw_field_edit_round_trips_through_id3v2() {
+        let dir = scratch("rawfield");
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Seed an unmapped custom field directly, the way a file ripped by
+        // some other tool might already have one.
+        {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown("CUSTOMFIELD".to_string()),
+                ItemValue::Text("old value".to_string()),
+            ));
+            tag.save_to_path(&path_str, WriteOptions::default()).unwrap();
+        }
+
+        write_raw_field_blocking(&path_str, "Unknown(CUSTOMFIELD)", "new value")
+            .expect("write_raw_field_blocking should succeed");
+
+        let read_back = read_tags_impl(&path_str).expect("read_tags_impl should succeed");
+        assert_eq!(
+            read_back.all_fields.get("Unknown(CUSTOMFIELD)").map(String::as_str),
+            Some("new value"),
+            "raw field edit did not round-trip through ID3v2"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

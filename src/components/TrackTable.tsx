@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ChevronUp,
   Filter,
   ImageOff,
   ImagePlus,
   Layers,
+  Loader2,
   Music,
   Search,
   SlidersHorizontal,
@@ -18,6 +23,7 @@ import type { AudioFile, PendingChange, PreviewMode, RowHeight, TagData } from "
 import { basename, FIELD_LABELS, formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
+import { internalDrag } from "../lib/internalDrag";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
 import { AudioPreview } from "./AudioPreview";
@@ -210,6 +216,111 @@ function ColumnIncludeToggle({
         state.total === 1 ? "" : "s"
       }`}
     />
+  );
+}
+
+/**
+ * Full-screen embedded-artwork viewer. Fetches the original, full-resolution
+ * picture on demand (`read_cover_art` — unlike the table's `covers` map,
+ * which only ever holds small re-encoded thumbnails) so the image shown here
+ * is byte-for-byte what's in the file, not a downscaled JPEG copy.
+ */
+function ArtworkLightbox({
+  file,
+  info,
+  onFetchInfo,
+  onClose,
+  onPrev,
+  onNext,
+}: {
+  file: AudioFile;
+  info: ImgInfo | null | undefined;
+  onFetchInfo: (path: string) => void;
+  onClose: () => void;
+  onPrev: () => void;
+  onNext: () => void;
+}) {
+  const [src, setSrc] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(undefined);
+    onFetchInfo(file.path);
+    invoke<string | null>("read_cover_art", { path: file.path })
+      .then((data) => {
+        if (!cancelled) setSrc(data);
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.path]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      else if (e.key === "ArrowLeft") onPrev();
+      else if (e.key === "ArrowRight") onNext();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onPrev, onNext]);
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[200] flex flex-col items-center justify-center bg-black/85 p-6"
+      onClick={onClose}
+    >
+      <button
+        className="absolute right-4 top-4 rounded-full bg-black/40 p-2 text-white/80 hover:bg-black/60 hover:text-white"
+        onClick={onClose}
+        title="Close (Esc)"
+      >
+        <X className="h-5 w-5" />
+      </button>
+      <button
+        className="absolute left-4 top-1/2 -translate-y-1/2 rounded-full bg-black/40 p-2 text-white/80 hover:bg-black/60 hover:text-white"
+        onClick={(e) => {
+          e.stopPropagation();
+          onPrev();
+        }}
+        title="Previous (←)"
+      >
+        <ChevronLeft className="h-6 w-6" />
+      </button>
+      <button
+        className="absolute right-4 top-1/2 -translate-y-1/2 rounded-full bg-black/40 p-2 text-white/80 hover:bg-black/60 hover:text-white"
+        onClick={(e) => {
+          e.stopPropagation();
+          onNext();
+        }}
+        title="Next (→)"
+      >
+        <ChevronRight className="h-6 w-6" />
+      </button>
+
+      <div className="flex max-h-[85vh] max-w-[85vw] items-center justify-center" onClick={(e) => e.stopPropagation()}>
+        {src === undefined ? (
+          <Loader2 className="h-8 w-8 animate-spin text-white/70" />
+        ) : src ? (
+          <img src={src} alt="" className="max-h-[85vh] max-w-[85vw] rounded object-contain shadow-2xl" />
+        ) : (
+          <div className="flex flex-col items-center gap-2 text-white/70">
+            <ImageOff className="h-8 w-8" />
+            <span className="text-sm">No embedded artwork</span>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 text-center text-sm text-white/80" onClick={(e) => e.stopPropagation()}>
+        <div className="font-medium">{file.filename}</div>
+        {info && <div className="text-xs text-white/50">{formatImageInfo(info)}</div>}
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -486,6 +597,18 @@ export function TrackTable({
       setSortDir("asc");
     }
   };
+
+  // Full-screen artwork viewer — index into `rows` so Left/Right can step
+  // through the whole (sorted/filtered) list, not just the virtualized window.
+  const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
+  // Guards against a single click (open the lightbox) firing on the first
+  // half of a double-click (open Inspect) — see the artwork cell below.
+  const artClickTimer = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (artClickTimer.current) window.clearTimeout(artClickTimer.current);
+    };
+  }, []);
 
   /** The rows between the anchor and `path`, in display order. */
   const rangeTo = (path: string): string[] => {
@@ -1010,6 +1133,7 @@ export function TrackTable({
                         ? undefined
                         : (e) => {
                             e.dataTransfer.effectAllowed = "move";
+                            internalDrag.active = true;
                             setDragCol(c.id);
                           }
                     }
@@ -1031,6 +1155,7 @@ export function TrackTable({
                       c.dynamic
                         ? undefined
                         : () => {
+                            internalDrag.active = false;
                             setDragCol(null);
                             setDragOverCol(null);
                           }
@@ -1163,6 +1288,10 @@ export function TrackTable({
                       onMouseEnter={() => onFetchImageInfo(f.path)}
                       onDoubleClick={(e) => {
                         e.stopPropagation();
+                        if (artClickTimer.current) {
+                          window.clearTimeout(artClickTimer.current);
+                          artClickTimer.current = null;
+                        }
                         onInspect(f);
                       }}
                       title="Double-click for all tag fields"
@@ -1173,7 +1302,22 @@ export function TrackTable({
                             "flex cursor-pointer items-center justify-center overflow-hidden rounded bg-secondary",
                             rh.img,
                           )}
-                          title={cover ? formatImageInfo(imageInfo[f.path]) : "No embedded artwork"}
+                          title={
+                            cover
+                              ? `${formatImageInfo(imageInfo[f.path])} — click for full screen`
+                              : "No embedded artwork"
+                          }
+                          onClick={(e) => {
+                            if (!cover) return;
+                            e.stopPropagation();
+                            // Wait a beat in case this is the first click of a
+                            // double-click (which opens Inspect instead).
+                            artClickTimer.current = window.setTimeout(() => {
+                              artClickTimer.current = null;
+                              const idx = rows.indexOf(f);
+                              setLightboxIdx(idx >= 0 ? idx : null);
+                            }, 220);
+                          }}
                         >
                           {cover ? (
                             <img src={cover} alt="" className="h-full w-full object-cover" />
@@ -1393,6 +1537,19 @@ export function TrackTable({
           </table>
         )}
       </div>
+
+      {lightboxIdx !== null && rows[lightboxIdx] && (
+        <ArtworkLightbox
+          file={rows[lightboxIdx]}
+          info={imageInfo[rows[lightboxIdx].path]}
+          onFetchInfo={onFetchImageInfo}
+          onClose={() => setLightboxIdx(null)}
+          onPrev={() => setLightboxIdx((i) => (i === null ? i : Math.max(0, i - 1)))}
+          onNext={() =>
+            setLightboxIdx((i) => (i === null ? i : Math.min(rows.length - 1, i + 1)))
+          }
+        />
+      )}
     </div>
   );
 }

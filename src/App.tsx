@@ -31,6 +31,7 @@ import {
 } from "./lib/standardize";
 import { activePreset } from "./lib/genres";
 import { matchesShortcut } from "./lib/shortcuts";
+import { internalDrag } from "./lib/internalDrag";
 import {
   basename,
   FIELD_LABELS,
@@ -163,7 +164,7 @@ export default function App() {
       await applyHistoryChanges(entry.changes, false);
       setHistory((h) => h.slice(0, -1));
       setRedoStack((r) => [...r, entry]);
-      setLibraryTags({});
+      dropLibraryTags(entry.changes.map((c) => c.path));
       await filesApi.refreshPaths(entry.changes.map((c) => c.path));
       notify(`Undid: ${entry.label}`, "success");
     } catch (e) {
@@ -181,7 +182,7 @@ export default function App() {
       await applyHistoryChanges(entry.changes, true);
       setRedoStack((r) => r.slice(0, -1));
       setHistory((h) => [...h, entry]);
-      setLibraryTags({});
+      dropLibraryTags(entry.changes.map((c) => c.path));
       await filesApi.refreshPaths(entry.changes.map((c) => c.path));
       notify(`Redid: ${entry.label}`, "success");
     } catch (e) {
@@ -326,6 +327,11 @@ export default function App() {
   importPathsRef.current = filesApi.importPaths;
   useEffect(() => {
     const promise = getCurrentWebview().onDragDropEvent((event) => {
+      // On Windows, this fires for ANY drag over the webview — including an
+      // in-page HTML5 drag like column reordering — not just an external OS
+      // file drag. Ignore it while TrackTable reports one in progress, so
+      // dragging a column header doesn't paint the "drop files" overlay.
+      if (internalDrag.active) return;
       const p = event.payload;
       if (p.type === "over" || p.type === "enter") setDropActive(true);
       else if (p.type === "leave") setDropActive(false);
@@ -360,14 +366,32 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * Drops the cached tags for just `paths`, so the "eagerly read tags" effect
+   * re-parses only those files from disk. Clearing the whole `libraryTags`
+   * map instead — the previous behaviour — made every single-track edit
+   * (write, undo, redo) re-parse the *entire* library, which on a large
+   * collection is slow enough to look like the edit did nothing.
+   */
+  const dropLibraryTags = (paths: string[]) => {
+    setLibraryTags((prev) => {
+      const next = { ...prev };
+      for (const p of paths) delete next[p];
+      return next;
+    });
+  };
+
   const afterWrite = async (affected: string[] = []) => {
     setPending(null);
     setInspected(null);
-    setLibraryTags({});
-    if (affected.length) invalidateCovers(affected);
-    // Refresh only what we touched — each entry costs a tag parse on disk.
-    if (affected.length) await filesApi.refreshPaths(affected);
-    else await filesApi.refresh();
+    if (affected.length) {
+      dropLibraryTags(affected);
+      invalidateCovers(affected);
+      await filesApi.refreshPaths(affected);
+    } else {
+      setLibraryTags({});
+      await filesApi.refresh();
+    }
   };
 
   const runCleanTags = async () => {
@@ -737,7 +761,17 @@ export default function App() {
       if (Object.keys(result.mapping).length) {
         invalidateCovers(Object.keys(result.mapping));
         filesApi.remap(result.mapping);
-        setLibraryTags({});
+        // A rename only changes the path, not the tags — carry the cached
+        // TagData over to the new path instead of clearing everything and
+        // forcing a full-library re-read from disk.
+        setLibraryTags((prev) => {
+          const next: Record<string, TagData> = {};
+          for (const [path, tags] of Object.entries(prev)) {
+            const newPath = result.mapping[path]?.path ?? path;
+            next[newPath] = tags;
+          }
+          return next;
+        });
       }
       if (result.written)
         notify(`Renamed ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
@@ -1096,11 +1130,15 @@ export default function App() {
     });
   };
 
-  /** Renames a genre within the active preset in place. */
-  const renameGenreInPreset = (oldName: string, newName: string) => {
+  /**
+   * Renames a genre within the active preset, then — if any loaded track
+   * still carries the old name — offers to retag the collection to match,
+   * so the preset and the actual files don't drift apart.
+   */
+  const renameGenreInPreset = async (oldName: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed || trimmed === oldName) return;
-    save({
+    await save({
       ...settings,
       genrePresets: settings.genrePresets.map((p) =>
         p.name === settings.activeGenrePreset
@@ -1108,6 +1146,19 @@ export default function App() {
           : p,
       ),
     });
+    const matching = Object.entries(libraryTags)
+      .filter(([, t]) => t.genre === oldName)
+      .map(([path]) => path);
+    if (!matching.length) return;
+    const ok = await confirm(
+      `${matching.length} track${matching.length === 1 ? "" : "s"} in the collection ` +
+        `${matching.length === 1 ? "uses" : "use"} "${oldName}". Rename ${
+          matching.length === 1 ? "it" : "them"
+        } to "${trimmed}"?`,
+      { title: "Rename Genre", kind: "info" },
+    );
+    if (!ok) return;
+    await editField(matching, "genre", trimmed);
   };
 
   const inspect = (file: AudioFile) => {
@@ -1164,7 +1215,6 @@ export default function App() {
           theme={settings.theme}
           onToggleTheme={() => save({ ...settings, theme: settings.theme === "dark" ? "light" : "dark" })}
           fileCount={filesApi.files.length}
-          ollamaRunning={ai.status ? ai.status.running : null}
           errorLogCount={logs.filter((l) => l.kind === "error").length}
         />
         <main className="relative min-w-0 flex-1 overflow-y-auto">
@@ -1240,7 +1290,13 @@ export default function App() {
               onResetActionCounts={analytics.reset}
             />
           ) : (
-            <SettingsPage settings={settings} onSave={save} checkOllama={ai.check} notify={notify} />
+            <SettingsPage
+              settings={settings}
+              onSave={save}
+              onRenameGenre={renameGenreInPreset}
+              checkOllama={ai.check}
+              notify={notify}
+            />
           )}
         </main>
       </div>

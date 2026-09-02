@@ -19,6 +19,8 @@ import { Combobox } from "../components/Combobox";
 interface Props {
   settings: Settings;
   onSave: (settings: Settings) => void;
+  /** Renames a genre in the active preset; may prompt to retag the collection. */
+  onRenameGenre: (oldName: string, newName: string) => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
   notify: (message: string, kind?: "success" | "error" | "info") => void;
 }
@@ -53,7 +55,49 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
   );
 }
 
-export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
+/**
+ * A genre input with its own draft, committed on blur/Enter rather than on
+ * every keystroke. Committing goes through `onCommit(newName)` (a rename,
+ * not a raw array splice) so the caller can offer to retag the collection.
+ */
+function GenreRow({
+  value,
+  onCommit,
+  onRemove,
+}: {
+  value: string;
+  onCommit: (next: string) => void;
+  onRemove: () => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+
+  const commit = () => {
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== value) onCommit(trimmed);
+    else setDraft(value);
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        className={cn(inputClass, "h-8 flex-1")}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+          else if (e.key === "Escape") setDraft(value);
+        }}
+      />
+      <button className="text-muted-foreground hover:text-destructive" title="Remove genre" onClick={onRemove}>
+        <X className="h-4 w-4" />
+      </button>
+    </div>
+  );
+}
+
+export function SettingsPage({ settings, onSave, onRenameGenre, checkOllama, notify }: Props) {
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
@@ -712,22 +756,12 @@ export function SettingsPage({ settings, onSave, checkOllama, notify }: Props) {
             <div className="mb-2 text-sm font-medium">Genres in "{gPreset.name}"</div>
             <div className="space-y-2">
               {gPreset.genres.map((g, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <input
-                    className={cn(inputClass, "h-8 flex-1")}
-                    value={g}
-                    onChange={(e) =>
-                      updateGenres(gPreset.genres.map((x, idx) => (idx === i ? e.target.value : x)))
-                    }
-                  />
-                  <button
-                    className="text-muted-foreground hover:text-destructive"
-                    title="Remove genre"
-                    onClick={() => updateGenres(gPreset.genres.filter((_, idx) => idx !== i))}
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
+                <GenreRow
+                  key={i}
+                  value={g}
+                  onCommit={(next) => onRenameGenre(g, next)}
+                  onRemove={() => updateGenres(gPreset.genres.filter((_, idx) => idx !== i))}
+                />
               ))}
               {gPreset.genres.length === 0 && (
                 <p className="text-xs text-muted-foreground">No genres yet — add one below.</p>

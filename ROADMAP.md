@@ -235,7 +235,419 @@ was doing anything.
 `applyStrip` / `applyUpdates` now take an `onProgress` callback so **Apply**
 shows "Writing N of M" with the bar; `renameSingleFile` sets `busy`.
 
-## Backlog
+### 17. Generate IDs (and the searchable backup, and raw-field edits) wrote nothing — v0.6
+Three separate call sites wrote a private/unmapped tag key through lofty's
+**checked** `Tag::insert`/`insert_text`, which internally calls
+`ItemKey::re_map(tag_type)` with `allow_unknown: false` — so any
+`ItemKey::Unknown` key without an entry in the format's own key map (private
+frames like our `TRACKID`/`TAGBACKUP`, or an arbitrary raw "All Tags" field)
+was **silently dropped before the item was even added to the tag**, with no
+error anywhere. This wasn't a selection or UI problem — the write itself
+never happened.
+
+**Fix** (`src-tauri/src/commands/files.rs`): switched all three sites to
+`insert_unchecked` — lofty's documented way to write `ItemKey::Unknown`
+values; the format-specific writer still validates the key at actual save
+time (confirmed via lofty source: ID3v2 writes it as a `TXXX` frame keyed by
+description, Vorbis passes it through `verify_key`), so this doesn't bypass
+real validation, only a redundant pre-check that has no entry for private
+keys anyway:
+- `set_text()` — fixes **Generate IDs** (Track ID silently never wrote).
+- The backup-blob insert in `write_tags_blocking` and in
+  `backup_file_blocking` — fixes the **searchable-backup JSON snapshot**,
+  meaning **Restore Backup had nothing to restore from** for any ID3v2 file
+  since this shipped. This was a real data-safety bug, not just a display one.
+- `write_raw_field_blocking()` — fixes editing any raw **"All Tags"** field
+  whose key isn't in lofty's built-in map.
+
+Three Rust round-trip tests added (`track_id_round_trips_through_id3v2`,
+`backup_blob_round_trips_through_id3v2`, `raw_field_edit_round_trips_through_id3v2`)
+against a minimal synthesized MP3, each reproduced the bug before the fix and
+passes after.
+
+Separately, `afterWrite()` in `App.tsx` was clearing the **entire**
+`libraryTags` cache on every single-track write (Generate IDs, an inline
+edit, undo/redo), instead of just the touched paths — the "eagerly read
+tags" effect then re-parsed the *whole library* from disk on every edit,
+which on a large collection is slow enough to look like the edit did
+nothing. Now only the affected paths are dropped from the cache
+(`dropLibraryTags()`); `renameToStandard` remaps cached tags to the new
+paths instead of wiping them, since a rename doesn't change the tags.
+
+### 18. Column drag-reorder opened the file-drop overlay — v0.6
+On Windows, Tauri's window-level `onDragDropEvent` ([App.tsx:328](src/App.tsx:328))
+fires for **any** drag over the webview — not just an external OS file
+drag — because it hooks WebView2's drag events at the host level. Dragging a
+`<th>` to reorder a column ([TrackTable.tsx](src/components/TrackTable.tsx))
+therefore also flipped `dropActive`, painting the "Drop audio files or
+folders to add them" overlay mid-drag.
+
+**Fix:** a plain module-level flag, [`src/lib/internalDrag.ts`](src/lib/internalDrag.ts),
+set on the column header's `dragstart` and cleared on `dragend`; App.tsx's
+listener bails out early while it's set. Reordering itself already worked
+and already persisted via `settings.visibleColumns` (order *is* visibility
+order) — the bug was purely the misleading overlay.
+
+### 19. Editing a genre name didn't do what it looked like — v0.6
+Two distinct paths, both fixed:
+- **Settings → Genre Presets:** each genre `<input>` called `onSave` (which
+  persists to the store) on every keystroke — no local draft — so editing
+  felt unresponsive. Now a small `GenreRow` component
+  ([SettingsPage.tsx](src/pages/SettingsPage.tsx)) holds its own draft,
+  committed on blur/Enter (`Esc` reverts).
+- **The inline genre dropdown's pencil-rename** (`Combobox`'s `onEditOption`,
+  wired at [TrackTable.tsx:1308](src/components/TrackTable.tsx:1308)) renamed
+  the *preset option* but never touched the value of the field actually being
+  edited — so renaming "House Tech" to "Tech House" while editing a track's
+  genre left that track showing the old name. **Fix**
+  ([Combobox.tsx](src/components/Combobox.tsx)): renaming the option that
+  matches the field's current value now also commits it as the new value.
+
+### 20. Renaming a genre now offers to retag the collection — v0.6
+Both rename paths above funnel through `renameGenreInPreset()` in
+[App.tsx](src/App.tsx), which now — after updating the preset — counts
+tracks in the loaded collection with the old genre and, if any exist, prompts
+*"N tracks in the collection use 'House Tech'. Rename them to 'Tech
+House'?"* via the native confirm dialog. Accepting runs the retag through the
+existing `editField()` bulk-edit path, so it's a normal undoable history
+entry. Scans only the loaded collection.
+
+### 21. Version string was hardcoded — v0.6
+[Sidebar.tsx](src/components/Sidebar.tsx) printed a literal `v0.1.0` while
+the manifests were at 0.5.2. **Fix:** reads the real version via
+`getVersion()` from `@tauri-apps/api/app` (same API `ComponentsPage.tsx`
+already used for update checks).
+
+### 22. Removed the Ollama attention dot — v0.6
+The amber dot on the Components nav item appeared whenever Ollama wasn't
+running, which is most of the time and isn't an error. Removed; Ollama
+status stays on the Components page itself. (`Sidebar` no longer takes an
+`ollamaRunning` prop.)
+
+### 23. Artwork full screen — v0.6
+Single-clicking the cover thumbnail opens a full-screen lightbox
+(`ArtworkLightbox` in [TrackTable.tsx](src/components/TrackTable.tsx)):
+fetches the true full-resolution embedded picture on demand via the
+(already-existing but unused) `read_cover_art` command rather than the
+table's small re-encoded thumbnails, fits to the window, `Esc`/click-outside
+to close, Left/Right arrows step through the current sorted/filtered list,
+and a caption shows the filename plus dimensions/format/size via the
+existing `useImageInfo` data. A short click/dblclick timer keeps this from
+firing on the first half of a double-click, which still opens the existing
+"all tag fields" Inspect dialog.
+
+## Roadmap — v0.7 → v1.0
+
+Planning only; nothing below is implemented. v0.6 (bug fixes) is complete —
+see items 17–23 above. Ordered by release. Each item notes the suspected
+cause where the code has already been read, so the fix doesn't start from
+zero.
+
+---
+
+# v0.7 — Editing UX
+
+### U1. Fast genre-assignment mode (keyboard-first)
+The core workflow. With the track table focused:
+
+| Key | State | Action |
+|---|---|---|
+| `↑` / `↓` | any | Move the highlight between tracks; playback keeps going |
+| `Enter` | not playing | Play the highlighted track **from its last position** |
+| `Enter` | playing this track | Expand the genre picker inline, focus its filter box |
+| `←` / `→` | playing, picker closed | Seek −10 s / +10 s |
+| `Enter` | picker open | Save genre → advance to the next track → stop the old one, start the new one |
+| `Esc` | picker open | Close without saving |
+| `Space` | any | Play / pause |
+
+Details:
+- Per-track resume position kept for the session, so re-entering a track
+  continues where it left off.
+- Typing in the picker filters the active preset (fuzzy, first match
+  preselected); `↑`/`↓` move within the open list; `Tab` accepts without
+  advancing to the next track.
+- Number keys `1`–`9` assign the Nth preset genre directly, no picker.
+- One save = one undoable history entry, so a whole session can be stepped back.
+- A slim "genre mode" strip at the bottom shows the current track, elapsed time
+  and the key legend, so the shortcuts are discoverable.
+- The seek amount (±10 s default) becomes a setting.
+
+### U2. Auto-detect genres from the collection
+New **Detect genres** action next to the preset editor: tallies every distinct
+`genre` value across the loaded collection, sorted by track count, with
+near-duplicate grouping (case, `&`/`and`, `-`/space, `Hip Hop`/`Hip-Hop`) so
+variants collapse into one suggested canonical spelling. Tick the ones to keep →
+appended to the active preset. Ticking a merged group also offers the B3 retag
+prompt, to normalize those tracks to the canonical name.
+
+### U3. Split Standardize into three tools
+Today one button does everything. Break it into:
+
+1. **Capitalization** — split button with a dropdown (`Aa` Capitalize Each Word,
+   `ALL CAPS`, `lowercase`, `Sentence case`, `Leave as-is`). The choice persists
+   and the left half re-runs the remembered mode — exactly how Clear Fields
+   already works.
+2. **Characters** — the character/separator rules (feat. normalization, bracket
+   style, dash spacing, junk-suffix removal, whitespace collapse), each
+   toggleable, run as its own button.
+3. **Standardize** — kept as "run everything currently enabled", for the old
+   one-click behaviour.
+
+All three still preview through the existing pending-change pipeline.
+
+### U4. Raw field names as the labels
+Setting **Field naming: Friendly / Raw / Both** — `Title` vs `TIT2` vs
+`Title (TIT2)`. Affects table headers, the Clear Fields checklist and the strip
+preview. Raw names are per-container (ID3 `TIT2`, Vorbis `TITLE`, MP4 `©nam`),
+so the label follows the format of the selected file; a mixed selection shows
+the ID3 name with the others in the tooltip.
+
+### U5. Strict filename charset
+Rename-to-standard currently sanitizes loosely. Add a **strict** mode (default
+on): the final stem may contain only `a-z`, `0-9` and `-`.
+
+- lowercase everything
+- transliterate accents to ASCII (`Beyoncé` → `beyonce`), romanize non-Latin
+  scripts where possible
+- every other character → `-`; runs of `-` collapse to one; trimmed at both ends
+- empty result → fall back to the track id, else refuse and report the file
+
+Show before/after in the rename preview, and warn when two files would collapse
+to the same stem **before** writing anything.
+
+### U6. Library browser sidebar
+A second, narrow pane on the left of the Library page (collapsible, resizable,
+width persisted) with a mode switcher:
+
+- **Folders** — the folder tree of the imported roots, with track counts
+- **Genres** — every genre in the collection with counts; click filters the table
+- **Playlists** — imported playlists (Rekordbox XML / m3u8, see F4)
+- **Artists** — grouped by artist, expandable to that artist's tracks
+
+Plus a search box at the top that filters *the tree itself* (find the right
+folder / genre / artist fast), separate from the existing track search.
+Selection is a filter over the loaded collection — no disk rescan. Ctrl-click
+for unions. Follows the Media Fetch sidebar design language.
+
+### U7. Primary / secondary DJ app
+Settings → **DJ software**: a primary and an optional secondary pick from
+Rekordbox, Serato, Traktor, Engine DJ, VirtualDJ, djay, Mixxx, "Other". Stored
+now, used for:
+
+- which field holds the searchable backup — Rekordbox reads Original Artist
+  (`TOPE`), Serato and Traktor don't and need Comment. Today's hardcoded
+  Original Artist behaviour becomes "whatever the primary app reads", with the
+  secondary app's field written too when the two differ.
+- default field visibility and rating scale (Rekordbox/Serato 0–5,
+  Traktor 0–255)
+- the export targets offered in v0.9 (F4/F5)
+
+A one-line explanation under the picker states exactly which fields the choice
+changes — no silent behaviour switches.
+
+---
+
+# v0.8 — Duplicate detection
+
+### F1. Find duplicates by audio, not by name
+Three stages, cheapest first:
+
+1. **Exact** — file hash (blake3) catches literal copies instantly.
+2. **Fingerprint** — decode to mono 11 kHz, compute a Chromaprint-compatible
+   fingerprint (Rust `rusty-chromaprint`, no external binary), cached per file
+   in a local sqlite database keyed by path + mtime + size, so a rescan is
+   near-free.
+3. **Match** — alignment-tolerant comparison, so an MP3 and a FLAC of the same
+   master, or two rips at different bitrates, still match.
+
+**Radio edit vs extended mix — the important part.** A radio edit's fingerprint
+*is* a subsequence of the extended mix, so naive matching flags them as
+duplicates. The comparison therefore reports **similarity** and **coverage**
+separately:
+
+- high similarity **and** durations within ~5 % → *same recording*, a real duplicate
+- high similarity on the overlapping region, but durations differing by more
+  than ~20 s or the aligned section covering only part of the longer file
+  → *different edit*
+
+The second case gets its own category — **"Alternate versions"** — and is never
+proposed for deletion. Title keywords (`Extended`, `Radio Edit`, `Club Mix`)
+only *label* a group; they never decide it.
+
+### F2. Duplicate review — you choose what to keep
+Results as groups, one row per file, with the facts needed to judge: format,
+bitrate / sample rate, duration, file size, has-artwork, tag-completeness score,
+folder, date added. Then:
+
+- an auto-suggested keeper (highest quality → most complete tags → oldest path),
+  pre-selected but **always overridable**
+- a rule bar to apply a keeper rule across every group at once ("prefer FLAC",
+  "prefer highest bitrate", "prefer this folder")
+- per file: **Keep** / **Remove** / **Skip group**
+- nothing is deleted until a final confirmation showing exact count and total
+  size, and **removal means the Recycle Bin or a quarantine folder — never a
+  hard delete** — with an undo manifest written alongside
+- optionally merge the loser's tags/artwork into the keeper before removal
+
+### F3. Waveform preview
+Generate peak/RMS waveforms (decoded once, peaks cached in the same sqlite
+database) shown in the player strip and inside duplicate groups — two candidates
+drawn one above the other makes "same master, different length" obvious at a
+glance. It also exposes song structure (intro / breakdown / drop) well enough to
+be useful during genre passes.
+
+---
+
+# v0.9 — Library features
+
+### F4. YouTube Music playlist → Rekordbox
+Paste a YouTube Music playlist URL. The app:
+
+1. fetches the playlist's entries (title / artist / duration / album)
+2. matches each against the collection — normalized artist+title first, then
+   fuzzy scoring with duration as tiebreaker, then optional fingerprint
+   confirmation for near-misses
+3. returns three lists:
+   - **Matched** → exported as a Rekordbox playlist (`.m3u8` **and** rekordbox
+     XML), in the playlist's original order
+   - **Missing** → the tracks not in the collection, as a copyable list, with a
+     hand-off to Media Fetch for downloading
+   - **The source playlist** itself, with links back to each YouTube Music entry
+4. flags ambiguous matches for manual confirmation rather than guessing — an
+   80 % match asks, it never silently accepts
+
+### F5. Rekordbox cue import
+Read **memory cues, hot cues, beat grid and BPM** from Rekordbox — via
+`rekordbox.xml` (the supported export path) and, where present, the ANLZ
+`.DAT`/`.EXT` analysis files beside the tracks. Drawn over the F3 waveform.
+Stored in the app's own sidecar database keyed by **fingerprint, not path**, so
+cues survive renames and moves.
+
+Longer-term goal: a neutral cue model that can be written back out to Rekordbox
+/ Serato / Traktor so a library survives switching software. **This release only
+reads and preserves — no writing back.**
+
+### F6. Simple backup archive
+Deliberately minimal: pick the selection or the whole collection → produce a
+**store-only ZIP** (compression level 0 — audio doesn't compress, and storing
+keeps it fast and byte-exact) with a generated name:
+
+```
+MusicTagCleaner-backup-2026-09-02-1432-412-tracks.zip
+```
+
+Size estimate before starting, progress bar during, reveal in Explorer when
+done. A small `manifest.json` inside lists paths, sizes and hashes so the
+archive can be verified later. No scheduling, no incremental logic, no cloud —
+the user moves the file somewhere safe themselves.
+
+---
+
+# v1.0 — Accounts, pricing, payments
+
+Built by **Sergio Alexo**, founder of **Forgexus**.
+
+### P1. Forgexus account login
+Sign in with a **Forgexus account** — the unified identity across the Forgexus
+group's technology and manufacturing divisions, so one account covers
+MusicTagCleaner, Media Fetch and everything that follows.
+
+- OAuth 2.0 + PKCE in the system browser, tokens in the OS keychain
+  (Windows Credential Manager / `tauri-plugin-stronghold`), background refresh,
+  never a password typed into the app
+- entitlements (tier, quota, device count) cached locally and signed, so the app
+  works offline for a 7-day grace period before requiring a re-check
+- **the app stays fully usable signed-out for everything local** — sign-in gates
+  cloud AI and quota, not tag editing
+- device management: 3 activations per account, self-service deactivation
+
+### P2. Pricing structure — recommendation
+The natural axis is *who does the thinking*, which is also what actually costs
+money. Three AI modes, cheapest to dearest, exactly as the compute cost runs:
+
+| Mode | What it is | Cost to you | Positioning |
+|---|---|---|---|
+| **Manual** | You edit; the app standardizes and validates | zero | Free |
+| **Local (Ollama)** | The user's own machine runs the model | zero marginal, plus support | Mid |
+| **Cloud (Claude API)** | Best quality, no setup, works anywhere | real per-track cost | Top |
+
+Recommended shape — **subscription for the app, credits for cloud AI**:
+
+- **Free** — full manual editing, standardize, rename, clear fields, backup ZIP,
+  library browser. No time limit. This is the funnel; don't cripple it.
+- **Pro — ~$8/mo or $60/yr** — local Ollama AI, auto genre detection, duplicate
+  detection, playlist matching, waveform + cue import, preset sync across
+  devices.
+- **Studio — ~$18/mo or $150/yr** — everything in Pro plus cloud (Claude) AI
+  with a monthly track allowance, priority processing, batches above 1000.
+- **Cloud credit packs** — for anyone over their allowance, and for Pro users
+  who want an occasional cloud run without upgrading. Price around 3–4× raw API
+  cost to cover payment fees, retries and support.
+- **Lifetime — ~$180, manual + local only, no cloud AI.** Worth offering once,
+  early, as a founder's edition. Never bundle a recurring cost into a one-off
+  price.
+
+Per-feature placement, cheapest to dearest, as asked:
+
+- *free:* manual editing, **auto genre detection** (it's a local tally, not AI),
+  capitalization + character tools, filename rules, backup ZIP
+- *Pro:* duplicate detection + fingerprinting, waveform, cue import, playlist
+  matching, Ollama AI cleanup
+- *Studio / credits:* Claude-powered auto-clean, genre *inference* for tracks
+  with no usable tags, artwork lookup, bulk cross-library unification
+
+**Free AI allowance:** first **3000 tracks free**, then **10 tracks/day free**
+across all AI features. Counted server-side against the Forgexus account (a
+local counter is trivially reset), shown as a remaining-count in the status bar,
+and decremented **only on a successful write** — never charge for a failed or
+rejected suggestion. Local Ollama should *not* consume the allowance: it costs
+nothing to run, and letting it run free is the strongest argument for Pro.
+
+### P3. Payments — recommendation
+**Don't go crypto-only.** Plainly:
+
+- The buyers are DJs, not crypto users. Crypto-only cuts off the large majority
+  at checkout — the most expensive decision on this list.
+- Subscriptions are the whole model, and crypto has no native recurring billing.
+  Every renewal becomes a manual action the user must remember, which wrecks
+  retention.
+- Refunds, chargebacks and EU/UK **VAT on digital goods** are legal obligations
+  a wallet doesn't handle for you.
+
+**Recommended:** cards + PayPal + Apple/Google Pay through a **merchant of
+record** — **Paddle** or **Lemon Squeezy** (Paddle if EU VAT and invoicing
+matter most, which for a one-person company they do). They become the seller of
+record, so global sales tax, invoicing and fraud are their problem, not yours:
+roughly 5 % + fixed fee versus Stripe's ~2.9 % + 30¢ *plus* doing tax compliance
+yourself. For a solo founder that difference is cheap.
+
+**Add crypto as a secondary option**, not the only one: BTC / ETH / USDC via
+Coinbase Commerce or BTCPay Server, offered for **one-time purchases only** —
+lifetime licences and credit top-ups, where there's no recurring-billing problem
+to solve. Cheap to add, appeals to part of the audience, takes nothing from
+anyone else.
+
+Practical notes: price in USD with local display currency; discount annual plans
+~35 % to smooth cash flow; state a 14-day refund policy plainly (cheaper than
+disputes); and make licence checks **fail open** — a payment-provider outage
+must never lock someone out of editing their own files.
+
+---
+
+## Open questions
+
+- Does a local database become the source of truth (sqlite: fingerprints,
+  waveform peaks, cues, playlists), or does the app stay stateless over the
+  files? F1 / F3 / F5 all effectively require it — worth deciding **before**
+  starting v0.8, since it changes the shape of everything after it.
+- YouTube Music has no official third-party playlist API. Confirm which access
+  path is workable and acceptable before committing F4 to a release.
+- Cross-library cue unification (F5's stated goal) is a large project in its own
+  right — probably v1.1+, not a rider on v0.9.
+
+---
+
+## Backlog (unscheduled)
 
 - Optional one-click "move Track Number ids into Track ID" for pre-v4
   libraries (use `isUid()` to pick which Track Number values are app ids).
@@ -244,8 +656,6 @@ shows "Writing N of M" with the bar; `renameSingleFile` sets `busy`.
   decodes. Debounce / hover-dwell, or drop the per-row size tooltip.
 - `file_info` does a full tag parse just for `hasBackup` + `duration`; making
   those lazy would make import near-instant (`fs::metadata` only).
-
-
 - No automated tests for `standardize.ts` or the table selection logic — add
   Vitest and cover the cases above so they don't regress.
 - Capitalization "casing exceptions" — a user-editable list of protected

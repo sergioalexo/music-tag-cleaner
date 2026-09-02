@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { Disc3, Moon, Music, Package, Settings, Sun, Terminal } from "lucide-react";
 import { cn } from "./ui";
 
@@ -16,8 +18,6 @@ interface Props {
   theme: "dark" | "light";
   onToggleTheme: () => void;
   fileCount: number;
-  /** null = unknown; false shows the attention dot on Components. */
-  ollamaRunning: boolean | null;
   errorLogCount: number;
 }
 
@@ -27,9 +27,16 @@ export function Sidebar({
   theme,
   onToggleTheme,
   fileCount,
-  ollamaRunning,
   errorLogCount,
 }: Props) {
+  // getVersion() reads the real app version at runtime (package.json /
+  // tauri.conf.json / Cargo.toml all stay in sync via `npm version`) instead
+  // of a hardcoded string that silently goes stale across releases.
+  const [version, setVersion] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => setVersion(null));
+  }, []);
+
   return (
     <aside className="flex h-full w-56 shrink-0 flex-col border-r bg-card/50">
       <div className="flex items-center gap-2.5 px-5 pb-4 pt-5">
@@ -40,7 +47,9 @@ export function Sidebar({
           <div className="text-sm font-bold leading-tight">
             <span className="text-muted-foreground">/ </span>MusicTagCleaner
           </div>
-          <div className="text-[10px] text-muted-foreground">v0.1.0 · lofty · ollama</div>
+          <div className="text-[10px] text-muted-foreground">
+            {version ? `v${version}` : "v…"} · lofty · ollama
+          </div>
         </div>
       </div>
 
@@ -64,12 +73,6 @@ export function Sidebar({
                 <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground">
                   {fileCount}
                 </span>
-              )}
-              {p === "components" && ollamaRunning === false && (
-                <span
-                  className="h-2 w-2 rounded-full bg-amber-500"
-                  title="Ollama is not running"
-                />
               )}
               {p === "logs" && errorLogCount > 0 && (
                 <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-destructive px-1.5 text-[10px] font-semibold text-destructive-foreground">
