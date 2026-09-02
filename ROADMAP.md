@@ -629,24 +629,61 @@ New [DuplicatesPage.tsx](src/pages/DuplicatesPage.tsx), reachable from a new
   weren't built.
 - **No quarantine-folder option**, only the Recycle Bin.
 
-## Roadmap — v0.8 (F3 remaining) → v1.0
+### 33. Waveform preview — v0.8 F3 (completes v0.8)
+`decode_to_pcm_capped()` in [duplicates.rs](src-tauri/src/commands/duplicates.rs)
+was generalized to take an optional sample cap: fingerprinting still decodes
+only the first ~2 minutes (`decode_to_pcm`), while a new `decode_full()`
+decodes the whole file for a waveform's true shape — needed because a
+fingerprint-only decode would truncate any track over 2 minutes to a
+misleadingly short waveform. `compute_waveform_peaks()` downsamples the
+decoded PCM (channels averaged to mono first) to 400 peak buckets; a new
+`get_waveform` command caches them in the *same* `file_cache` sqlite table
+the fingerprint cache uses, in a `waveform_peaks` column, keyed the same
+way (path + mtime + size).
 
-Planning only from here on. v0.6 and v0.7 are complete (items 1–30); v0.8
-F1/F2 (duplicate detection + review, items 31–32) are complete — only F3
-(waveform preview) is still unimplemented. Ordered by release. Each item
-notes the suspected cause where the code has already been read, so the fix
-doesn't start from zero.
+**A real bug found and fixed while building this:** the fingerprint cache
+and the waveform cache are populated independently (whichever is requested
+first), so the table's schema had to become "every non-identity column is
+nullable, both sides upsert by path." A naive upsert — write your own
+columns, leave the other side's alone — turns out to be unsafe: if a file
+changes between the two writes, whichever write happens *after* the change
+stamps the row with the new mtime/size while the *other* side's still-old
+cached value is left in place, silently marking stale data (fingerprint or
+waveform, whichever wasn't just recomputed) as valid for the new file
+content. Fixed with a `CASE WHEN file_cache.mtime = excluded.mtime AND
+file_cache.size = excluded.size THEN <old value> ELSE NULL END` guard in
+both upserts, so the other side's cached value survives only when the file
+genuinely hasn't changed. Caught by a dedicated test
+(`waveform_and_fingerprint_caches_survive_each_other`) that writes a
+fingerprint, then a waveform, and checks the fingerprint is still intact —
+this would have been a real, silent duplicate-detection correctness bug
+against a real library where files get edited between scans.
 
----
+New [Waveform.tsx](src/components/Waveform.tsx): fetches and in-memory
+caches peaks per path, renders as an SVG bar chart, with an optional
+`progress` prop that draws a playhead line. Wired into:
+- **Genre Mode's bottom strip** ([TrackTable.tsx](src/components/TrackTable.tsx)) —
+  the current track's waveform with a live playhead synced to `gmTime`/`gmDuration`.
+- **Duplicate review** ([DuplicatesPage.tsx](src/pages/DuplicatesPage.tsx)) —
+  every file in a group shows its own waveform stacked under the next,
+  making "same master, different length" (or a genuinely different
+  recording) visible at a glance, exactly as planned.
 
-# v0.8 — Duplicate detection
+**Not built:** using the waveform to expose song structure (intro/
+breakdown/drop) for genre passes — the peaks are shown, but no structural
+analysis (energy-based section detection) was added on top of them; and the
+per-row `AudioPreview` prelisten scrub bar (used throughout the main track
+table, outside Genre Mode) still uses a plain range input rather than this
+waveform, to avoid restructuring an already-stable, widely-used component
+in this pass.
 
-### F3. Waveform preview
-Generate peak/RMS waveforms (decoded once, peaks cached in the same sqlite
-database) shown in the player strip and inside duplicate groups — two candidates
-drawn one above the other makes "same master, different length" obvious at a
-glance. It also exposes song structure (intro / breakdown / drop) well enough to
-be useful during genre passes.
+This completes v0.8 (items 31–33: duplicate detection, review, waveform).
+
+## Roadmap — v0.9 → v1.0
+
+Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–33).
+Ordered by release. Each item notes the suspected cause where the code has
+already been read, so the fix doesn't start from zero.
 
 ---
 

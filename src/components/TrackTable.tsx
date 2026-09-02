@@ -30,6 +30,7 @@ import { internalDrag } from "../lib/internalDrag";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
 import { AudioPreview, formatDuration, releasePlayback, takeOverPlayback } from "./AudioPreview";
+import { Waveform } from "./Waveform";
 import { dominantFamily, fieldHeaderLabel, rawNameTooltip } from "../lib/rawFieldNames";
 import { Combobox } from "./Combobox";
 import { Stars } from "./Stars";
@@ -1774,41 +1775,53 @@ export function TrackTable({
       </div>
 
       {genreMode && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t bg-secondary/40 px-3 py-2 text-xs">
-          <Headphones className="h-3.5 w-3.5 shrink-0 text-primary" />
+        <div className="border-t bg-secondary/40 px-3 py-2 text-xs">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Headphones className="h-3.5 w-3.5 shrink-0 text-primary" />
+            {(() => {
+              const currentPath = anchorPath ?? rows[0]?.path ?? null;
+              const currentFile = currentPath ? rows.find((f) => f.path === currentPath) : undefined;
+              if (!currentFile) return <span className="text-muted-foreground">No track selected.</span>;
+              const playingHere = gmPlayingPath === currentFile.path;
+              return (
+                <>
+                  <button
+                    onClick={() => (playingHere ? gmPauseKeepPosition() : gmPlay(currentFile.path))}
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground"
+                    title={playingHere ? "Pause (Space)" : "Play (Enter / Space)"}
+                  >
+                    {playingHere ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                  </button>
+                  <span className="min-w-0 max-w-[28ch] truncate font-medium" title={currentFile.filename}>
+                    {currentFile.filename}
+                  </span>
+                  <span className="shrink-0 font-mono text-muted-foreground">
+                    {formatDuration(playingHere ? gmTime : gmPositions.current[currentFile.path] ?? 0)} /{" "}
+                    {formatDuration(playingHere ? gmDuration : 0)}
+                  </span>
+                  <span className="shrink-0 text-muted-foreground">
+                    Genre: <span className="font-medium text-foreground">{tags[currentFile.path]?.genre || "—"}</span>
+                  </span>
+                </>
+              );
+            })()}
+            <span className="ml-auto shrink-0 text-muted-foreground">
+              ↑↓ move · Enter play / tag · ←→ seek {GM_SEEK_SECONDS}s · 1–9 quick-tag · Space play/pause · Esc exit
+            </span>
+            <Button variant="ghost" size="sm" onClick={toggleGenreMode}>
+              Exit
+            </Button>
+          </div>
           {(() => {
             const currentPath = anchorPath ?? rows[0]?.path ?? null;
-            const currentFile = currentPath ? rows.find((f) => f.path === currentPath) : undefined;
-            if (!currentFile) return <span className="text-muted-foreground">No track selected.</span>;
-            const playingHere = gmPlayingPath === currentFile.path;
-            return (
-              <>
-                <button
-                  onClick={() => (playingHere ? gmPauseKeepPosition() : gmPlay(currentFile.path))}
-                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground"
-                  title={playingHere ? "Pause (Space)" : "Play (Enter / Space)"}
-                >
-                  {playingHere ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
-                </button>
-                <span className="min-w-0 max-w-[28ch] truncate font-medium" title={currentFile.filename}>
-                  {currentFile.filename}
-                </span>
-                <span className="shrink-0 font-mono text-muted-foreground">
-                  {formatDuration(playingHere ? gmTime : gmPositions.current[currentFile.path] ?? 0)} /{" "}
-                  {formatDuration(playingHere ? gmDuration : 0)}
-                </span>
-                <span className="shrink-0 text-muted-foreground">
-                  Genre: <span className="font-medium text-foreground">{tags[currentFile.path]?.genre || "—"}</span>
-                </span>
-              </>
-            );
+            if (!currentPath) return null;
+            const playingHere = gmPlayingPath === currentPath;
+            const progress =
+              playingHere && gmDuration > 0
+                ? gmTime / gmDuration
+                : undefined;
+            return <Waveform path={currentPath} height={28} progress={progress} className="mt-1.5" />;
           })()}
-          <span className="ml-auto shrink-0 text-muted-foreground">
-            ↑↓ move · Enter play / tag · ←→ seek {GM_SEEK_SECONDS}s · 1–9 quick-tag · Space play/pause · Esc exit
-          </span>
-          <Button variant="ghost" size="sm" onClick={toggleGenreMode}>
-            Exit
-          </Button>
         </div>
       )}
 

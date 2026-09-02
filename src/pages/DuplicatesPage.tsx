@@ -5,6 +5,7 @@ import { AlertTriangle, Copy, Loader2, Trash2 } from "lucide-react";
 import type { AudioFile, TagData } from "../types";
 import { formatBytes } from "../types";
 import { Button, Card, cn } from "../components/ui";
+import { Waveform } from "../components/Waveform";
 
 interface DuplicateGroup {
   id: string;
@@ -208,33 +209,36 @@ export function DuplicatesPage({
                     const f = fileByPath[p];
                     const state = rowStates[p] ?? "skip";
                     return (
-                      <div key={p} className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-accent/40">
-                        <button
-                          className="min-w-0 flex-1 truncate text-left text-sm"
-                          onClick={() => onInspect(p)}
-                          title={p}
-                        >
-                          {f?.filename ?? p}
-                          <span className="ml-2 text-xs text-muted-foreground">{fileFacts(f, tags[p])}</span>
-                        </button>
-                        <div className="flex shrink-0 gap-1">
-                          {(["keep", "remove", "skip"] as const).map((s) => (
-                            <button
-                              key={s}
-                              onClick={() => setRowStates((prev) => ({ ...prev, [p]: s }))}
-                              className={cn(
-                                "rounded-md border px-2 py-1 text-xs font-medium capitalize",
-                                state === s
-                                  ? s === "remove"
-                                    ? "border-destructive bg-destructive text-destructive-foreground"
-                                    : "border-primary bg-primary text-primary-foreground"
-                                  : "border-input bg-background text-muted-foreground hover:bg-accent",
-                              )}
-                            >
-                              {s}
-                            </button>
-                          ))}
+                      <div key={p} className="rounded-md px-2 py-1.5 hover:bg-accent/40">
+                        <div className="flex items-center gap-2">
+                          <button
+                            className="min-w-0 flex-1 truncate text-left text-sm"
+                            onClick={() => onInspect(p)}
+                            title={p}
+                          >
+                            {f?.filename ?? p}
+                            <span className="ml-2 text-xs text-muted-foreground">{fileFacts(f, tags[p])}</span>
+                          </button>
+                          <div className="flex shrink-0 gap-1">
+                            {(["keep", "remove", "skip"] as const).map((s) => (
+                              <button
+                                key={s}
+                                onClick={() => setRowStates((prev) => ({ ...prev, [p]: s }))}
+                                className={cn(
+                                  "rounded-md border px-2 py-1 text-xs font-medium capitalize",
+                                  state === s
+                                    ? s === "remove"
+                                      ? "border-destructive bg-destructive text-destructive-foreground"
+                                      : "border-primary bg-primary text-primary-foreground"
+                                    : "border-input bg-background text-muted-foreground hover:bg-accent",
+                                )}
+                              >
+                                {s}
+                              </button>
+                            ))}
+                          </div>
                         </div>
+                        <Waveform path={p} height={22} className="mt-1" />
                       </div>
                     );
                   })}

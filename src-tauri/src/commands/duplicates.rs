@@ -64,20 +64,29 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("fingerprint-cache.sqlite"))
 }
 
+/// Every cache column besides the path+mtime+size identity is nullable —
+/// fingerprinting (F1) and waveform generation (F3) populate this table
+/// independently (a file can have one without the other yet), and both
+/// upsert by path rather than requiring a row to already exist. Reads
+/// always re-check mtime/size, so a stale value left in an unrelated column
+/// by a since-changed file is simply never returned, not a correctness risk.
+/// Shared as a constant (rather than duplicated in tests) so the schema
+/// used by `open_db` and by tests constructing their own connection can
+/// never drift apart.
+const FILE_CACHE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS file_cache (
+    path TEXT PRIMARY KEY,
+    mtime INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    blake3_hash TEXT,
+    fingerprint TEXT,
+    duration_secs REAL,
+    sample_rate INTEGER,
+    waveform_peaks TEXT
+);";
+
 fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS file_cache (
-            path TEXT PRIMARY KEY,
-            mtime INTEGER NOT NULL,
-            size INTEGER NOT NULL,
-            blake3_hash TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
-            duration_secs REAL NOT NULL,
-            sample_rate INTEGER NOT NULL
-        );",
-    )
-    .map_err(|e| e.to_string())?;
+    conn.execute_batch(FILE_CACHE_SCHEMA_SQL).map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -97,11 +106,15 @@ fn compute_blake3(path: &Path) -> Result<String, String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-/// Decodes up to ~2 minutes of audio (plenty for a fingerprint match, and
-/// far cheaper than decoding a whole DJ mix) to interleaved i16 PCM.
-fn decode_to_pcm(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
-    const MAX_SAMPLES: usize = 44_100 * 2 * 120; // ~120s stereo @44.1kHz worst case
+/// Fingerprint matching only needs the first couple of minutes of a track —
+/// far cheaper than decoding a whole DJ mix start to end.
+const FINGERPRINT_MAX_SAMPLES: usize = 44_100 * 2 * 120; // ~120s stereo @44.1kHz worst case
 
+/// Decodes audio to interleaved i16 PCM, stopping early once `max_samples`
+/// interleaved samples have been decoded (`None` decodes the whole file —
+/// used for waveform generation, where the true shape of the whole track
+/// matters, unlike fingerprint matching).
+fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i16>, u32, u32, f64), String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -151,8 +164,10 @@ fn decode_to_pcm(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
                 let mut chunk: Vec<i16> = vec![0i16; audio_buf.samples_interleaved()];
                 audio_buf.copy_to_slice_interleaved(&mut chunk);
                 pcm.extend_from_slice(&chunk);
-                if pcm.len() >= MAX_SAMPLES {
-                    break;
+                if let Some(max) = max_samples {
+                    if pcm.len() >= max {
+                        break;
+                    }
                 }
             }
             Err(SymError::DecodeError(_)) => continue,
@@ -163,12 +178,20 @@ fn decode_to_pcm(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
     if sample_rate == 0 {
         return Err("could not decode any audio frames".to_string());
     }
-    // Duration is measured from the actual audio decoded here (capped at
-    // ~2 minutes), not the file's real length — fine for fingerprint
-    // matching, but callers needing the true track length should use the
-    // existing `file_info`/`list_files` duration instead.
+    // Duration is measured from the actual audio decoded here, so it's only
+    // the true track length when `max_samples` is None — a capped decode's
+    // caller should use the existing `file_info`/`list_files` duration
+    // instead if it needs the real length.
     let duration_secs = total_frames as f64 / sample_rate as f64;
     Ok((pcm, sample_rate, channels.max(1), duration_secs))
+}
+
+fn decode_to_pcm(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
+    decode_to_pcm_capped(path, Some(FINGERPRINT_MAX_SAMPLES))
+}
+
+fn decode_full(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
+    decode_to_pcm_capped(path, None)
 }
 
 fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<Vec<u32>, String> {
@@ -185,25 +208,24 @@ fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<V
 fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
     let (mtime, size) = file_stat(Path::new(path))?;
 
-    let cached: Option<CachedFingerprint> = conn
+    let cached: Option<(Option<String>, Option<String>, Option<f64>, Option<u32>)> = conn
         .query_row(
             "SELECT blake3_hash, fingerprint, duration_secs, sample_rate FROM file_cache
              WHERE path = ?1 AND mtime = ?2 AND size = ?3",
             params![path, mtime, size],
-            |row| {
-                let fp_str: String = row.get(1)?;
-                Ok(CachedFingerprint {
-                    blake3: row.get(0)?,
-                    fingerprint: fp_str.split(',').filter_map(|s| s.parse().ok()).collect(),
-                    duration_secs: row.get(2)?,
-                    sample_rate: row.get(3)?,
-                })
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some(hit) = cached {
-        return Ok(hit);
+    // All four columns must be present — a row that only has a cached
+    // waveform (F3, computed independently) doesn't count as a fingerprint hit.
+    if let Some((Some(blake3), Some(fp_str), Some(duration_secs), Some(sample_rate))) = cached {
+        return Ok(CachedFingerprint {
+            blake3,
+            fingerprint: fp_str.split(',').filter_map(|s| s.parse().ok()).collect(),
+            duration_secs,
+            sample_rate,
+        });
     }
 
     let blake3 = compute_blake3(Path::new(path))?;
@@ -211,15 +233,123 @@ fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, St
     let fingerprint = compute_fingerprint(&pcm, sample_rate, channels)?;
     let fp_str = fingerprint.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
 
+    // The waveform cache (F3) is written by a separate upsert keyed on the
+    // same path — preserve it only if mtime/size (the file's content) are
+    // unchanged from what's already stored; if they differ, the existing
+    // waveform_peaks belongs to an old version of this file and must not be
+    // carried forward under the new mtime/size stamp, or a future waveform
+    // read would silently return stale data for the changed file.
     conn.execute(
-        "INSERT OR REPLACE INTO file_cache
-            (path, mtime, size, blake3_hash, fingerprint, duration_secs, sample_rate)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO file_cache (path, mtime, size, blake3_hash, fingerprint, duration_secs, sample_rate)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(path) DO UPDATE SET
+            mtime = excluded.mtime, size = excluded.size,
+            blake3_hash = excluded.blake3_hash, fingerprint = excluded.fingerprint,
+            duration_secs = excluded.duration_secs, sample_rate = excluded.sample_rate,
+            waveform_peaks = CASE
+                WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                THEN file_cache.waveform_peaks ELSE NULL
+            END",
         params![path, mtime, size, blake3, fp_str, duration_secs, sample_rate],
     )
     .map_err(|e| e.to_string())?;
 
     Ok(CachedFingerprint { blake3, fingerprint, duration_secs, sample_rate })
+}
+
+/// Waveform peaks are downsampled to this many buckets — enough visual
+/// resolution for spotting a duplicate/alternate-version's shape or a
+/// track's structure, small enough to be a trivially cheap payload.
+const WAVEFORM_BUCKETS: usize = 400;
+
+/// Peak (max absolute amplitude, 0.0-1.0) per bucket, channels averaged
+/// down to mono first.
+fn compute_waveform_peaks(pcm: &[i16], channels: u32) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    let frames = pcm.len() / channels;
+    if frames == 0 {
+        return Vec::new();
+    }
+    let bucket_size = (frames / WAVEFORM_BUCKETS).max(1);
+    let mut peaks = Vec::with_capacity(WAVEFORM_BUCKETS);
+    let mut frame_idx = 0;
+    while frame_idx < frames && peaks.len() < WAVEFORM_BUCKETS {
+        let end = (frame_idx + bucket_size).min(frames);
+        let mut max_abs = 0i32;
+        for f in frame_idx..end {
+            let mut sum = 0i32;
+            for c in 0..channels {
+                sum += pcm[f * channels + c] as i32;
+            }
+            max_abs = max_abs.max((sum / channels as i32).abs());
+        }
+        peaks.push(max_abs as f32 / i16::MAX as f32);
+        frame_idx = end;
+    }
+    peaks
+}
+
+fn get_or_compute_waveform(conn: &Connection, path: &str) -> Result<Vec<f32>, String> {
+    let (mtime, size) = file_stat(Path::new(path))?;
+
+    let cached: Option<Option<String>> = conn
+        .query_row(
+            "SELECT waveform_peaks FROM file_cache WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+            params![path, mtime, size],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(Some(peaks_str)) = cached {
+        let peaks: Vec<f32> = peaks_str.split(',').filter_map(|s| s.parse().ok()).collect();
+        if !peaks.is_empty() {
+            return Ok(peaks);
+        }
+    }
+
+    let (pcm, _sample_rate, channels, _duration_secs) = decode_full(path)?;
+    let peaks = compute_waveform_peaks(&pcm, channels);
+    let peaks_str = peaks.iter().map(|p| format!("{p:.4}")).collect::<Vec<_>>().join(",");
+
+    // Same staleness guard as the fingerprint upsert above, mirrored: only
+    // carry the existing fingerprint columns forward if mtime/size (the
+    // file's content) haven't changed since they were cached.
+    conn.execute(
+        "INSERT INTO file_cache (path, mtime, size, waveform_peaks)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO UPDATE SET
+            mtime = excluded.mtime, size = excluded.size, waveform_peaks = excluded.waveform_peaks,
+            blake3_hash = CASE
+                WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                THEN file_cache.blake3_hash ELSE NULL
+            END,
+            fingerprint = CASE
+                WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                THEN file_cache.fingerprint ELSE NULL
+            END,
+            duration_secs = CASE
+                WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                THEN file_cache.duration_secs ELSE NULL
+            END,
+            sample_rate = CASE
+                WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                THEN file_cache.sample_rate ELSE NULL
+            END",
+        params![path, mtime, size, peaks_str],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(peaks)
+}
+
+#[tauri::command]
+pub async fn get_waveform(app: AppHandle, path: String) -> Result<Vec<f32>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&app)?;
+        get_or_compute_waveform(&conn, &path)
+    })
+    .await
+    .map_err(|_| "waveform generation task panicked".to_string())?
 }
 
 /// A same-recording duplicate needs high similarity *and* matching duration.
@@ -490,14 +620,7 @@ mod tests {
 
         let db_path = dir.join("cache.sqlite");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS file_cache (
-                path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, size INTEGER NOT NULL,
-                blake3_hash TEXT NOT NULL, fingerprint TEXT NOT NULL,
-                duration_secs REAL NOT NULL, sample_rate INTEGER NOT NULL
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
 
         let first = get_or_compute(&conn, path_str).unwrap();
         assert!(!first.fingerprint.is_empty());
@@ -507,6 +630,42 @@ mod tests {
         let second = get_or_compute(&conn, path_str).unwrap();
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_eq!(first.blake3, second.blake3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waveform_and_fingerprint_caches_survive_each_other() {
+        let dir = scratch_dir("waveform");
+        let path = dir.join("tone.wav");
+        let sr = 44_100;
+        write_wav(&path, &sine_pcm(440.0, sr, 3.0), sr);
+        let path_str = path.to_str().unwrap();
+
+        let conn = Connection::open(dir.join("cache.sqlite")).unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
+
+        // Fingerprint first, then waveform — writing the waveform must not
+        // wipe out the fingerprint that was just cached for the same
+        // unchanged file (the CASE-guarded upsert this test exists to check).
+        let fp = get_or_compute(&conn, path_str).unwrap();
+        let peaks = get_or_compute_waveform(&conn, path_str).unwrap();
+        assert!(!peaks.is_empty());
+        assert!(peaks.iter().all(|p| (0.0..=1.0).contains(p)), "peaks should be normalized 0-1");
+
+        let fp_again = get_or_compute(&conn, path_str).unwrap();
+        assert_eq!(fp.fingerprint, fp_again.fingerprint, "fingerprint should survive a waveform write");
+
+        // And the reverse: waveform must be cached and reused, not just the
+        // fingerprint.
+        let peaks_again = get_or_compute_waveform(&conn, path_str).unwrap();
+        // Not exact equality: peaks are stored as text rounded to 4 decimal
+        // places, so a round trip through the cache loses a little precision
+        // by design (keeps the cached payload small).
+        assert_eq!(peaks.len(), peaks_again.len());
+        for (a, b) in peaks.iter().zip(peaks_again.iter()) {
+            assert!((a - b).abs() < 0.001, "peak drifted too far after a cache round-trip: {a} vs {b}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
