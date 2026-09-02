@@ -542,55 +542,104 @@ search box that filters the tree/list itself.
   clear. Left as a follow-up if single-selection turns out to be limiting
   in practice.
 
-## Roadmap — v0.8 → v1.0
+### 31. Find duplicates by audio content — v0.8 F1
+New Rust module [duplicates.rs](src-tauri/src/commands/duplicates.rs), three
+stages as planned:
 
-Planning only from here on; v0.7 (items 24–30 above) is complete. Ordered
-by release. Each item notes the suspected cause where the code has already
-been read, so the fix doesn't start from zero.
+1. **Exact** — a blake3 hash of the file bytes.
+2. **Fingerprint** — `rusty-chromaprint` (confirmed pure Rust: pulls in only
+   `rustfft`/`realfft`/`rubato`, no C library or external binary) computes
+   the fingerprint from PCM decoded by `symphonia` (also pure Rust). Both are
+   cached in a local sqlite database (`rusqlite`, `bundled` feature — SQLite
+   compiles from source, no external DLL needed) at
+   `app_data_dir()/fingerprint-cache.sqlite`, keyed by path + mtime + size,
+   so re-scanning an unchanged library only touches the exact-hash step.
+   Only the first ~2 minutes of audio is decoded per file — plenty for a
+   fingerprint match, far cheaper than decoding a whole DJ mix start to end.
+3. **Match** — `rusty_chromaprint::match_fingerprints` returns alignment-
+   tolerant segments; the *largest* segment's `.score` (chromaprint's own
+   0–32 similarity measure, lower = more similar) and **coverage** (that
+   segment's duration versus each file's own duration) drive classification.
+
+**Radio edit vs. extended mix**, built exactly as planned: high similarity
+**and** high coverage on **both** sides → `"duplicate"`; high similarity but
+coverage only high on the *shorter* file → `"alternate"` (never suggested
+for deletion). Verified with a dedicated test
+(`radio_edit_inside_extended_mix_classifies_as_alternate_not_duplicate`)
+using a synthetic melody embedded inside a longer one with a different
+intro/outro — confirmed it classifies as Alternate, not Duplicate. Two more
+tests confirm identical audio scores as a strong match and two different
+melodies don't; a further two exercise the real file-decode path (a
+synthesized WAV written to disk) and the sqlite cache actually being reused
+on a second call. All 5 pass.
+
+Transitively-related files (A matches B, B matches C) are merged into one
+group via union-find rather than emitting overlapping pairs; a cluster is
+only labeled `"duplicate"` if *every* compared pair inside it was a
+duplicate match — one alternate-version pair downgrades the whole cluster,
+so a radio edit + its extended mix + a byte-identical copy of the radio
+edit doesn't get mislabeled as all being the same file. Progress is reported
+via a `duplicate-scan-progress` event (the same `AppHandle::emit` pattern
+`components.rs` already uses for download progress).
+
+**Caveat, stated plainly:** the similarity/coverage thresholds
+(`DUPLICATE_SCORE_MAX`, `DUPLICATE_MIN_COVERAGE`, etc.) are a reasoned
+starting point, not a scientifically calibrated cutoff — they were validated
+against synthetic sine-wave/melody fixtures (the only audio available in
+this environment), not real music. They may need tuning against an actual
+library; the constants are isolated at the top of the file specifically so
+that's easy to do without touching the algorithm itself.
+
+### 32. Duplicate review UI — v0.8 F2
+New [DuplicatesPage.tsx](src/pages/DuplicatesPage.tsx), reachable from a new
+**Duplicates** sidebar nav item:
+
+- **Scan for Duplicates** runs the v0.8 F1 engine over every loaded file,
+  with a live progress bar driven by the `duplicate-scan-progress` event.
+- Results as groups, each row showing format, bitrate, sample rate,
+  duration, file size, artwork presence and a tag-completeness count — the
+  facts item 32 asked for, computed from the existing `AudioFile`/`TagData`
+  the app already loads (extended `AudioFile` with `bitrateKbps`/
+  `sampleRateHz` from lofty's `FileProperties`, which weren't surfaced to
+  the frontend before this).
+- An auto-suggested keeper (lossless format → highest bitrate → most
+  complete tags → path as a deterministic last resort) is pre-selected as
+  **Keep**, every other file in a `"duplicate"` group defaults to
+  **Remove**; every file in an `"alternate"` group defaults to **Skip**
+  (never auto-suggested for removal). Every row is a three-way
+  Keep/Remove/Skip toggle, always overridable.
+- Nothing is deleted until **Remove N to Recycle Bin**, which shows the
+  exact count and total size and reuses the existing `delete_file` command
+  — already Recycle-Bin-based, not a hard delete, so no new Rust command was
+  needed for removal itself.
+
+**Simplified vs. the original plan:**
+- No **keeper rule bar** ("prefer FLAC", "prefer highest bitrate" applied
+  across every group at once) — each group is reviewed individually. The
+  per-group auto-suggestion already applies a sensible default rule; a bulk
+  override bar is a reasonable follow-up if reviewing many groups by hand
+  turns out to be tedious.
+- **"Oldest path" tie-break** isn't really oldest-by-date — `AudioFile`
+  doesn't carry file mtime to the frontend, so the tie-break after
+  format/bitrate/tags is alphabetical path order instead. Surfacing mtime
+  would be a small, isolated follow-up.
+- **No undo manifest** and **no tag/artwork merge into the keeper** before
+  removal — deletion goes to the Recycle Bin (itself a form of undo via the
+  OS), but the specific "written alongside" manifest and the merge step
+  weren't built.
+- **No quarantine-folder option**, only the Recycle Bin.
+
+## Roadmap — v0.8 (F3 remaining) → v1.0
+
+Planning only from here on. v0.6 and v0.7 are complete (items 1–30); v0.8
+F1/F2 (duplicate detection + review, items 31–32) are complete — only F3
+(waveform preview) is still unimplemented. Ordered by release. Each item
+notes the suspected cause where the code has already been read, so the fix
+doesn't start from zero.
 
 ---
 
 # v0.8 — Duplicate detection
-
-### F1. Find duplicates by audio, not by name
-Three stages, cheapest first:
-
-1. **Exact** — file hash (blake3) catches literal copies instantly.
-2. **Fingerprint** — decode to mono 11 kHz, compute a Chromaprint-compatible
-   fingerprint (Rust `rusty-chromaprint`, no external binary), cached per file
-   in a local sqlite database keyed by path + mtime + size, so a rescan is
-   near-free.
-3. **Match** — alignment-tolerant comparison, so an MP3 and a FLAC of the same
-   master, or two rips at different bitrates, still match.
-
-**Radio edit vs extended mix — the important part.** A radio edit's fingerprint
-*is* a subsequence of the extended mix, so naive matching flags them as
-duplicates. The comparison therefore reports **similarity** and **coverage**
-separately:
-
-- high similarity **and** durations within ~5 % → *same recording*, a real duplicate
-- high similarity on the overlapping region, but durations differing by more
-  than ~20 s or the aligned section covering only part of the longer file
-  → *different edit*
-
-The second case gets its own category — **"Alternate versions"** — and is never
-proposed for deletion. Title keywords (`Extended`, `Radio Edit`, `Club Mix`)
-only *label* a group; they never decide it.
-
-### F2. Duplicate review — you choose what to keep
-Results as groups, one row per file, with the facts needed to judge: format,
-bitrate / sample rate, duration, file size, has-artwork, tag-completeness score,
-folder, date added. Then:
-
-- an auto-suggested keeper (highest quality → most complete tags → oldest path),
-  pre-selected but **always overridable**
-- a rule bar to apply a keeper rule across every group at once ("prefer FLAC",
-  "prefer highest bitrate", "prefer this folder")
-- per file: **Keep** / **Remove** / **Skip group**
-- nothing is deleted until a final confirmation showing exact count and total
-  size, and **removal means the Recycle Bin or a quarantine folder — never a
-  hard delete** — with an undo manifest written alongside
-- optionally merge the loser's tags/artwork into the keeper before removal
 
 ### F3. Waveform preview
 Generate peak/RMS waveforms (decoded once, peaks cached in the same sqlite
@@ -739,10 +788,13 @@ must never lock someone out of editing their own files.
 
 ## Open questions
 
-- Does a local database become the source of truth (sqlite: fingerprints,
-  waveform peaks, cues, playlists), or does the app stay stateless over the
-  files? F1 / F3 / F5 all effectively require it — worth deciding **before**
-  starting v0.8, since it changes the shape of everything after it.
+- ~~Does a local database become the source of truth~~ — **decided**: yes.
+  F1 (item 31) added a local sqlite database at
+  `app_data_dir()/fingerprint-cache.sqlite`, keyed by path + mtime + size.
+  F3's waveform peaks are a natural fit for the same database/cache
+  (same cache-invalidation story); F5's cues should use it too, keyed by
+  fingerprint rather than path per the original plan, so cues survive a
+  rename or move.
 - YouTube Music has no official third-party playlist API. Confirm which access
   path is workable and acceptable before committing F4 to a release.
 - Cross-library cue unification (F5's stated goal) is a large project in its own

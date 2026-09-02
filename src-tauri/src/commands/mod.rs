@@ -3,4 +3,5 @@ pub mod ai;
 mod ai_tests;
 pub mod backup;
 pub mod components;
+pub mod duplicates;
 pub mod files;

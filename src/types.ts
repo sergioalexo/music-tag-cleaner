@@ -5,6 +5,8 @@ export interface AudioFile {
   size: number;
   hasBackup: boolean;
   durationSecs?: number;
+  bitrateKbps?: number;
+  sampleRateHz?: number;
 }
 
 export interface TagData {

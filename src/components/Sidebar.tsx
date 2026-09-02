@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { Disc3, Moon, Music, Package, Settings, Sun, Terminal } from "lucide-react";
+import { Copy, Disc3, Moon, Music, Package, Settings, Sun, Terminal } from "lucide-react";
 import { cn } from "./ui";
 
-export type Page = "library" | "components" | "settings" | "logs";
+export type Page = "library" | "duplicates" | "components" | "settings" | "logs";
 
 const NAV: { page: Page; label: string; icon: typeof Music }[] = [
   { page: "library", label: "Library", icon: Disc3 },
+  { page: "duplicates", label: "Duplicates", icon: Copy },
   { page: "components", label: "Components", icon: Package },
   { page: "logs", label: "Logs", icon: Terminal },
   { page: "settings", label: "Settings", icon: Settings },

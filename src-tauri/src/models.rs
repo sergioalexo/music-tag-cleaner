@@ -11,6 +11,10 @@ pub struct AudioFile {
     pub has_backup: bool,
     /// Playback length in seconds, when readable from the file's audio properties.
     pub duration_secs: Option<f64>,
+    /// Audio bitrate in kbps, when readable — used by duplicate review to
+    /// judge which of two matching files is the better-quality copy.
+    pub bitrate_kbps: Option<u32>,
+    pub sample_rate_hz: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

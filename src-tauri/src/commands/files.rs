@@ -103,6 +103,8 @@ fn file_info(path: &Path) -> AudioFile {
     let duration_secs = tagged
         .as_ref()
         .map(|t| t.properties().duration().as_secs_f64());
+    let bitrate_kbps = tagged.as_ref().and_then(|t| t.properties().audio_bitrate());
+    let sample_rate_hz = tagged.as_ref().and_then(|t| t.properties().sample_rate());
     AudioFile {
         path: path.to_string_lossy().to_string(),
         filename: path
@@ -117,6 +119,8 @@ fn file_info(path: &Path) -> AudioFile {
         size,
         has_backup,
         duration_secs,
+        bitrate_kbps,
+        sample_rate_hz,
     }
 }
 

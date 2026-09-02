@@ -22,6 +22,7 @@ import { useSettings } from "./hooks/useSettings";
 import { useTags } from "./hooks/useTags";
 import { ComponentsPage } from "./pages/ComponentsPage";
 import { LibraryPage } from "./pages/LibraryPage";
+import { DuplicatesPage } from "./pages/DuplicatesPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { LogsPage } from "./pages/LogsPage";
 import {
@@ -868,6 +869,50 @@ export default function App() {
     }
   };
 
+  /**
+   * Batch removal for the Duplicates page: confirms with the exact count and
+   * total size, then moves each file to the Recycle Bin (never a hard
+   * delete) via the same `delete_file` command as the single-file path
+   * above. Returns whether anything was actually removed, so the caller
+   * knows whether to update its own UI.
+   */
+  const deleteDuplicateFiles = async (paths: string[]): Promise<boolean> => {
+    if (!paths.length) return false;
+    const totalBytes = paths.reduce(
+      (sum, p) => sum + (filesApi.files.find((f) => f.path === p)?.size ?? 0),
+      0,
+    );
+    const ok = await confirm(
+      `Move ${paths.length} file${paths.length === 1 ? "" : "s"} (${formatBytes(totalBytes)}) to the Recycle Bin?`,
+      { title: "Remove Duplicates", kind: "warning" },
+    );
+    if (!ok) return false;
+    setBusy(true);
+    let removed = 0;
+    const errors: string[] = [];
+    for (const p of paths) {
+      try {
+        await invoke("delete_file", { path: p });
+        removed++;
+      } catch (e) {
+        errors.push(`${basename(p)}: ${e}`);
+      }
+    }
+    errors.forEach((e) => notify(e, "error"));
+    if (removed) {
+      invalidateCovers(paths);
+      filesApi.removeFiles(paths);
+      setLibraryTags((prev) => {
+        const next = { ...prev };
+        for (const p of paths) delete next[p];
+        return next;
+      });
+      notify(`Removed ${removed} file${removed === 1 ? "" : "s"}`, "success");
+    }
+    setBusy(false);
+    return removed > 0;
+  };
+
   const setCoverArt = async (file: AudioFile) => {
     const picked = await open({
       title: "Choose Artwork",
@@ -1379,6 +1424,17 @@ export default function App() {
               }
               shortcuts={settings.shortcuts}
               onTrack={analytics.track}
+            />
+          ) : page === "duplicates" ? (
+            <DuplicatesPage
+              files={filesApi.files}
+              tags={libraryTags}
+              notify={notify}
+              onDelete={deleteDuplicateFiles}
+              onInspect={(path) => {
+                const file = filesApi.files.find((f) => f.path === path);
+                if (file) inspect(file);
+              }}
             />
           ) : page === "components" ? (
             <ComponentsPage

@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner"
-version = "0.6.0"
+version = "0.8.0"
 description = "Strip audio tags to the essentials and clean them up with AI"
 edition = "2021"
 
@@ -24,6 +24,10 @@ walkdir = "2"
 tokio = { version = "1", features = ["time"] }
 trash = "5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
+rusty-chromaprint = "0.3.0"
+symphonia = { version = "0.6.1", features = ["mp3", "flac", "aac", "isomp4", "wav", "ogg", "vorbis", "aiff"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+blake3 = "1.8.7"
 
 [profile.release]
 strip = true
