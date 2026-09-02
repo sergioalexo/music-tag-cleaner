@@ -811,6 +811,15 @@ export function SettingsPage({ settings, onSave, onRenameGenre, checkOllama, not
               onChange={(e) => set("nextTrackId", Math.max(0, Number(e.target.value) || 0))}
             />
           </Row>
+          <Row
+            label="Strict file names"
+            hint='Rename to Standard uses only a-z, 0-9 and "-" — e.g. "beyonce-halo-000123" instead of "Beyoncé - Halo - 000123"'
+          >
+            <Toggle
+              checked={settings.strictFilenames}
+              onChange={(v) => set("strictFilenames", v)}
+            />
+          </Row>
         </div>
       </Card>
 

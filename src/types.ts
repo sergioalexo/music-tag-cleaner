@@ -139,6 +139,8 @@ export interface Settings {
   nextTrackId: number;
   /** Digit count for generated track IDs (also the required length to count as a UID). */
   trackIdDigits: number;
+  /** Rename to Standard uses only a-z, 0-9 and "-" in the file stem when true. */
+  strictFilenames: boolean;
   /** Fields the "Clear Fields" action empties. */
   clearFields: string[];
   /**

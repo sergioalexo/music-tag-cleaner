@@ -43,6 +43,7 @@ export const DEFAULT_SETTINGS: Settings = {
   activeGenrePreset: "Sergio Alexo",
   nextTrackId: 0,
   trackIdDigits: 6,
+  strictFilenames: true,
   clearFields: ["album"],
   transliterateScripts: [],
   settingsVersion: CURRENT_SETTINGS_VERSION,

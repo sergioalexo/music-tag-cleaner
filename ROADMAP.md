@@ -383,11 +383,40 @@ advancing isn't implemented (only Enter/click advance); fuzzy filtering and
 arrow-navigation *within* the open picker's own option list were already
 present in `Combobox` before this feature and needed no changes.
 
+### 25. Strict filename charset — v0.7
+Settings → Track IDs → **Strict file names** (default **on**): Rename to
+Standard now builds the stem with only `a-z`, `0-9` and `-`.
+
+- `sanitizeForFilenameStrict()` ([standardize.ts](src/lib/standardize.ts)):
+  Unicode NFKD-decomposes the value and strips the combining diacritical
+  marks that split off (`Beyoncé` → `beyonce`, `Motörhead` → `motorhead`,
+  `Ñoño & Zürich` → `nono-zurich`), lowercases, then maps every remaining
+  non-`[a-z0-9]` character to `-`, collapsing runs and trimming both ends.
+  `buildRenameStem()` takes a `strict` flag and joins parts with `-` instead
+  of `" - "` when set.
+- **Limitation, as scoped:** this ASCII-folds accented Latin script well but
+  cannot romanize a genuinely different script (Cyrillic, CJK, Arabic, …) —
+  those characters have no accent to strip, so they become dashes like any
+  other unsupported character, same as the roadmap's "where possible" caveat.
+- Falling back to the track id when artist/title sanitize to nothing, and
+  refusing (reporting an error) a file with no usable characters at all, both
+  fall out of the existing `[artist, title, uid].filter(nonEmpty).join()`
+  structure — no special-case code needed, since `uid` was already one of
+  the three parts.
+- `renameToStandard()` in [App.tsx](src/App.tsx) now pre-counts stem
+  collisions across the batch and warns (native confirm, not blocking) before
+  writing anything; the existing rename-collision suffix (" (2)", " (3)", …)
+  still guarantees nothing is overwritten either way.
+- **Not built:** a dedicated before/after rename preview screen — there
+  wasn't one before this change either, so this stayed scoped to the
+  character-set enforcement itself rather than adding new UI.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented except item 24 above (Genre
-Mode). Ordered by release. Each item notes the suspected cause where the
-code has already been read, so the fix doesn't start from zero.
+Planning only; nothing below is implemented except items 24–25 above (Genre
+Mode, strict filenames). Ordered by release. Each item notes the suspected
+cause where the code has already been read, so the fix doesn't start from
+zero.
 
 ---
 
@@ -422,19 +451,6 @@ Setting **Field naming: Friendly / Raw / Both** — `Title` vs `TIT2` vs
 preview. Raw names are per-container (ID3 `TIT2`, Vorbis `TITLE`, MP4 `©nam`),
 so the label follows the format of the selected file; a mixed selection shows
 the ID3 name with the others in the tooltip.
-
-### U5. Strict filename charset
-Rename-to-standard currently sanitizes loosely. Add a **strict** mode (default
-on): the final stem may contain only `a-z`, `0-9` and `-`.
-
-- lowercase everything
-- transliterate accents to ASCII (`Beyoncé` → `beyonce`), romanize non-Latin
-  scripts where possible
-- every other character → `-`; runs of `-` collapse to one; trimmed at both ends
-- empty result → fall back to the track id, else refuse and report the file
-
-Show before/after in the rename preview, and warn when two files would collapse
-to the same stem **before** writing anything.
 
 ### U6. Library browser sidebar
 A second, narrow pane on the left of the Library page (collapsible, resizable,

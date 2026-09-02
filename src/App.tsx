@@ -27,6 +27,8 @@ import { LogsPage } from "./pages/LogsPage";
 import {
   applyCapitalization,
   applyReplacements,
+  buildRenameStem,
+  isUid,
   removeCharsFrom,
 } from "./lib/standardize";
 import { activePreset } from "./lib/genres";
@@ -745,8 +747,9 @@ export default function App() {
     // radius is bigger and less obviously intentional.
     const isPartialSelection = files.length < filesApi.files.length;
     if (!isPartialSelection) {
+      const pattern = settings.strictFilenames ? "artist-title-id" : "artist - title - id";
       const ok = await confirm(
-        `Rename ${files.length} file${files.length === 1 ? "" : "s"} to "artist - title - id"? ` +
+        `Rename ${files.length} file${files.length === 1 ? "" : "s"} to "${pattern}"? ` +
           "Original tags are not affected.",
         { title: "Rename to Standard", kind: "info" },
       );
@@ -756,7 +759,35 @@ export default function App() {
     try {
       const { map, errors } = await tagsApi.read(files.map((f) => f.path));
       errors.forEach((e) => notify(e, "error"));
-      const result = await tagsApi.renameFiles(files, map, settings.trackIdDigits);
+
+      // Warn (don't block) when two files would land on the same stem —
+      // Rename to Standard still appends " (2)" on a real collision, but
+      // strict mode makes near-duplicates ("Beyoncé" / "Beyonce") collapse
+      // far more often, so it's worth calling out before writing anything.
+      const stemCounts = new Map<string, number>();
+      for (const file of files) {
+        const tags = map[file.path];
+        if (!tags) continue;
+        const uid = isUid(tags.trackId, settings.trackIdDigits) ? tags.trackId : undefined;
+        const stem = buildRenameStem(tags.artist, tags.title, uid, settings.strictFilenames);
+        if (stem) stemCounts.set(stem, (stemCounts.get(stem) ?? 0) + 1);
+      }
+      const collisions = [...stemCounts.values()].filter((n) => n > 1).length;
+      if (collisions > 0) {
+        const ok = await confirm(
+          `${collisions} file name${collisions === 1 ? "" : "s"} would collapse to the same name as ` +
+            `another file. They'll get " (2)", " (3)", … appended so nothing is overwritten. Continue?`,
+          { title: "Rename to Standard", kind: "warning" },
+        );
+        if (!ok) return;
+      }
+
+      const result = await tagsApi.renameFiles(
+        files,
+        map,
+        settings.trackIdDigits,
+        settings.strictFilenames,
+      );
       result.errors.forEach((e) => notify(e, "error"));
       if (Object.keys(result.mapping).length) {
         invalidateCovers(Object.keys(result.mapping));

@@ -154,16 +154,41 @@ export function sanitizeForFilename(value: string): string {
   return collapseSpaces(value.replace(/[^\p{L}\p{N}\s]/gu, " "));
 }
 
-/** Builds the standard "artist - title - uid" file stem from tag values. */
+/**
+ * Strict filename mode: ASCII-folds accented Latin letters (é → e, ñ → n, ü
+ * → u, …) via Unicode NFKD decomposition, then forces the result down to
+ * exactly `a-z`, `0-9` and `-` — the only characters guaranteed safe across
+ * every filesystem, OS and DJ tool. Anything else (spaces, punctuation, and
+ * — this can't attempt real script transliteration — any non-Latin
+ * character) becomes a dash; runs of dashes collapse to one and the ends
+ * are trimmed.
+ */
+export function sanitizeForFilenameStrict(value: string): string {
+  const folded = value
+    .normalize("NFKD")
+    // Strip the combining diacritical marks NFKD split off (U+0300-U+036F).
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase();
+  return folded.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Builds the standard rename stem from tag values: "artist - title - uid"
+ * normally, or "artist-title-uid" (fully lowercase, dash-only) when `strict`
+ * is set. Empty parts are dropped, so a missing artist or uid doesn't leave
+ * a stray separator.
+ */
 export function buildRenameStem(
   artist: string | undefined,
   title: string | undefined,
   uid: string | undefined,
+  strict = false,
 ): string {
+  const sanitize = strict ? sanitizeForFilenameStrict : sanitizeForFilename;
   const parts = [artist, title, uid]
-    .map((p) => sanitizeForFilename((p ?? "").trim()))
+    .map((p) => sanitize((p ?? "").trim()))
     .filter((p) => p.length > 0);
-  return parts.join(" - ");
+  return parts.join(strict ? "-" : " - ");
 }
 
 /**

@@ -315,13 +315,15 @@ export function useTags() {
   };
 
   /**
-   * Renames files to "artist - title - uid" (sanitized). Returns a mapping of
-   * old path -> new AudioFile so the caller can update its list.
+   * Renames files to "artist - title - uid" (sanitized), or the fully
+   * lowercase dash-only "artist-title-uid" when `strict` is set. Returns a
+   * mapping of old path -> new AudioFile so the caller can update its list.
    */
   const renameFiles = async (
     files: AudioFile[],
     map: Record<string, TagData>,
     trackIdDigits = 6,
+    strict = false,
   ): Promise<ApplyResult & { mapping: Record<string, AudioFile> }> => {
     let written = 0;
     const errors: string[] = [];
@@ -330,9 +332,9 @@ export function useTags() {
       const tags = map[file.path];
       if (!tags) continue;
       const uid = isUid(tags.trackId, trackIdDigits) ? tags.trackId : undefined;
-      const stem = buildRenameStem(tags.artist, tags.title, uid);
+      const stem = buildRenameStem(tags.artist, tags.title, uid, strict);
       if (!stem) {
-        errors.push(`${file.filename}: no artist/title to build a name from`);
+        errors.push(`${file.filename}: no usable characters to build a name from`);
         continue;
       }
       try {
