@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
-import { Download, Plus, PlugZap, Upload, X } from "lucide-react";
+import { Download, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
 import type {
   Capitalization,
   CharReplacement,
@@ -13,6 +13,7 @@ import { CLEARABLE_FIELDS, FIELD_LABELS, TRANSLITERATE_SCRIPTS } from "../types"
 import { migrate, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
 import { STANDARDIZE_FIELDS } from "../hooks/useTags";
 import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
+import type { GenreGroup } from "../lib/genres";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
 import { Combobox } from "../components/Combobox";
 
@@ -21,6 +22,12 @@ interface Props {
   onSave: (settings: Settings) => void;
   /** Renames a genre in the active preset; may prompt to retag the collection. */
   onRenameGenre: (oldName: string, newName: string) => void;
+  /** Every distinct genre spelling found in the loaded collection, grouped. */
+  collectionGenreGroups: GenreGroup[];
+  /** Appends the given genre names to the active preset. */
+  onAddGenres: (names: string[]) => void;
+  /** Offers to retag tracks using a non-canonical spelling to the canonical one. */
+  onMergeGenreVariants: (variants: string[], canonical: string) => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
   notify: (message: string, kind?: "success" | "error" | "info") => void;
 }
@@ -97,7 +104,116 @@ function GenreRow({
   );
 }
 
-export function SettingsPage({ settings, onSave, onRenameGenre, checkOllama, notify }: Props) {
+/**
+ * Lists every genre spelling detected in the loaded collection that isn't
+ * already in the active preset, grouped so near-duplicate spellings ("Hip
+ * Hop" / "Hip-Hop") show as one row. Ticking a row adds its canonical
+ * spelling to the preset; if the row has more than one variant, adding it
+ * also offers to retag the collection's other-spelling tracks to match.
+ */
+function DetectGenresPanel({
+  groups,
+  presetGenres,
+  onAdd,
+  onMerge,
+}: {
+  groups: GenreGroup[];
+  presetGenres: string[];
+  onAdd: (names: string[]) => void;
+  onMerge: (variants: string[], canonical: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const existing = new Set(presetGenres.map((g) => g.toLowerCase()));
+  const candidates = groups.filter((g) => !existing.has(g.canonical.toLowerCase()));
+  const [checked, setChecked] = useState<Set<string>>(new Set(candidates.map((g) => g.canonical)));
+
+  if (!open) {
+    return (
+      <Button variant="ghost" size="sm" className="mt-1" onClick={() => setOpen(true)}>
+        <Sparkles />
+        Detect genres from collection
+      </Button>
+    );
+  }
+
+  const apply = () => {
+    const toAdd = candidates.filter((g) => checked.has(g.canonical));
+    onAdd(toAdd.map((g) => g.canonical));
+    for (const g of toAdd) {
+      if (g.variants.length > 1) onMerge(g.variants.map((v) => v.name), g.canonical);
+    }
+    setOpen(false);
+  };
+
+  return (
+    <div className="mt-2 rounded-lg border bg-secondary/20 p-3">
+      {candidates.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No new genres found — every genre in the collection is already in this preset.
+        </p>
+      ) : (
+        <>
+          <p className="mb-2 text-xs text-muted-foreground">
+            Found {candidates.length} genre{candidates.length === 1 ? "" : "s"} in the loaded
+            collection not yet in this preset. Untick any you don't want.
+          </p>
+          <div className="max-h-56 space-y-1.5 overflow-y-auto">
+            {candidates.map((g) => (
+              <label key={g.canonical} className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-[var(--primary)]"
+                  checked={checked.has(g.canonical)}
+                  onChange={(e) =>
+                    setChecked((prev) => {
+                      const next = new Set(prev);
+                      if (e.target.checked) next.add(g.canonical);
+                      else next.delete(g.canonical);
+                      return next;
+                    })
+                  }
+                />
+                <span>
+                  {g.canonical}{" "}
+                  <span className="text-xs text-muted-foreground">
+                    ({g.count} track{g.count === 1 ? "" : "s"})
+                  </span>
+                  {g.variants.length > 1 && (
+                    <span className="block text-xs text-muted-foreground">
+                      also seen as: {g.variants.slice(1).map((v) => v.name).join(", ")} — will
+                      offer to retag those to "{g.canonical}"
+                    </span>
+                  )}
+                </span>
+              </label>
+            ))}
+          </div>
+        </>
+      )}
+      <div className="mt-3 flex gap-2">
+        {candidates.length > 0 && (
+          <Button variant="default" size="sm" onClick={apply} disabled={checked.size === 0}>
+            Add {checked.size || ""} genre{checked.size === 1 ? "" : "s"}
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function SettingsPage({
+  settings,
+  onSave,
+  onRenameGenre,
+  collectionGenreGroups,
+  onAddGenres,
+  onMergeGenreVariants,
+  checkOllama,
+  notify,
+}: Props) {
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
@@ -776,6 +892,12 @@ export function SettingsPage({ settings, onSave, onRenameGenre, checkOllama, not
               <Plus />
               Add genre
             </Button>
+            <DetectGenresPanel
+              groups={collectionGenreGroups}
+              presetGenres={gPreset.genres}
+              onAdd={onAddGenres}
+              onMerge={onMergeGenreVariants}
+            />
           </div>
         </div>
       </Card>

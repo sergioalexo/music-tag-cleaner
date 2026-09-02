@@ -411,24 +411,41 @@ Standard now builds the stem with only `a-z`, `0-9` and `-`.
   wasn't one before this change either, so this stayed scoped to the
   character-set enforcement itself rather than adding new UI.
 
+### 26. Auto-detect genres from the collection — v0.7
+Settings → Genre Presets → **Detect genres from collection**
+([SettingsPage.tsx](src/pages/SettingsPage.tsx), `DetectGenresPanel`):
+
+- `detectGenreGroups()` ([genres.ts](src/lib/genres.ts)) tallies every
+  distinct `TagData.genre` across the loaded collection (`libraryTags` in
+  App.tsx, kept live via a `useMemo`), grouping near-duplicate spellings by a
+  normalized key (case, `&`/`and`, `-`/space all folded together — `Hip Hop`
+  / `Hip-Hop` / `hip hop` collapse into one group). The most common raw
+  spelling in a group becomes its suggested `canonical` name.
+- The panel lists groups **not already in the active preset**, pre-ticked,
+  sorted by track count, with the other spellings shown under each ("also
+  seen as: …"). **Add N genres** appends the ticked canonical names to the
+  preset via `addGenresToPreset()`.
+- For any ticked group with more than one variant, adding it also calls the
+  existing retag machinery (`mergeGenreVariants()`, built on the same
+  confirm-then-`editField()` pattern as item 20's single-genre rename) —
+  offering to retag every track using a non-canonical spelling to the
+  canonical one, in a single native confirm covering the whole group.
+
+Found and fixed one grouping bug while testing this: normalizing `&` to
+`and` without surrounding spaces turned `R&B` into `rand b` instead of
+`r and b`, so it never matched the `R and B` spelling it was supposed to
+group with.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented except items 24–25 above (Genre
-Mode, strict filenames). Ordered by release. Each item notes the suspected
-cause where the code has already been read, so the fix doesn't start from
-zero.
+Planning only; nothing below is implemented except items 24–26 above (Genre
+Mode, strict filenames, genre auto-detect). Ordered by release. Each item
+notes the suspected cause where the code has already been read, so the fix
+doesn't start from zero.
 
 ---
 
 # v0.7 — Editing UX
-
-### U2. Auto-detect genres from the collection
-New **Detect genres** action next to the preset editor: tallies every distinct
-`genre` value across the loaded collection, sorted by track count, with
-near-duplicate grouping (case, `&`/`and`, `-`/space, `Hip Hop`/`Hip-Hop`) so
-variants collapse into one suggested canonical spelling. Tick the ones to keep →
-appended to the active preset. Ticking a merged group also offers the B3 retag
-prompt, to normalize those tracks to the canonical name.
 
 ### U3. Split Standardize into three tools
 Today one button does everything. Break it into:

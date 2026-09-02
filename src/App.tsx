@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -31,7 +31,7 @@ import {
   isUid,
   removeCharsFrom,
 } from "./lib/standardize";
-import { activePreset } from "./lib/genres";
+import { activePreset, detectGenreGroups } from "./lib/genres";
 import { matchesShortcut } from "./lib/shortcuts";
 import { internalDrag } from "./lib/internalDrag";
 import {
@@ -113,6 +113,12 @@ export default function App() {
   };
 
   const [libraryTags, setLibraryTags] = useState<Record<string, TagData>>({});
+  // Feeds Settings > Genre Presets > "Detect genres" — every distinct genre
+  // spelling in the loaded collection, near-duplicates grouped together.
+  const collectionGenreGroups = useMemo(
+    () => detectGenreGroups(Object.values(libraryTags).map((t) => t.genre)),
+    [libraryTags],
+  );
   const [pending, setPending] = useState<PendingChange[] | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>("strip");
   const [tagsMap, setTagsMap] = useState<Record<string, TagData>>({});
@@ -1192,6 +1198,43 @@ export default function App() {
     await editField(matching, "genre", trimmed);
   };
 
+  /** Appends genre names to the active preset (skipping ones already there). */
+  const addGenresToPreset = async (names: string[]) => {
+    const preset = settings.genrePresets.find((p) => p.name === settings.activeGenrePreset);
+    if (!preset) return;
+    const existing = new Set(preset.genres.map((g) => g.toLowerCase()));
+    const toAdd = names.filter((n) => n.trim() && !existing.has(n.trim().toLowerCase()));
+    if (!toAdd.length) return;
+    await save({
+      ...settings,
+      genrePresets: settings.genrePresets.map((p) =>
+        p.name === settings.activeGenrePreset ? { ...p, genres: [...p.genres, ...toAdd] } : p,
+      ),
+    });
+  };
+
+  /**
+   * Detect Genres found several raw spellings that normalize to the same
+   * thing (e.g. "Hip Hop" / "Hip-Hop"). Offers to retag every track using a
+   * non-canonical variant so the collection converges on one spelling.
+   */
+  const mergeGenreVariants = async (variants: string[], canonical: string) => {
+    const nonCanonical = new Set(variants.filter((v) => v !== canonical));
+    if (!nonCanonical.size) return;
+    const matching = Object.entries(libraryTags)
+      .filter(([, t]) => t.genre && nonCanonical.has(t.genre))
+      .map(([path]) => path);
+    if (!matching.length) return;
+    const ok = await confirm(
+      `${matching.length} track${matching.length === 1 ? "" : "s"} in the collection use a ` +
+        `different spelling of "${canonical}" (${[...nonCanonical].join(", ")}). ` +
+        `Retag ${matching.length === 1 ? "it" : "them"} to "${canonical}"?`,
+      { title: "Merge Genre Spellings", kind: "info" },
+    );
+    if (!ok) return;
+    await editField(matching, "genre", canonical);
+  };
+
   const inspect = (file: AudioFile) => {
     const tags = libraryTags[file.path];
     if (tags) setInspected({ file, tags });
@@ -1325,6 +1368,9 @@ export default function App() {
               settings={settings}
               onSave={save}
               onRenameGenre={renameGenreInPreset}
+              collectionGenreGroups={collectionGenreGroups}
+              onAddGenres={addGenresToPreset}
+              onMergeGenreVariants={mergeGenreVariants}
               checkOllama={ai.check}
               notify={notify}
             />
