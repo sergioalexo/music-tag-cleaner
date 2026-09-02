@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
   ChevronDown,
@@ -8,11 +8,14 @@ import {
   ChevronRight,
   ChevronUp,
   Filter,
+  Headphones,
   ImageOff,
   ImagePlus,
   Layers,
   Loader2,
   Music,
+  Pause,
+  Play,
   Search,
   SlidersHorizontal,
   Trash2,
@@ -26,7 +29,7 @@ import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { internalDrag } from "../lib/internalDrag";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
-import { AudioPreview } from "./AudioPreview";
+import { AudioPreview, formatDuration, releasePlayback, takeOverPlayback } from "./AudioPreview";
 import { Combobox } from "./Combobox";
 import { Stars } from "./Stars";
 import { Button, cn } from "./ui";
@@ -399,6 +402,125 @@ export function TrackTable({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
+  // --- Genre Mode: fast keyboard-driven genre assignment --------------------
+  // Up/Down move the "current" row (reusing rowSel/anchorPath as a single-row
+  // highlight) without touching playback. Enter plays the current row, or —
+  // if it's already playing — expands the inline genre picker. Saving from
+  // the picker (see the Combobox onChange below) advances to the next row and
+  // switches playback to it, resuming from wherever that row was left. Left/
+  // Right seek the currently playing track; 1-9 quick-tag from the active
+  // preset without opening the picker at all.
+  const GM_SEEK_SECONDS = 10;
+  const [genreMode, setGenreMode] = useState(false);
+  const genreModeRef = useRef(genreMode);
+  genreModeRef.current = genreMode;
+  const gmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [gmPlayingPath, setGmPlayingPath] = useState<string | null>(null);
+  const gmPlayingRef = useRef<string | null>(null);
+  gmPlayingRef.current = gmPlayingPath;
+  // Per-track resume position, kept only for the current session.
+  const gmPositions = useRef<Record<string, number>>({});
+  const [gmTime, setGmTime] = useState(0);
+  const [gmDuration, setGmDuration] = useState(0);
+
+  const gmSavePosition = useCallback(() => {
+    const el = gmAudioRef.current;
+    const p = gmPlayingRef.current;
+    if (el && p && Number.isFinite(el.currentTime)) gmPositions.current[p] = el.currentTime;
+  }, []);
+
+  const gmPauseKeepPosition = useCallback(() => {
+    gmSavePosition();
+    gmAudioRef.current?.pause();
+    setGmPlayingPath(null);
+  }, [gmSavePosition]);
+
+  const gmPlay = useCallback(
+    (path: string) => {
+      const el = gmAudioRef.current;
+      if (!el) return;
+      gmSavePosition();
+      // Pre-empts a row's own prelisten button too — only one thing plays.
+      takeOverPlayback(gmPauseKeepPosition);
+      const url = convertFileSrc(path);
+      if (el.src !== url) {
+        // A different track — load it and seek to its saved resume point
+        // once metadata is available.
+        el.src = url;
+        const resume = gmPositions.current[path] ?? 0;
+        const onReady = () => {
+          el.currentTime = resume;
+          el.removeEventListener("loadedmetadata", onReady);
+        };
+        el.addEventListener("loadedmetadata", onReady);
+      }
+      // Same track (e.g. Space to pause then resume) — just resume in place,
+      // no reload/reseek, so it's instant.
+      void el
+        .play()
+        .then(() => setGmPlayingPath(path))
+        .catch(() => setGmPlayingPath(null));
+    },
+    [gmSavePosition, gmPauseKeepPosition],
+  );
+
+  const gmStop = useCallback(() => {
+    gmSavePosition();
+    gmAudioRef.current?.pause();
+    releasePlayback(gmPauseKeepPosition);
+    setGmPlayingPath(null);
+  }, [gmSavePosition, gmPauseKeepPosition]);
+
+  const gmSeek = useCallback((delta: number) => {
+    const el = gmAudioRef.current;
+    if (!el || !gmPlayingRef.current) return;
+    const max = Number.isFinite(el.duration) ? el.duration : el.currentTime + Math.abs(delta);
+    el.currentTime = Math.max(0, Math.min(max, el.currentTime + delta));
+  }, []);
+
+  /** After a genre is saved, moves to the next row and starts it playing from
+   * its own resume point — or stops if that was the last row. */
+  const gmAdvance = useCallback(
+    (fromPath: string) => {
+      const list = rowsRef.current;
+      const idx = list.findIndex((f) => f.path === fromPath);
+      const next = idx >= 0 ? list[idx + 1] : undefined;
+      if (next) {
+        setAnchorPath(next.path);
+        setRowSel(new Set([next.path]));
+        gmPlay(next.path);
+        gmActionsRef.current.virtual.scrollToIndex(idx + 1);
+      } else {
+        gmStop();
+      }
+    },
+    [gmPlay, gmStop],
+  );
+
+  const toggleGenreMode = () => {
+    setGenreMode((on) => {
+      const next = !on;
+      onTrack(next ? "genreMode:on" : "genreMode:off");
+      if (next) {
+        if (!anchorRef.current && rowsRef.current[0]) {
+          setAnchorPath(rowsRef.current[0].path);
+          setRowSel(new Set([rowsRef.current[0].path]));
+        }
+      } else {
+        gmStop();
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    // Release the shared playback slot if the table unmounts mid-playback.
+    return () => {
+      if (gmPlayingRef.current) releasePlayback(gmPauseKeepPosition);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     if (!pickerOpen) return;
     const close = (e: MouseEvent) => {
@@ -415,6 +537,69 @@ export function TrackTable({
         setSearchOpen(true);
         requestAnimationFrame(() => searchInputRef.current?.focus());
         return;
+      }
+      // Genre Mode captures its own keys while nothing else has focus — the
+      // same guard the rest of this handler uses, which also means it
+      // naturally steps aside while the genre picker's own input is focused
+      // (that Combobox handles its own Enter/Arrows/Escape).
+      if (genreModeRef.current && e.target === document.body) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          gmStop();
+          setGenreMode(false);
+          gmActionsRef.current.onTrack("genreMode:off");
+          return;
+        }
+        const currentPath = anchorRef.current ?? rowsRef.current[0]?.path ?? null;
+        if (currentPath) {
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const list = rowsRef.current;
+            const idx = list.findIndex((f) => f.path === currentPath);
+            const nextIdx =
+              e.key === "ArrowDown" ? Math.min(list.length - 1, idx + 1) : Math.max(0, idx - 1);
+            const nextPath = list[nextIdx]?.path;
+            if (nextPath) {
+              setAnchorPath(nextPath);
+              setRowSel(new Set([nextPath]));
+              gmActionsRef.current.virtual.scrollToIndex(nextIdx);
+            }
+            return;
+          }
+          if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            if (gmPlayingRef.current) {
+              e.preventDefault();
+              gmSeek(e.key === "ArrowRight" ? GM_SEEK_SECONDS : -GM_SEEK_SECONDS);
+            }
+            return;
+          }
+          if (e.key === " ") {
+            e.preventDefault();
+            if (gmPlayingRef.current === currentPath) gmPauseKeepPosition();
+            else gmPlay(currentPath);
+            return;
+          }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            if (gmPlayingRef.current === currentPath) {
+              const { tags: liveTags, beginEdit: beginEditFn } = gmActionsRef.current;
+              beginEditFn(currentPath, "genre", liveTags[currentPath]?.genre ?? "");
+            } else {
+              gmPlay(currentPath);
+            }
+            return;
+          }
+          if (/^[1-9]$/.test(e.key)) {
+            e.preventDefault();
+            const { genreOptions: liveOptions, onEditField: liveOnEditField } = gmActionsRef.current;
+            const genre = liveOptions[Number(e.key) - 1];
+            if (genre) {
+              liveOnEditField([currentPath], "genre", genre);
+              gmAdvance(currentPath);
+            }
+            return;
+          }
+        }
       }
       // Ctrl/Cmd+A highlights every visible row (it does NOT tick them) so the
       // user can then Space / click a box to tick the whole selection.
@@ -446,7 +631,7 @@ export function TrackTable({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [shortcuts, onSetMany]);
+  }, [shortcuts, onSetMany, gmPlay, gmPauseKeepPosition, gmSeek, gmAdvance, gmStop]);
 
   const rh = ROW_STYLE[rowHeight];
   // Order follows visibleColumns (drag-and-drop reorders that array), not
@@ -777,6 +962,13 @@ export function TrackTable({
     setDraft(value);
   };
 
+  // Mirrors the latest values/callbacks Genre Mode's keydown handler needs
+  // (declared above, before these exist) into a ref, so that handler's
+  // effect can stay subscribed with a stable dependency list instead of
+  // re-registering the window listener on every tags/props change.
+  const gmActionsRef = useRef({ tags, genreOptions, onEditField, onTrack, beginEdit, virtual });
+  gmActionsRef.current = { tags, genreOptions, onEditField, onTrack, beginEdit, virtual };
+
   /**
    * Clear Fields preview: tick a column that isn't being cleared yet to add it,
    * building removal rows for the same files the preview already covers. Raw
@@ -922,6 +1114,18 @@ export function TrackTable({
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border bg-card">
+      <audio
+        ref={gmAudioRef}
+        onTimeUpdate={(e) => setGmTime(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => setGmDuration(e.currentTarget.duration || 0)}
+        onEnded={() => {
+          const p = gmPlayingRef.current;
+          if (p) gmPositions.current[p] = 0;
+          releasePlayback(gmPauseKeepPosition);
+          setGmPlayingPath(null);
+        }}
+        className="hidden"
+      />
       <div className="flex items-center justify-between border-b px-3 py-2">
         <span className="text-xs text-muted-foreground">
           {rows.length} track{rows.length === 1 ? "" : "s"}
@@ -929,6 +1133,15 @@ export function TrackTable({
           {files.filter((f) => selected.has(f.path)).length} selected
         </span>
         <div className="flex items-center gap-1">
+          <Button
+            variant={genreMode ? "default" : "ghost"}
+            size="sm"
+            onClick={toggleGenreMode}
+            title="Genre Mode — keyboard-driven genre assignment: ↑↓ move, Enter play/tag, ←→ seek, 1-9 quick-tag, Esc exit"
+          >
+            <Headphones />
+            Genre Mode
+          </Button>
           <Button
             variant={searchOpen ? "secondary" : "ghost"}
             size="sm"
@@ -1446,7 +1659,13 @@ export function TrackTable({
                               options={genreOptions}
                               allowCustom
                               autoFocus
-                              onChange={(v) => commitEdit(v)}
+                              onChange={(v) => {
+                                commitEdit(v);
+                                // Genre Mode: saving here is the cue to move
+                                // on — advance to the next row and switch
+                                // playback to it.
+                                if (genreModeRef.current) gmAdvance(f.path);
+                              }}
                               onClose={() => setEditing(null)}
                               onCreate={onAddGenre}
                               onEditOption={onRenameGenre}
@@ -1537,6 +1756,45 @@ export function TrackTable({
           </table>
         )}
       </div>
+
+      {genreMode && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t bg-secondary/40 px-3 py-2 text-xs">
+          <Headphones className="h-3.5 w-3.5 shrink-0 text-primary" />
+          {(() => {
+            const currentPath = anchorPath ?? rows[0]?.path ?? null;
+            const currentFile = currentPath ? rows.find((f) => f.path === currentPath) : undefined;
+            if (!currentFile) return <span className="text-muted-foreground">No track selected.</span>;
+            const playingHere = gmPlayingPath === currentFile.path;
+            return (
+              <>
+                <button
+                  onClick={() => (playingHere ? gmPauseKeepPosition() : gmPlay(currentFile.path))}
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground"
+                  title={playingHere ? "Pause (Space)" : "Play (Enter / Space)"}
+                >
+                  {playingHere ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                </button>
+                <span className="min-w-0 max-w-[28ch] truncate font-medium" title={currentFile.filename}>
+                  {currentFile.filename}
+                </span>
+                <span className="shrink-0 font-mono text-muted-foreground">
+                  {formatDuration(playingHere ? gmTime : gmPositions.current[currentFile.path] ?? 0)} /{" "}
+                  {formatDuration(playingHere ? gmDuration : 0)}
+                </span>
+                <span className="shrink-0 text-muted-foreground">
+                  Genre: <span className="font-medium text-foreground">{tags[currentFile.path]?.genre || "—"}</span>
+                </span>
+              </>
+            );
+          })()}
+          <span className="ml-auto shrink-0 text-muted-foreground">
+            ↑↓ move · Enter play / tag · ←→ seek {GM_SEEK_SECONDS}s · 1–9 quick-tag · Space play/pause · Esc exit
+          </span>
+          <Button variant="ghost" size="sm" onClick={toggleGenreMode}>
+            Exit
+          </Button>
+        </div>
+      )}
 
       {lightboxIdx !== null && rows[lightboxIdx] && (
         <ArtworkLightbox

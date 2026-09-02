@@ -3,10 +3,28 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { Pause, Play } from "lucide-react";
 import { cn } from "./ui";
 
-// Only one preview plays at a time across the whole table.
-let stopOthers: (() => void) | null = null;
+// Only one thing plays at a time across the whole table — a row's own
+// prelisten button here, or Genre Mode's single-audio-element player in
+// TrackTable. Whoever starts playing registers its own stop function so the
+// next one to start can pre-empt it.
+let activeStopper: (() => void) | null = null;
 
-function formatDuration(seconds: number): string {
+export function takeOverPlayback(stop: () => void) {
+  if (activeStopper && activeStopper !== stop) activeStopper();
+  activeStopper = stop;
+}
+
+export function releasePlayback(stop: () => void) {
+  if (activeStopper === stop) activeStopper = null;
+}
+
+/** Stops whatever is currently playing anywhere in the table. */
+export function stopAllPlayback() {
+  activeStopper?.();
+  activeStopper = null;
+}
+
+export function formatDuration(seconds: number): string {
   if (!seconds || !Number.isFinite(seconds)) return "--:--";
   const total = Math.round(seconds);
   const m = Math.floor(total / 60);
@@ -32,7 +50,7 @@ export function AudioPreview({ path }: { path: string }) {
     }
     return () => {
       if (audioRef.current) audioRef.current.pause();
-      if (stopOthers === pause) stopOthers = null;
+      releasePlayback(pause);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path]);
@@ -54,8 +72,7 @@ export function AudioPreview({ path }: { path: string }) {
       el.src = convertFileSrc(path);
       setReady(true);
     }
-    if (stopOthers && stopOthers !== pause) stopOthers();
-    stopOthers = pause;
+    takeOverPlayback(pause);
     void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
   };
 
@@ -67,8 +84,7 @@ export function AudioPreview({ path }: { path: string }) {
     setTime(el.currentTime);
     // Clicking/dragging the scrub bar auto-starts playback if it's paused.
     if (!playing) {
-      if (stopOthers && stopOthers !== pause) stopOthers();
-      stopOthers = pause;
+      takeOverPlayback(pause);
       void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
     }
   };

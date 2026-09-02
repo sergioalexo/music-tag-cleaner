@@ -336,41 +336,62 @@ existing `useImageInfo` data. A short click/dblclick timer keeps this from
 firing on the first half of a double-click, which still opens the existing
 "all tag fields" Inspect dialog.
 
+### 24. Genre Mode — fast keyboard-driven genre assignment — v0.7
+Toolbar toggle (`Headphones` button, [TrackTable.tsx](src/components/TrackTable.tsx))
+that turns the table's own row-highlight (`rowSel`/`anchorPath`) and a single
+shared `<audio>` element into a keyboard-only genre-tagging loop:
+
+| Key | State | Action |
+|---|---|---|
+| `↑` / `↓` | any | Move the current row; playback keeps going |
+| `Enter` | not playing | Play the current row **from its last position** |
+| `Enter` | playing this row | Expand the genre picker inline, focused |
+| `←` / `→` | playing, picker closed | Seek −10 s / +10 s |
+| (type + `Enter`, or click an option) | picker open | Save genre → advance → old track stops, new one plays from its own resume point |
+| `Esc` | picker open | Close without saving (existing `Combobox` behaviour, untouched) |
+| `Space` | picker closed | Play / pause the current row |
+| `1`–`9` | picker closed | Quick-tag the Nth preset genre directly, no picker, then advance |
+| `Esc` | picker closed | Exit Genre Mode |
+
+Implementation notes:
+- One shared `<HTMLAudioElement>` (not a per-row player) with a
+  `gmPositions` map of per-track resume seconds, kept for the session.
+  Resuming the *same* track (Space pause/resume) skips the reload entirely —
+  only switching tracks reloads `src` and seeks to the saved position.
+- Registers with the same `takeOverPlayback`/`releasePlayback` module-level
+  singleton a row's own prelisten button already used
+  ([AudioPreview.tsx](src/components/AudioPreview.tsx), refactored out of
+  its previous private `stopOthers` variable), so only one thing ever plays
+  across the whole table.
+- The keydown handling is merged into the table's existing window-level key
+  handler rather than a second listener, gated the same way the rest of that
+  handler already is (`e.target === document.body`) — which is also what
+  makes it step aside automatically while the genre picker's own `<input>`
+  has focus, letting `Combobox`'s existing Enter/Arrow/Escape handling run
+  untouched with no event-propagation hacks needed.
+- Saving from the picker reuses the existing `beginEdit`/`commitEdit`/
+  `onEditField` pipeline — a genre-mode save is a completely normal
+  undoable history entry.
+- Up/Down and advance both call the existing virtualizer's `scrollToIndex`
+  so the current row stays in view on a long list.
+- A bottom strip shows the current filename, play/pause, elapsed/total time,
+  the track's current genre, and the key legend.
+
+**Simplified vs. the original plan, left as backlog:** the seek amount is a
+hardcoded 10 s constant rather than a setting; `Tab`-to-accept-without-
+advancing isn't implemented (only Enter/click advance); fuzzy filtering and
+arrow-navigation *within* the open picker's own option list were already
+present in `Combobox` before this feature and needed no changes.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented. v0.6 (bug fixes) is complete —
-see items 17–23 above. Ordered by release. Each item notes the suspected
-cause where the code has already been read, so the fix doesn't start from
-zero.
+Planning only; nothing below is implemented except item 24 above (Genre
+Mode). Ordered by release. Each item notes the suspected cause where the
+code has already been read, so the fix doesn't start from zero.
 
 ---
 
 # v0.7 — Editing UX
-
-### U1. Fast genre-assignment mode (keyboard-first)
-The core workflow. With the track table focused:
-
-| Key | State | Action |
-|---|---|---|
-| `↑` / `↓` | any | Move the highlight between tracks; playback keeps going |
-| `Enter` | not playing | Play the highlighted track **from its last position** |
-| `Enter` | playing this track | Expand the genre picker inline, focus its filter box |
-| `←` / `→` | playing, picker closed | Seek −10 s / +10 s |
-| `Enter` | picker open | Save genre → advance to the next track → stop the old one, start the new one |
-| `Esc` | picker open | Close without saving |
-| `Space` | any | Play / pause |
-
-Details:
-- Per-track resume position kept for the session, so re-entering a track
-  continues where it left off.
-- Typing in the picker filters the active preset (fuzzy, first match
-  preselected); `↑`/`↓` move within the open list; `Tab` accepts without
-  advancing to the next track.
-- Number keys `1`–`9` assign the Nth preset genre directly, no picker.
-- One save = one undoable history entry, so a whole session can be stepped back.
-- A slim "genre mode" strip at the bottom shows the current track, elapsed time
-  and the key legend, so the shortcuts are discoverable.
-- The seek amount (±10 s default) becomes a setting.
 
 ### U2. Auto-detect genres from the collection
 New **Detect genres** action next to the preset editor: tallies every distinct
