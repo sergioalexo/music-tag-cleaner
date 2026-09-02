@@ -194,8 +194,25 @@ fn decode_full(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
     decode_to_pcm_capped(path, None)
 }
 
+/// The one Chromaprint configuration used everywhere a fingerprint is
+/// computed or compared — two fingerprints are only comparable if they were
+/// both produced with the same configuration, so this is centralized rather
+/// than each call site picking its own preset.
+///
+/// Silence removal was added after testing against a real library turned up
+/// a concrete false positive: three completely unrelated songs clustered
+/// into one "alternate version" group. `preset_test2()` alone (no silence
+/// removal) lets a quiet/faded intro or outro — low-energy audio carries
+/// almost no distinguishing chroma information — spuriously "match" across
+/// otherwise unrelated tracks. `with_removed_silence` (threshold from the
+/// crate's own `preset_test4`) skips those frames instead of fingerprinting
+/// near-silence as if it were real content.
+fn fingerprint_config() -> Configuration {
+    Configuration::preset_test2().with_removed_silence(50)
+}
+
 fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<Vec<u32>, String> {
-    let config = Configuration::preset_test2();
+    let config = fingerprint_config();
     let mut printer = Fingerprinter::new(&config);
     printer
         .start(sample_rate, channels)
@@ -356,12 +373,14 @@ pub async fn get_waveform(app: AppHandle, path: String) -> Result<Vec<f32>, Stri
 /// A lower score (rusty-chromaprint: 0-32, lower = more similar) with
 /// coverage this close on *both* sides is a very strong signal — these
 /// thresholds are a starting point, not a scientifically calibrated cutoff,
-/// and may need tuning against real libraries.
+/// and `ALTERNATE_SCORE_MAX` was tightened once already against a real
+/// false positive found while testing against a real library (see
+/// `classify_pair`'s doc comment).
 const DUPLICATE_SCORE_MAX: f64 = 10.0;
 const DUPLICATE_MIN_COVERAGE: f64 = 0.85;
 /// A weaker/partial match still worth surfacing as a probable alternate
 /// version (radio edit vs. extended mix, etc.) rather than discarding.
-const ALTERNATE_SCORE_MAX: f64 = 14.0;
+const ALTERNATE_SCORE_MAX: f64 = 6.0;
 const ALTERNATE_MIN_COVERAGE: f64 = 0.35;
 
 enum PairMatch {
@@ -370,13 +389,41 @@ enum PairMatch {
     NoMatch,
 }
 
-/// Compares two fingerprints and classifies the relationship. Reports
-/// **coverage** (how much of each track's fingerprinted audio the best
-/// matching segment spans) and **score** (chromaprint's own similarity
-/// measure) separately, which is what lets a radio edit correctly match
-/// *inside* an extended mix without the two being flagged as identical:
-/// coverage on the shorter file is high, but coverage on the longer one is
-/// only partial — an "alternate version", not a duplicate.
+/// Compares two fingerprints and classifies the relationship using the
+/// single largest matching segment. Reports **coverage** (how much of each
+/// track's fingerprinted audio that one segment spans) and **score**
+/// (chromaprint's own similarity measure) separately, which is what lets a
+/// radio edit correctly match *inside* an extended mix without the two
+/// being flagged as identical: coverage on the shorter file is high, but
+/// coverage on the longer one is only partial — an "alternate version",
+/// not a duplicate.
+///
+/// **Deliberately the single biggest segment, not a span/sum across every
+/// segment returned by `match_fingerprints`.** A span-based version (union
+/// of every segment's start-to-end range) was tried after finding that two
+/// genuinely identical re-encoded copies fragmented into 5 segments with
+/// small gaps, undercounting their coverage — but tested against the same
+/// real library, span-based coverage badly over-counted the *opposite*
+/// case: several scattered, individually brief coincidental matches (shared
+/// drum patterns/timbral similarity common across unrelated electronic/pop
+/// production) spread a "first match to last match" span across nearly an
+/// entire file, which reads as high "coverage" despite almost none of the
+/// content actually matching. That produced far worse false positives
+/// (unrelated songs merged as "duplicate", one 14-file cluster of unrelated
+/// tracks) than the fragmentation problem it was meant to fix. Reverted;
+/// the fragmentation case is left as a known, narrower limitation (such a
+/// pair under-classifies as "alternate" rather than "duplicate" — see
+/// backlog) in favor of not reintroducing something worse.
+///
+/// **Score is the deciding signal for the shared-jingle case**, found on
+/// the same real library: two completely unrelated songs shared one ~46s
+/// segment positioned at the very start of one file and mid-track in the
+/// other — the signature of a promotional jingle or station drop prepended
+/// by whatever tool/source they were downloaded from, not the same
+/// recording. It scored 9.55, versus 0.03 for a genuine radio-edit/
+/// extended-mix synthetic fixture's shared segment — a wide, reliable gap —
+/// so `ALTERNATE_SCORE_MAX` was tightened from 14.0 to 6.0 to exclude it
+/// without needing to touch coverage at all.
 fn classify_pair(a: &CachedFingerprint, b: &CachedFingerprint, config: &Configuration) -> PairMatch {
     let Ok(segments) = match_fingerprints(&a.fingerprint, &b.fingerprint, config) else {
         return PairMatch::NoMatch;
@@ -388,6 +435,17 @@ fn classify_pair(a: &CachedFingerprint, b: &CachedFingerprint, config: &Configur
     let coverage_a = if a.duration_secs > 0.0 { (match_secs / a.duration_secs).min(1.0) } else { 0.0 };
     let coverage_b = if b.duration_secs > 0.0 { (match_secs / b.duration_secs).min(1.0) } else { 0.0 };
     let min_coverage = coverage_a.min(coverage_b);
+    if std::env::var("MTC_DEBUG_CLASSIFY").is_ok() {
+        eprintln!(
+            "DEBUG classify_pair: segments={} match_secs={match_secs:.1} \
+             a.dur={:.1} b.dur={:.1} coverage_a={coverage_a:.3} coverage_b={coverage_b:.3} \
+             min_coverage={min_coverage:.3} score={:.2}",
+            segments.len(),
+            a.duration_secs,
+            b.duration_secs,
+            best.score,
+        );
+    }
     let duration_diff = (a.duration_secs - b.duration_secs).abs();
 
     if best.score <= DUPLICATE_SCORE_MAX
@@ -425,16 +483,23 @@ impl UnionFind {
     }
 }
 
-fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<DuplicateGroup>, String> {
-    let conn = open_db(app)?;
+/// The actual detection pipeline, independent of Tauri — takes a plain
+/// sqlite `Connection` and an optional progress callback (`(done, total,
+/// phase)`) instead of an `AppHandle`, so it can be exercised directly
+/// (real-library smoke testing, benchmarking) without a running app.
+fn scan_duplicates_core(
+    conn: &Connection,
+    paths: &[String],
+    mut on_progress: impl FnMut(usize, usize, &str),
+) -> Vec<DuplicateGroup> {
     let total = paths.len();
     let mut fingerprints: Vec<(String, CachedFingerprint)> = Vec::with_capacity(total);
     for (i, path) in paths.iter().enumerate() {
-        match get_or_compute(&conn, path) {
+        match get_or_compute(conn, path) {
             Ok(fp) => fingerprints.push((path.clone(), fp)),
             Err(e) => eprintln!("duplicate scan: skipping {path}: {e}"),
         }
-        emit_progress(app, i + 1, total, "fingerprinting");
+        on_progress(i + 1, total, "fingerprinting");
     }
 
     // Stage 1: exact byte-identical files (blake3), grouped immediately —
@@ -464,7 +529,7 @@ fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<D
     // than ~35% of its extended mix in practice) to keep this well short of
     // full O(n²) on a large library.
     let candidates: Vec<usize> = (0..fingerprints.len()).filter(|&i| !in_exact_group[i]).collect();
-    let config = Configuration::preset_test2();
+    let config = fingerprint_config();
     let mut uf = UnionFind::new(candidates.len());
     let mut pair_kind: std::collections::HashMap<(usize, usize), (bool, f64)> = std::collections::HashMap::new();
 
@@ -489,7 +554,7 @@ fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<D
                 PairMatch::NoMatch => {}
             }
         }
-        emit_progress(app, i + 1, fingerprints.len(), "comparing");
+        on_progress(i + 1, fingerprints.len(), "comparing");
     }
 
     let mut clusters: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
@@ -531,7 +596,15 @@ fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<D
         });
     }
 
-    Ok(groups)
+    groups
+}
+
+fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<DuplicateGroup>, String> {
+    let conn = open_db(app)?;
+    let app = app.clone();
+    Ok(scan_duplicates_core(&conn, &paths, |done, total, phase| {
+        emit_progress(&app, done, total, phase)
+    }))
 }
 
 #[tauri::command]
@@ -544,6 +617,109 @@ pub async fn scan_duplicates(app: AppHandle, paths: Vec<String>) -> Result<Vec<D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostic for a specific real-file false positive: prints exactly
+    /// where the "match" lands in each file (timestamps, item count, score)
+    /// instead of just the summary classification, so a spurious match can
+    /// actually be understood rather than guessed at. Point it at two real
+    /// paths with:
+    ///   MTC_TEST_PATH_A="C:\...\a.mp3" MTC_TEST_PATH_B="C:\...\b.mp3" cargo test --release diagnose_pair -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diagnose_pair() {
+        let path_a = std::env::var("MTC_TEST_PATH_A").expect("set MTC_TEST_PATH_A");
+        let path_b = std::env::var("MTC_TEST_PATH_B").expect("set MTC_TEST_PATH_B");
+
+        let cache_dir = std::env::temp_dir().join("mtc-real-scan-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let conn = Connection::open(cache_dir.join("cache.sqlite")).unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
+
+        let fp_a = get_or_compute(&conn, &path_a).unwrap();
+        let fp_b = get_or_compute(&conn, &path_b).unwrap();
+        println!(
+            "A: {path_a}\n   decoded duration (capped) = {:.1}s, fingerprint len = {}",
+            fp_a.duration_secs,
+            fp_a.fingerprint.len()
+        );
+        println!(
+            "B: {path_b}\n   decoded duration (capped) = {:.1}s, fingerprint len = {}",
+            fp_b.duration_secs,
+            fp_b.fingerprint.len()
+        );
+
+        let config = fingerprint_config();
+        let mut segments = match_fingerprints(&fp_a.fingerprint, &fp_b.fingerprint, &config).unwrap();
+        println!("\n{} segment(s) found:", segments.len());
+        segments.sort_by(|a, b| b.items_count.cmp(&a.items_count));
+        for s in segments.iter().take(10) {
+            println!(
+                "  score={:.2} items={} dur={:.1}s | A: {:.1}s-{:.1}s | B: {:.1}s-{:.1}s",
+                s.score,
+                s.items_count,
+                s.duration(&config),
+                s.start1(&config),
+                s.end1(&config),
+                s.start2(&config),
+                s.end2(&config)
+            );
+        }
+
+        match classify_pair(&fp_a, &fp_b, &config) {
+            PairMatch::Duplicate { score } => println!("\nClassified: Duplicate (score {score:.2})"),
+            PairMatch::Alternate { score } => println!("\nClassified: Alternate (score {score:.2})"),
+            PairMatch::NoMatch => println!("\nClassified: No match"),
+        }
+    }
+
+    /// Manual, opt-in smoke test against a real folder of real music — the
+    /// only way to see how the pipeline behaves on actual bitrate/format
+    /// diversity and real edit relationships, which no synthetic fixture can
+    /// stand in for. Not part of the normal suite: run explicitly with
+    ///   MTC_TEST_DIR="C:\path\to\folder" cargo test --release real_library_scan_smoke_test -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_library_scan_smoke_test() {
+        let dir = std::env::var("MTC_TEST_DIR")
+            .expect("set MTC_TEST_DIR to a real folder of audio files to scan");
+        let exts = ["mp3", "flac", "wav", "m4a", "aac", "aiff", "aif", "ogg"];
+        let mut paths = Vec::new();
+        for entry in walkdir::WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                    if exts.contains(&ext.to_ascii_lowercase().as_str()) {
+                        paths.push(entry.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        println!("Found {} audio files under {dir}", paths.len());
+
+        let cache_dir = std::env::temp_dir().join("mtc-real-scan-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let conn = Connection::open(cache_dir.join("cache.sqlite")).unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
+
+        let start = std::time::Instant::now();
+        let mut last_print = std::time::Instant::now();
+        let groups = scan_duplicates_core(&conn, &paths, |done, total, phase| {
+            if last_print.elapsed().as_secs() >= 3 || done == total {
+                println!(
+                    "{phase}: {done}/{total} ({:.1}s elapsed)",
+                    start.elapsed().as_secs_f64()
+                );
+                last_print = std::time::Instant::now();
+            }
+        });
+        println!("\nScan took {:?} for {} files", start.elapsed(), paths.len());
+        println!("Found {} group(s)\n", groups.len());
+        for g in &groups {
+            println!("--- {} (score {:.2}, {} files) ---", g.kind, g.score, g.paths.len());
+            for p in &g.paths {
+                println!("  {p}");
+            }
+        }
+    }
 
     fn sine_pcm(freq: f64, sample_rate: u32, seconds: f64) -> Vec<i16> {
         let n = (sample_rate as f64 * seconds) as usize;
@@ -710,7 +886,7 @@ mod tests {
             duration_secs: extended_pcm.len() as f64 / sr as f64,
             sample_rate: sr,
         };
-        let config = Configuration::preset_test2();
+        let config = fingerprint_config();
         match classify_pair(&radio, &extended, &config) {
             PairMatch::Alternate { .. } => {}
             PairMatch::Duplicate { score } => {
@@ -729,7 +905,7 @@ mod tests {
         let pcm_b = pcm_a.clone();
         let fp_a = compute_fingerprint(&pcm_a, sr, 1).unwrap();
         let fp_b = compute_fingerprint(&pcm_b, sr, 1).unwrap();
-        let config = Configuration::preset_test2();
+        let config = fingerprint_config();
         let segments = match_fingerprints(&fp_a, &fp_b, &config).unwrap();
         let best = segments.iter().max_by(|a, b| a.items_count.cmp(&b.items_count));
         assert!(best.is_some(), "identical audio should produce at least one matching segment");
@@ -748,7 +924,7 @@ mod tests {
         let pcm_b = melody_pcm(&[233.08, 277.18, 311.13, 466.16], sr, 5.0); // A#/Bb-ish minor-flavored run
         let fp_a = compute_fingerprint(&pcm_a, sr, 1).unwrap();
         let fp_b = compute_fingerprint(&pcm_b, sr, 1).unwrap();
-        let config = Configuration::preset_test2();
+        let config = fingerprint_config();
         let segments = match_fingerprints(&fp_a, &fp_b, &config).unwrap();
         let best_score = segments
             .iter()

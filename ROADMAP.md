@@ -679,9 +679,93 @@ in this pass.
 
 This completes v0.8 (items 31–33: duplicate detection, review, waveform).
 
+### 34. Real-library validation of duplicate detection — v0.8.2
+Item 31 shipped calibrated only against synthetic sine-wave/melody fixtures
+(the only audio available in that environment) — this item is running it
+for real, against the user's own collection, and fixing what that turned up.
+
+**Method:** `scan_duplicates_blocking` was split into a Tauri-independent
+`scan_duplicates_core(conn, paths, on_progress)` — same production logic,
+takes a plain `Connection` and a progress closure instead of an `AppHandle`
+— so it can run from a `#[ignore]`d test outside a running app. Pointed at
+`C:\Users\sopas\Music\backup` (484 real MP3s of varied bitrate/source):
+~106s end to end (~0.22s/file), 9 groups on the first pass.
+
+**Result — genuinely valuable, not clean on the first try:**
+- 7 of 9 groups were correct real duplicates on the very first run, several
+  non-trivial: an app-generated-Track-ID naming variant, a featured-artist
+  retag ("Sao Paulo" / "The Weeknd- Anitta - Sao Paulo"), and straight
+  re-downloads — all scoring 0.00–0.66 out of a 0–32 scale.
+- **One real false positive**: three completely unrelated songs (Brutalismus
+  3000 / Michael Sembello / The Police) clustered as "alternate version"
+  (score 9.55). Diagnosed with a new `diagnose_pair` test that prints exact
+  matched-segment timestamps rather than just the summary classification —
+  it showed a genuine 46.6s audio match, but positioned at 0:00–0:47 in one
+  file and 0:57–1:43 in the other: the signature of a shared promotional
+  jingle/station-drop prepended by whatever tool the files were downloaded
+  through, not the same recording.
+- **One real under-classification**: a genuine duplicate pair ("Pitbull -
+  Hotel Room Service") landed as "alternate" (score 2.34) instead of
+  "duplicate", because the two re-encoded copies matched across 5 separate
+  segments with small gaps between them (re-encoding artifacts), and
+  `classify_pair` only measured coverage from the single largest segment —
+  36.6s out of 120s, well under the 85% duplicate threshold.
+
+**What was tried and reverted — worth recording so it isn't tried again the
+same way:** to fix the under-classification, coverage was changed to span
+every matching segment (first segment's start to last segment's end) instead
+of just the biggest one, and score to a length-weighted average across all
+segments. Re-run against the same 484 files: **14 groups, most of them
+wrong** — unrelated songs merged as "duplicate" (score 8.87, 9.64, 9.57),
+and one 14-file cluster combining completely unrelated tracks. Root cause:
+several scattered, individually brief coincidental matches (shared drum
+patterns/timbral similarity, common across unrelated electronic/pop
+production) spread a first-to-last "span" across nearly a whole file, which
+reads as high coverage despite almost none of the content actually
+matching — span conflates "matched over a wide range" with "matched
+densely," and real files apparently produce enough scattered noise for that
+distinction to matter. **Reverted to single-largest-segment coverage** —
+the under-classification bug stayed (recorded above, now backlog), rather
+than trade it for something worse.
+
+**What actually shipped, verified against the real false positive AND a
+clean re-run of all 8 remaining groups:** `ALTERNATE_SCORE_MAX` tightened
+from 14.0 to 6.0. Diagnostic data showed score was the reliable separator
+all along — the shared-jingle false positive scored 9.55, while the
+synthetic radio-edit/extended-mix fixture (item 31's own test) scored 0.03
+— a wide, dependable gap that coverage-tuning alone couldn't replicate
+(the false positive's coverage, 0.39, and the genuine synthetic case's,
+0.44, were too close together to separate on that axis). Also added
+silence removal to the shared fingerprint config (`with_removed_silence`)
+on the hypothesis that quiet intros/outros were the cause — measurement
+showed identical scores with or without it, so it did *not* explain this
+particular false positive, but is a real, independently-justified
+improvement (near-silent audio genuinely carries little discriminating
+chroma information) kept regardless.
+
+Re-run after the fix: **8 of 8 groups correct** — the false positive is
+gone, all 7 duplicate pairs and the one under-classified-but-real alternate
+pair are intact, no new false positives. Two new permanent test fixtures:
+`diagnose_pair` (point it at any two real files, prints exact segment
+timestamps/scores) and `real_library_scan_smoke_test` (point it at a real
+folder, runs the actual production pipeline). Both `#[ignore]`d — opt-in via
+env vars, not part of the normal suite — since they need real audio files
+this repo doesn't ship.
+
+**Left as backlog, not fixed:** the Hotel Room Service-style
+under-classification (a genuine duplicate fragmenting into several segments
+lands as "alternate" rather than "duplicate") is still present — it's a
+real limitation, not a regression, and safer to leave than to re-attempt
+with the span-based approach that made things worse. A cache schema/
+algorithm-version stamp is also still missing (see Backlog) — this session
+hand-cleared the sqlite cache directory before each re-test since
+`fingerprint_config()` changed; without a version stamp, a *future* config
+change could silently compare fingerprints computed under two different
+configs against each other.
+
 ## Roadmap — v0.9 → v1.0
 
-Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–33).
+Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34).
 Ordered by release. Each item notes the suspected cause where the code has
 already been read, so the fix doesn't start from zero.
 
@@ -854,4 +938,21 @@ must never lock someone out of editing their own files.
   tokens (`AC/DC`, `feat.`, `McFly`, …) to override the default recasing.
 - `settings.columnWidths` accumulates an `extra:<key>` entry for every raw
   field ever resized and never prunes them — harmless but untidy.
+- The `file_cache` sqlite table (duplicate detection, item 31/34) has no
+  algorithm-version stamp — if `fingerprint_config()` or the waveform bucket
+  count ever changes again, old cached rows would silently compare against
+  new ones as if they were the same algorithm. Add an `algo_version INTEGER`
+  column, bump a constant whenever the algorithm changes, and treat a
+  version mismatch as a cache miss.
+- A genuine duplicate that fragments into several matching segments (re-
+  encoding artifacts, minor structural drift) under-classifies as
+  "alternate version" rather than "duplicate", because `classify_pair` only
+  measures coverage from the single largest segment (see item 34's real
+  false-positive-vs-worse-regression story before changing this) — real,
+  reproducible (`Pitbull - Hotel Room Service` in the user's own library),
+  left alone because the two fixes tried for it both made a different case
+  much worse. Needs a coverage measure that distinguishes "matched fairly
+  densely across a wide range" from "a handful of scattered short matches
+  spread over a wide range" — simple span or simple sum both fail one real
+  case or the other.
 - (add items here)
