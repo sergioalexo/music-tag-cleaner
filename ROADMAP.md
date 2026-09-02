@@ -436,12 +436,32 @@ Found and fixed one grouping bug while testing this: normalizing `&` to
 `r and b`, so it never matched the `R and B` spelling it was supposed to
 group with.
 
+### 27. Raw field names as labels — v0.7
+Settings → Standardization → **Field naming**: `Title` / `TIT2` / `Title
+(TIT2)`. New [rawFieldNames.ts](src/lib/rawFieldNames.ts):
+
+- A static table of each curated field's raw name in the three tag families
+  this app writes — ID3v2 (`TIT2`, `TPE1`, …), Vorbis Comments (`TITLE`,
+  `ARTIST`, …), MP4/iTunes atoms (`©nam`, `©ART`, …) — including the app's
+  own private `Unknown(TRACKID)` field's real name per family.
+- `familyForFormat()` maps a file extension to its tag family (mp3/wav/aiff
+  → ID3v2, flac/ogg → Vorbis, m4a/aac → MP4); `dominantFamily()` picks the
+  most common family across the loaded collection.
+
+**Simplified vs. the original plan:** a table header is one label shared by
+every row, so it can't literally "follow the format of the selected file"
+per-row — it uses the collection's dominant family instead, with
+`rawNameTooltip()` listing every family's name on hover so a mixed
+collection is never misleading. Only table headers were wired up; the Clear
+Fields checklist and the strip preview still show the friendly name
+regardless of this setting — left as a follow-up rather than done partway.
+
 ## Roadmap — v0.7 → v1.0
 
-Planning only; nothing below is implemented except items 24–26 above (Genre
-Mode, strict filenames, genre auto-detect). Ordered by release. Each item
-notes the suspected cause where the code has already been read, so the fix
-doesn't start from zero.
+Planning only; nothing below is implemented except items 24–27 above (Genre
+Mode, strict filenames, genre auto-detect, raw field names). Ordered by
+release. Each item notes the suspected cause where the code has already
+been read, so the fix doesn't start from zero.
 
 ---
 
@@ -461,13 +481,6 @@ Today one button does everything. Break it into:
    one-click behaviour.
 
 All three still preview through the existing pending-change pipeline.
-
-### U4. Raw field names as the labels
-Setting **Field naming: Friendly / Raw / Both** — `Title` vs `TIT2` vs
-`Title (TIT2)`. Affects table headers, the Clear Fields checklist and the strip
-preview. Raw names are per-container (ID3 `TIT2`, Vorbis `TITLE`, MP4 `©nam`),
-so the label follows the format of the selected file; a mixed selection shows
-the ID3 name with the others in the tooltip.
 
 ### U6. Library browser sidebar
 A second, narrow pane on the left of the Library page (collapsible, resizable,

@@ -38,6 +38,7 @@ export const DEFAULT_SETTINGS: Settings = {
   replacements: DEFAULT_REPLACEMENTS,
   capitalization: "asis",
   highlightSymbols: false,
+  fieldNaming: "friendly",
   removeChars: ",.",
   genrePresets: DEFAULT_GENRE_PRESETS,
   activeGenrePreset: "Sergio Alexo",

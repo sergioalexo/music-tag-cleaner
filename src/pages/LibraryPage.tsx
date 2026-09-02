@@ -500,6 +500,7 @@ export function LibraryPage({
           visibleColumns={settings.visibleColumns}
           columnWidths={settings.columnWidths}
           highlightSymbols={settings.highlightSymbols}
+          fieldNaming={settings.fieldNaming}
           rowHeight={settings.rowHeight}
           genreOptions={genreOptions}
           onToggle={filesApi.toggle}

@@ -130,6 +130,8 @@ export interface Settings {
   capitalization: Capitalization;
   /** Highlight non-standard symbols in Title/Artist cells in the table. */
   highlightSymbols: boolean;
+  /** How curated field names are labeled: the friendly name, the raw tag frame name, or both. */
+  fieldNaming: "friendly" | "raw" | "both";
   /** Characters removed by the "Remove characters" action. */
   removeChars: string;
   /** Named genre presets; the Genre action snaps genres to the active one. */

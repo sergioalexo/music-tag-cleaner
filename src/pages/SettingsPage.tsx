@@ -608,6 +608,33 @@ export function SettingsPage({
               onChange={(v) => set("highlightSymbols", v)}
             />
           </Row>
+          <Row
+            label="Field naming"
+            hint='Table headers as "Title", the raw frame name "TIT2", or "Title (TIT2)" — picked from the most common format in the loaded collection'
+          >
+            <div className="flex gap-1">
+              {(
+                [
+                  { value: "friendly", label: "Title" },
+                  { value: "raw", label: "TIT2" },
+                  { value: "both", label: "Both" },
+                ] as const
+              ).map((o) => (
+                <button
+                  key={o.value}
+                  onClick={() => set("fieldNaming", o.value)}
+                  className={cn(
+                    "rounded-md border px-2.5 py-1 text-xs font-medium",
+                    settings.fieldNaming === o.value
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-input bg-background hover:bg-accent",
+                  )}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          </Row>
           <Row label="Capitalization" hint="How to re-case values when standardizing">
             <div className="flex gap-1">
               {CAP_OPTIONS.map((o) => (

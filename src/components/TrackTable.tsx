@@ -30,6 +30,7 @@ import { internalDrag } from "../lib/internalDrag";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
 import { AudioPreview, formatDuration, releasePlayback, takeOverPlayback } from "./AudioPreview";
+import { dominantFamily, fieldHeaderLabel, rawNameTooltip } from "../lib/rawFieldNames";
 import { Combobox } from "./Combobox";
 import { Stars } from "./Stars";
 import { Button, cn } from "./ui";
@@ -162,6 +163,7 @@ interface Props {
   visibleColumns: string[];
   columnWidths: Record<string, number>;
   highlightSymbols: boolean;
+  fieldNaming: "friendly" | "raw" | "both";
   rowHeight: RowHeight;
   genreOptions: string[];
   onToggle: (path: string) => void;
@@ -340,6 +342,7 @@ export function TrackTable({
   visibleColumns,
   columnWidths,
   highlightSymbols,
+  fieldNaming,
   rowHeight,
   genreOptions,
   onToggle,
@@ -722,6 +725,11 @@ export function TrackTable({
   const columnById = useMemo(() => new Map(columns.map((c) => [c.id, c])), [columns]);
   const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
   const totalWidth = 36 + rh.art + 32 + columns.reduce((sum, c) => sum + widthOf(c), 0);
+  // Picks one tag family's raw name per column header when fieldNaming isn't
+  // "friendly" — a mixed-format collection can't show a different header per
+  // row, so this uses whichever family is most common; rawNameTooltip covers
+  // the rest on hover.
+  const headerFamily = useMemo(() => dominantFamily(files), [files]);
 
   /**
    * Display order. Sorting is memoized because it is O(n log n) over the whole
@@ -1337,7 +1345,12 @@ export function TrackTable({
                   Art
                 </th>
                 <th className={cn("px-1 py-2", headerSep)} />
-                {columns.map((c) => (
+                {columns.map((c) => {
+                  const headerLabel = c.field
+                    ? fieldHeaderLabel(c.label, c.field, fieldNaming, headerFamily)
+                    : c.label;
+                  const headerTooltip = c.field ? rawNameTooltip(c.label, c.field) : undefined;
+                  return (
                   <th
                     key={c.id}
                     draggable={!c.dynamic}
@@ -1394,7 +1407,9 @@ export function TrackTable({
                         ? "Click to sort by track length — drag to reorder"
                         : c.dynamic
                           ? `${c.label} — raw tag field, click to sort, drag edge to resize`
-                          : "Click to sort — drag to reorder"
+                          : headerTooltip
+                            ? `${headerTooltip} — click to sort, drag to reorder`
+                            : "Click to sort — drag to reorder"
                     }
                   >
                     <span className="flex items-center gap-1 overflow-hidden">
@@ -1421,7 +1436,7 @@ export function TrackTable({
                             onChange={() => addClearColumn(c)}
                           />
                         )}
-                      <span className="min-w-0 flex-1 truncate">{c.label}</span>
+                      <span className="min-w-0 flex-1 truncate">{headerLabel}</span>
                       {c.id === backupFieldId && (
                         <span className="shrink-0 text-[9px] font-normal text-amber-500">(Backup)</span>
                       )}
@@ -1442,7 +1457,8 @@ export function TrackTable({
                       <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
                     </span>
                   </th>
-                ))}
+                  );
+                })}
               </tr>
             </thead>
             <tbody>
