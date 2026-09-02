@@ -380,7 +380,7 @@ const DUPLICATE_SCORE_MAX: f64 = 10.0;
 const DUPLICATE_MIN_COVERAGE: f64 = 0.85;
 /// A weaker/partial match still worth surfacing as a probable alternate
 /// version (radio edit vs. extended mix, etc.) rather than discarding.
-const ALTERNATE_SCORE_MAX: f64 = 6.0;
+const ALTERNATE_SCORE_MAX: f64 = 4.0;
 const ALTERNATE_MIN_COVERAGE: f64 = 0.35;
 
 enum PairMatch {
@@ -420,10 +420,20 @@ enum PairMatch {
 /// segment positioned at the very start of one file and mid-track in the
 /// other — the signature of a promotional jingle or station drop prepended
 /// by whatever tool/source they were downloaded from, not the same
-/// recording. It scored 9.55, versus 0.03 for a genuine radio-edit/
-/// extended-mix synthetic fixture's shared segment — a wide, reliable gap —
-/// so `ALTERNATE_SCORE_MAX` was tightened from 14.0 to 6.0 to exclude it
-/// without needing to touch coverage at all.
+/// recording. It scored 9.55. `ALTERNATE_SCORE_MAX` was first tightened
+/// from 14.0 to 6.0 on that single data point.
+///
+/// **Then tested against a second, larger, more varied real folder (3726
+/// files, mostly dance/EDM)**, which surfaced six *more* shared-jingle false
+/// positives that 6.0 didn't catch — unrelated tracks across trance, indie
+/// pop and techno, clustering tightly at scores 4.84–5.93 (one confirmed
+/// with `diagnose_pair`: two unrelated tracks both matching from 0.0s/1.2s,
+/// the same "matches from the very start of the file" signature). In that
+/// same run, every plausible *genuine* alternate — same-song variants,
+/// edits, a mashup that legitimately samples another track — scored 3.14 or
+/// lower. That's a real, consistent gap across two independent libraries
+/// (genuine matches: 0.03–3.14; shared-jingle false positives: 4.84–9.55),
+/// so `ALTERNATE_SCORE_MAX` was tightened again, from 6.0 to 4.0.
 fn classify_pair(a: &CachedFingerprint, b: &CachedFingerprint, config: &Configuration) -> PairMatch {
     let Ok(segments) = match_fingerprints(&a.fingerprint, &b.fingerprint, config) else {
         return PairMatch::NoMatch;

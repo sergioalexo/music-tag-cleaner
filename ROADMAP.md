@@ -763,6 +763,26 @@ hand-cleared the sqlite cache directory before each re-test since
 change could silently compare fingerprints computed under two different
 configs against each other.
 
+**Round two — a second, larger, more diverse real folder (v0.8.3):**
+`C:\Users\sopas\Music\Collection`, 3726 files, mostly dance/EDM — a genuinely
+different test of the same fix. First pass at `ALTERNATE_SCORE_MAX = 6.0`
+found 41 groups, but **6 more shared-jingle false positives** slipped
+through — clusters of unrelated artists across trance, indie pop and
+techno, scoring 4.84–5.93, all clustered right under that ceiling. One
+confirmed with `diagnose_pair`: two completely unrelated tracks (Angelo
+Ferreri, Armin Van Buuren) both matching from 0.0s/1.2s — the same
+"matches from the very start of the file" signature as the first false
+positive. Meanwhile every *genuine* alternate found in this run — same-song
+variants, edits, even a legitimate mashup that samples another track —
+scored 3.14 or lower. That gap (genuine: 0.03–3.14, shared-jingle false
+positives: 4.84–9.55) is now consistent across two independent real
+libraries, so `ALTERNATE_SCORE_MAX` was tightened again, 6.0 → 4.0.
+Re-verified against the same 3726 files (fast this time — the fingerprint
+cache was already warm from the first pass, so this only re-ran the
+comparison stage, ~278s instead of ~1170s): **35 groups, exactly the 6 false
+positives gone, every remaining score ≤3.14** — no new omissions or false
+positives introduced.
+
 ## Roadmap — v0.9 → v1.0
 
 Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34).
