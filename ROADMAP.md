@@ -508,33 +508,45 @@ Remove Chars.
 All three still build the same before/after pending-change preview as
 before — no changes were needed there.
 
-## Roadmap — v0.7 → v1.0
+### 30. Library browser sidebar — v0.7 (v0.7 complete)
+New [LibrarySidebar.tsx](src/components/LibrarySidebar.tsx): a collapsible,
+resizable pane (drag the right edge, 160–420px, width and collapsed state
+persisted to `settings.sidebarWidth`/`sidebarCollapsed`) to the left of the
+track table, with a Folders / Genres / Artists mode switcher and its own
+search box that filters the tree/list itself.
 
-Planning only; nothing below is implemented except items 24–29 above (Genre
-Mode, strict filenames, genre auto-detect, raw field names, DJ app profile,
-Standardize split) — U6 (library browser sidebar) is the only v0.7 item left.
-Ordered by release. Each item notes the suspected cause where the code has
-already been read, so the fix doesn't start from zero.
+- **Folders** — a real nested tree built from every loaded file's path
+  (`buildFolderTree()`), not just a flat list of parent directories; each
+  folder shows its track count (including subfolders) and expands/collapses
+  independently. Clicking a folder filters the table to that folder and
+  everything under it.
+- **Genres** / **Artists** — flat, count-sorted lists tallied directly from
+  `TagData.genre`/`artist` with **no** near-duplicate merging — this is for
+  exact-match browsing, not the fuzzy grouping Detect Genres (item 26) does,
+  so what you click is exactly what you'll see. Clicking one filters to an
+  exact match.
+- Clicking the active filter again clears it; a banner shows the current
+  filter with its own clear button. The filter narrows the `files` array
+  passed into `TrackTable`, so it composes with — sits underneath — the
+  table's own existing search/flagged filters rather than replacing them,
+  and never triggers a disk rescan.
 
----
+**Simplified vs. the original plan:**
+- **Playlists** mode isn't included — there's no playlist import feature
+  yet (that's v0.9 F4/F5), so it would have nothing to show.
+- **Artists** is a flat list, not "expandable to that artist's tracks" —
+  clicking an artist already filters the whole table to their tracks, which
+  covers the same need without a second, nested tree UI.
+- **Ctrl-click for unions** (selecting multiple folders/genres/artists at
+  once) isn't implemented — one active filter at a time, click again to
+  clear. Left as a follow-up if single-selection turns out to be limiting
+  in practice.
 
-# v0.7 — Editing UX
+## Roadmap — v0.8 → v1.0
 
-
-### U6. Library browser sidebar
-A second, narrow pane on the left of the Library page (collapsible, resizable,
-width persisted) with a mode switcher:
-
-- **Folders** — the folder tree of the imported roots, with track counts
-- **Genres** — every genre in the collection with counts; click filters the table
-- **Playlists** — imported playlists (Rekordbox XML / m3u8, see F4)
-- **Artists** — grouped by artist, expandable to that artist's tracks
-
-Plus a search box at the top that filters *the tree itself* (find the right
-folder / genre / artist fast), separate from the existing track search.
-Selection is a filter over the loaded collection — no disk rescan. Ctrl-click
-for unions. Follows the Media Fetch sidebar design language.
-
+Planning only from here on; v0.7 (items 24–30 above) is complete. Ordered
+by release. Each item notes the suspected cause where the code has already
+been read, so the fix doesn't start from zero.
 
 ---
 

@@ -38,6 +38,7 @@ import { TrackTable } from "../components/TrackTable";
 import PreviewTable from "../components/PreviewTable";
 import { ClearFieldsMenu } from "../components/ClearFieldsMenu";
 import { CapitalizationMenu } from "../components/CapitalizationMenu";
+import { LibrarySidebar, matchesSidebarFilter, type SidebarFilter } from "../components/LibrarySidebar";
 import { Button } from "../components/ui";
 
 interface FilesApi {
@@ -166,6 +167,14 @@ export function LibraryPage({
 }: Props) {
   const selectedCount = filesApi.selectedPaths.length;
   const noSel = busy || selectedCount === 0;
+
+  // Library browser sidebar (Folders/Genres/Artists) — a plain in-memory
+  // filter over the loaded files, layered underneath the table's own search.
+  const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter | null>(null);
+  const sidebarFilteredFiles = useMemo(
+    () => filesApi.files.filter((f) => matchesSidebarFilter(f, libraryTags, sidebarFilter)),
+    [filesApi.files, libraryTags, sidebarFilter],
+  );
   const backupCount = filesApi.files.filter(
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
   ).length;
@@ -510,56 +519,68 @@ export function LibraryPage({
         </div>
       )}
 
-      {pending && (previewMode === "strip" || previewMode === "history") ? (
-        <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
-          <PreviewTable
-            rows={pending}
-            mode={previewMode}
-            busy={busy}
-            onRowsChange={onPendingChange}
-            onApply={onApplyPending}
-            onCancel={onCancelPending}
-          />
-        </div>
-      ) : (
-        <TrackTable
+      <div className="flex min-h-0 flex-1 gap-3">
+        <LibrarySidebar
           files={filesApi.files}
           tags={libraryTags}
-          covers={covers}
-          imageInfo={imageInfo}
-          onFetchImageInfo={onFetchImageInfo}
-          onSetCoverArt={onSetCoverArt}
-          onRemoveCoverArt={onRemoveCoverArt}
-          unresolved={unresolved}
-          selected={filesApi.selected}
-          visibleColumns={settings.visibleColumns}
-          columnWidths={settings.columnWidths}
-          highlightSymbols={settings.highlightSymbols}
-          fieldNaming={settings.fieldNaming}
-          rowHeight={settings.rowHeight}
-          genreOptions={genreOptions}
-          onToggle={filesApi.toggle}
-          onSetAll={filesApi.setAll}
-          onSetMany={filesApi.setManySelected}
-          onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
-          onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
-          onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
-          onEditField={onEditField}
-          onEditRawField={onEditRawField}
-          onEditRating={onEditRating}
-          onInspect={onInspect}
-          onAddGenre={onAddGenre}
-          onRenameGenre={onRenameGenre}
-          onDeleteFile={onDeleteFile}
-          onRenameFile={onRenameFile}
-          backupFieldId={backupFieldId}
-          shortcuts={shortcuts}
-          onTrack={onTrack}
-          pending={inlinePreview ? pending : null}
-          onPendingChange={onPendingChange}
-          previewMode={previewMode}
+          width={settings.sidebarWidth}
+          collapsed={settings.sidebarCollapsed}
+          filter={sidebarFilter}
+          onFilterChange={setSidebarFilter}
+          onWidthChange={(w) => onSaveSettings({ ...settings, sidebarWidth: w })}
+          onCollapsedChange={(c) => onSaveSettings({ ...settings, sidebarCollapsed: c })}
         />
-      )}
+        {pending && (previewMode === "strip" || previewMode === "history") ? (
+          <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
+            <PreviewTable
+              rows={pending}
+              mode={previewMode}
+              busy={busy}
+              onRowsChange={onPendingChange}
+              onApply={onApplyPending}
+              onCancel={onCancelPending}
+            />
+          </div>
+        ) : (
+          <TrackTable
+            files={sidebarFilteredFiles}
+            tags={libraryTags}
+            covers={covers}
+            imageInfo={imageInfo}
+            onFetchImageInfo={onFetchImageInfo}
+            onSetCoverArt={onSetCoverArt}
+            onRemoveCoverArt={onRemoveCoverArt}
+            unresolved={unresolved}
+            selected={filesApi.selected}
+            visibleColumns={settings.visibleColumns}
+            columnWidths={settings.columnWidths}
+            highlightSymbols={settings.highlightSymbols}
+            fieldNaming={settings.fieldNaming}
+            rowHeight={settings.rowHeight}
+            genreOptions={genreOptions}
+            onToggle={filesApi.toggle}
+            onSetAll={filesApi.setAll}
+            onSetMany={filesApi.setManySelected}
+            onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
+            onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
+            onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
+            onEditField={onEditField}
+            onEditRawField={onEditRawField}
+            onEditRating={onEditRating}
+            onInspect={onInspect}
+            onAddGenre={onAddGenre}
+            onRenameGenre={onRenameGenre}
+            onDeleteFile={onDeleteFile}
+            onRenameFile={onRenameFile}
+            backupFieldId={backupFieldId}
+            shortcuts={shortcuts}
+            onTrack={onTrack}
+            pending={inlinePreview ? pending : null}
+            onPendingChange={onPendingChange}
+            previewMode={previewMode}
+          />
+        )}
+      </div>
     </div>
   );
 }

@@ -177,6 +177,9 @@ export interface Settings {
   visibleColumns: string[];
   columnWidths: Record<string, number>;
   rowHeight: RowHeight;
+  /** Library browser sidebar (Folders/Genres/Artists) width and collapsed state. */
+  sidebarWidth: number;
+  sidebarCollapsed: boolean;
   /** Character replacement rules for the Standardize action. */
   replacements: CharReplacement[];
   capitalization: Capitalization;

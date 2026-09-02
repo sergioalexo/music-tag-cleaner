@@ -36,6 +36,8 @@ export const DEFAULT_SETTINGS: Settings = {
   ],
   columnWidths: {},
   rowHeight: "normal",
+  sidebarWidth: 220,
+  sidebarCollapsed: false,
   replacements: DEFAULT_REPLACEMENTS,
   capitalization: "asis",
   highlightSymbols: false,
