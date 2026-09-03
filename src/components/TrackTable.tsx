@@ -22,7 +22,7 @@ import {
   X,
   ZoomIn,
 } from "lucide-react";
-import type { AudioFile, PendingChange, PreviewMode, RowHeight, TagData } from "../types";
+import type { AudioFile, CueData, PendingChange, PreviewMode, RowHeight, TagData } from "../types";
 import { basename, FIELD_LABELS, formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
@@ -426,6 +426,11 @@ export function TrackTable({
   const gmPositions = useRef<Record<string, number>>({});
   const [gmTime, setGmTime] = useState(0);
   const [gmDuration, setGmDuration] = useState(0);
+  // Rekordbox cues (see `get_cues_for_path`) for whichever track is showing
+  // in the Genre Mode strip, drawn as an overlay on its Waveform. `null`
+  // means "checked, none imported"; `undefined` means "not fetched yet".
+  const [gmCues, setGmCues] = useState<CueData | null | undefined>(undefined);
+  const gmCuesCache = useRef<Record<string, CueData | null>>({});
 
   const gmSavePosition = useCallback(() => {
     const el = gmAudioRef.current;
@@ -977,6 +982,35 @@ export function TrackTable({
   // re-registering the window listener on every tags/props change.
   const gmActionsRef = useRef({ tags, genreOptions, onEditField, onTrack, beginEdit, virtual });
   gmActionsRef.current = { tags, genreOptions, onEditField, onTrack, beginEdit, virtual };
+
+  // Fetches Rekordbox cues (see `get_cues_for_path`) for whichever track is
+  // showing in the Genre Mode strip, so its Waveform can draw them.
+  const gmCuesPath = genreMode ? anchorPath ?? rows[0]?.path ?? null : null;
+  useEffect(() => {
+    if (!gmCuesPath) {
+      setGmCues(undefined);
+      return;
+    }
+    const cached = gmCuesCache.current[gmCuesPath];
+    if (cached !== undefined) {
+      setGmCues(cached);
+      return;
+    }
+    let cancelled = false;
+    setGmCues(undefined);
+    invoke<CueData | null>("get_cues_for_path", { path: gmCuesPath })
+      .then((cues) => {
+        gmCuesCache.current[gmCuesPath] = cues;
+        if (!cancelled) setGmCues(cues);
+      })
+      .catch(() => {
+        gmCuesCache.current[gmCuesPath] = null;
+        if (!cancelled) setGmCues(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [gmCuesPath]);
 
   /**
    * Clear Fields preview: tick a column that isn't being cleared yet to add it,
@@ -1820,7 +1854,17 @@ export function TrackTable({
               playingHere && gmDuration > 0
                 ? gmTime / gmDuration
                 : undefined;
-            return <Waveform path={currentPath} height={28} progress={progress} className="mt-1.5" />;
+            const currentFile = rows.find((f) => f.path === currentPath);
+            return (
+              <Waveform
+                path={currentPath}
+                height={28}
+                progress={progress}
+                className="mt-1.5"
+                cues={gmCues}
+                durationSecs={currentFile?.durationSecs}
+              />
+            );
           })()}
         </div>
       )}

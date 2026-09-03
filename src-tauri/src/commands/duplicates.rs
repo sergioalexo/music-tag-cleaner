@@ -44,11 +44,11 @@ pub struct DuplicateGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CachedFingerprint {
-    blake3: String,
-    fingerprint: Vec<u32>,
-    duration_secs: f64,
-    sample_rate: u32,
+pub(crate) struct CachedFingerprint {
+    pub(crate) blake3: String,
+    pub(crate) fingerprint: Vec<u32>,
+    pub(crate) duration_secs: f64,
+    pub(crate) sample_rate: u32,
 }
 
 fn emit_progress(app: &AppHandle, done: usize, total: usize, phase: &str) {
@@ -58,7 +58,7 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize, phase: &str) {
     );
 }
 
-fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("fingerprint-cache.sqlite"))
@@ -84,7 +84,7 @@ const FILE_CACHE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS file_cache (
     waveform_peaks TEXT
 );";
 
-fn open_db(app: &AppHandle) -> Result<Connection, String> {
+pub(crate) fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
     conn.execute_batch(FILE_CACHE_SCHEMA_SQL).map_err(|e| e.to_string())?;
     Ok(conn)
@@ -222,7 +222,7 @@ fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<V
     Ok(printer.fingerprint().to_vec())
 }
 
-fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
+pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
     let (mtime, size) = file_stat(Path::new(path))?;
 
     let cached: Option<(Option<String>, Option<String>, Option<f64>, Option<u32>)> = conn

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
-import { Download, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
-import type { CharReplacement, DjApp, GenrePreset, OllamaStatus, Settings } from "../types";
+import { Download, ListMusic, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
+import type { CharReplacement, DjApp, GenrePreset, ImportResult, OllamaStatus, Settings } from "../types";
 import {
   CAP_OPTIONS,
   CLEARABLE_FIELDS,
@@ -218,6 +219,8 @@ export function SettingsPage({
   const [exportingSettings, setExportingSettings] = useState(false);
   const [importingSettings, setImportingSettings] = useState(false);
   const [recordingShortcut, setRecordingShortcut] = useState<string | null>(null);
+  const [rbImporting, setRbImporting] = useState(false);
+  const [rbProgress, setRbProgress] = useState<{ done: number; total: number } | null>(null);
 
   const exportSettings = async () => {
     const dest = await save({
@@ -257,6 +260,36 @@ export function SettingsPage({
       notify(`Could not import settings: ${e}`, "error");
     } finally {
       setImportingSettings(false);
+    }
+  };
+
+  const importRekordboxCues = async () => {
+    const picked = await open({
+      title: "Select rekordbox.xml",
+      multiple: false,
+      filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
+    });
+    if (!picked || typeof picked !== "string") return;
+    setRbImporting(true);
+    setRbProgress({ done: 0, total: 0 });
+    const unlisten = await listen<{ done: number; total: number }>("rekordbox-import-progress", (e) => {
+      setRbProgress(e.payload);
+    });
+    try {
+      const result = await invoke<ImportResult>("import_rekordbox_cues", { xmlPath: picked });
+      const skipped = result.errors.length;
+      notify(
+        `Imported cues for ${result.matched} of ${result.totalEntries} tracks` +
+          (result.notFoundOnDisk > 0 ? ` (${result.notFoundOnDisk} not found on disk)` : "") +
+          (skipped > 0 ? ` — ${skipped} error(s)` : ""),
+        skipped > 0 ? "info" : "success",
+      );
+    } catch (e) {
+      notify(`Could not import Rekordbox cues: ${e}`, "error");
+    } finally {
+      unlisten();
+      setRbImporting(false);
+      setRbProgress(null);
     }
   };
 
@@ -1148,6 +1181,24 @@ export function SettingsPage({
             <Upload />
             Import Settings
           </Button>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Rekordbox Cue Import"
+          hint="Read memory cues, hot cues, loops and the beat grid from a rekordbox.xml collection export — matched to your files by audio fingerprint, so it survives renames. Read-only: nothing is written back to Rekordbox."
+        />
+        <div className="flex items-center gap-3 px-5 py-3">
+          <Button variant="secondary" size="sm" onClick={importRekordboxCues} disabled={rbImporting}>
+            <ListMusic />
+            {rbImporting ? "Importing…" : "Import Rekordbox Cues"}
+          </Button>
+          {rbImporting && rbProgress && rbProgress.total > 0 && (
+            <span className="text-xs text-muted-foreground">
+              {rbProgress.done} of {rbProgress.total}
+            </span>
+          )}
         </div>
       </Card>
     </div>

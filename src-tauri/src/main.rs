@@ -109,6 +109,8 @@ fn main() {
             commands::duplicates::get_waveform,
             commands::backup_archive::create_backup_archive,
             commands::backup_archive::read_backup_manifest,
+            commands::rekordbox_import::import_rekordbox_cues,
+            commands::rekordbox_import::get_cues_for_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");

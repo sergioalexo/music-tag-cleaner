@@ -306,6 +306,46 @@ export const FIELD_LABELS: Record<string, string> = {
   rating: "Rating",
 };
 
+// v0.9 F5 — Rekordbox cue import. Field names are camelCase to match the
+// `#[serde(rename_all = "camelCase")]` structs in
+// `src-tauri/src/commands/rekordbox_import.rs`.
+export interface TempoPoint {
+  positionSecs: number;
+  bpm: number;
+  meter: string;
+}
+
+export interface CuePoint {
+  positionSecs: number;
+  /** `undefined`/`null` for a memory cue; 0-7 for a hot cue pad. */
+  pad?: number | null;
+  name: string;
+  color?: [number, number, number] | null;
+}
+
+export interface LoopPoint {
+  startSecs: number;
+  endSecs: number;
+  pad?: number | null;
+  name: string;
+  color?: [number, number, number] | null;
+}
+
+export interface CueData {
+  averageBpm?: number | null;
+  tempo: TempoPoint[];
+  memoryCues: CuePoint[];
+  hotCues: CuePoint[];
+  loops: LoopPoint[];
+}
+
+export interface ImportResult {
+  totalEntries: number;
+  matched: number;
+  notFoundOnDisk: number;
+  errors: string[];
+}
+
 export function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }

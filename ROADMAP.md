@@ -824,12 +824,60 @@ fast and byte-exact) via the new [backup_archive.rs](src-tauri/src/commands/back
 `read_backup_manifest` command exists but nothing calls it yet) — left for
 if it turns out to be needed, rather than built speculatively now.
 
+### 36. Rekordbox cue import — v0.9 F5
+New **Import Rekordbox Cues** button on the Settings page: picks a
+`rekordbox.xml` export via a file dialog and reads every track's memory
+cues, hot cues, loops, and beat grid/BPM out of it, via the new
+[rekordbox_import.rs](src-tauri/src/commands/rekordbox_import.rs). Read-only
+— nothing is ever written back to Rekordbox.
+
+- Cues are stored keyed by **audio fingerprint, not file path** — reusing
+  the exact same Chromaprint pipeline and sqlite cache `duplicates.rs`
+  already built for duplicate detection (`get_or_compute`, `open_db` were
+  made `pub(crate)` for this reuse). This means a cue survives a rename or a
+  move; only a genuine re-encode changes the fingerprint.
+- `rekordbox.xml`'s `TRACK` entries are parsed with a streaming `quick-xml`
+  reader: `POSITION_MARK` elements with `Type="0"` and both a `Start` and
+  `End` attribute become loops; the rest become hot cues (`Num >= 0`, giving
+  the pad 0–7) or memory cues (`Num` negative/absent). `TEMPO` elements
+  build the beat grid. Locations are `file://localhost/`-prefixed,
+  percent-encoded paths (`%20`, multibyte UTF-8 escapes included) —
+  `location_to_path()` strips the prefix, percent-decodes, and flips
+  slashes for Windows.
+- Progress reported via a `rekordbox-import-progress` event, shown next to
+  the button; the result notification reports tracks matched vs. total,
+  how many source entries weren't found on disk, and any per-track errors.
+- The [Waveform](src/components/Waveform.tsx) component now accepts
+  optional `cues`/`durationSecs` props and draws memory cues, hot cues (with
+  Rekordbox's default pad colors when the XML has none), and loop regions
+  as an overlay, positioned by `positionSecs / durationSecs`. Genre Mode's
+  waveform strip in [TrackTable.tsx](src/components/TrackTable.tsx) fetches
+  `get_cues_for_path` for whichever track is showing (cached per path,
+  keyed off the same `anchorPath` the strip already tracks) and passes the
+  result straight through.
+- 5 Rust tests (4 passing, 1 `#[ignore]`d real-data test): percent-decoding
+  (plain and multibyte UTF-8), a full parse of a real trimmed XML excerpt
+  with cues/hot cues/a loop, and a SQL round trip confirming cues survive a
+  path change under the same fingerprint but don't match a different one.
+
+**Validated against the user's real `rekordbox.xml`** (145 KB, 89 `TRACK`
+entries): parsed all 89 entries; 88/89 found on disk (one file — `Kye
+Gibbon - Saving My Life.flac` — correctly reported missing); of the 88
+found, 85 had memory cues, 86 had hot cues, 46 had loops, and all 89 had
+tempo/beat-grid data.
+
+**Not built:** ANLZ `.DAT`/`.EXT` sidecar parsing (mentioned as a maybe in
+the original roadmap item) — `rekordbox.xml` already carries every cue type
+tested against real data, so the extra analysis-file format wasn't needed.
+Writing cues back out to Rekordbox/Serato/Traktor remains explicitly
+out of scope, as planned.
+
 ## Roadmap — v0.9 → v1.0
 
 Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34);
-v0.9 F6 (item 35) is done — F4 and F5 remain. Ordered by release. Each item
-notes the suspected cause where the code has already been read, so the fix
-doesn't start from zero.
+v0.9 F5 and F6 (items 35–36) are done — only F4 remains. Ordered by
+release. Each item notes the suspected cause where the code has already
+been read, so the fix doesn't start from zero.
 
 ---
 
@@ -851,17 +899,7 @@ Paste a YouTube Music playlist URL. The app:
 4. flags ambiguous matches for manual confirmation rather than guessing — an
    80 % match asks, it never silently accepts
 
-### F5. Rekordbox cue import
-Read **memory cues, hot cues, beat grid and BPM** from Rekordbox — via
-`rekordbox.xml` (the supported export path) and, where present, the ANLZ
-`.DAT`/`.EXT` analysis files beside the tracks. Drawn over the F3 waveform.
-Stored in the app's own sidecar database keyed by **fingerprint, not path**, so
-cues survive renames and moves.
-
-Longer-term goal: a neutral cue model that can be written back out to Rekordbox
-/ Serato / Traktor so a library survives switching software. **This release only
-reads and preserves — no writing back.**
-
+### F5. Rekordbox cue import — done, see item 36
 ---
 
 # v1.0 — Accounts, pricing, payments
