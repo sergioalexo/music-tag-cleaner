@@ -7,3 +7,4 @@ pub mod components;
 pub mod duplicates;
 pub mod files;
 pub mod rekordbox_import;
+pub mod ytmusic;

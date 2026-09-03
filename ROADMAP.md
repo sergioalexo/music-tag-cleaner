@@ -872,34 +872,95 @@ tested against real data, so the extra analysis-file format wasn't needed.
 Writing cues back out to Rekordbox/Serato/Traktor remains explicitly
 out of scope, as planned.
 
-## Roadmap — v0.9 → v1.0
+### 37. YouTube Music playlist → Rekordbox — v0.9 F4
+New **YT Music Import** page: paste a YouTube Music (or plain YouTube)
+playlist URL, fetch its track list via `yt-dlp` (metadata only — nothing is
+ever downloaded), match it against the loaded collection, and export a
+Rekordbox playlist. Via the new
+[ytmusic.rs](src-tauri/src/commands/ytmusic.rs),
+[ytMatch.ts](src/lib/ytMatch.ts) and
+[rekordboxExport.ts](src/lib/rekordboxExport.ts).
 
-Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34);
-v0.9 F5 and F6 (items 35–36) are done — only F4 remains. Ordered by
-release. Each item notes the suspected cause where the code has already
-been read, so the fix doesn't start from zero.
+- **yt-dlp is treated as an optional external tool**, the same pattern
+  `components.rs` already uses for Ollama: `ytdlp_info` detects it (a
+  bundled copy in the app's own data dir first, then anywhere on `PATH`,
+  so a system-wide install via pip/a package manager is picked up too),
+  `install_ytdlp` downloads the standalone GitHub-release binary straight
+  into the app's data dir if it's missing — no installer, no PATH changes.
+- **One request per playlist, not one per track:** `fetch_ytmusic_playlist`
+  runs a single `yt-dlp -J --flat-playlist` call. This was a real design
+  decision, not an assumption — empirical testing against real playlists
+  during development (see below) found that per-video fields like
+  `track`/`artist`/`album` come back empty even for videos on an artist's
+  own official channel in this yt-dlp version, so a slower per-video fetch
+  wouldn't have reliably bought more accuracy anyway. The flat call reliably
+  returns `id`, `title` and `duration` for every entry, which is what the
+  matching step is actually built around.
+- **Matching works from title text and duration, not structured fields**
+  (`ytMatch.ts`): each entry's title is split on an "Artist - Title"-style
+  separator (falling back to the uploading channel, minus a trailing
+  " - Topic", as an artist signal when there's no separator to split on),
+  then scored against every loaded track's tags via a normalized Levenshtein
+  similarity — diacritic-folded the same way `sanitizeForFilenameStrict`
+  does, with common clutter like "(Official Video)"/"(Lyrics)"/"[HD]"
+  stripped first. A second scoring pass compares the *whole* cleaned title
+  against the tag's combined "artist title" text, so a video title with no
+  separator at all (surprisingly common — see below) isn't unfairly
+  penalized for being compared only against the tag's title field; the
+  better of the two scores wins. Duration closeness (within 2s counts full
+  weight, tapering to zero past 15s) contributes a smaller share.
+- **Three-tier result, matching the roadmap's "an 80% match asks, it never
+  silently accepts":** ≥90% auto-matches, 55–90% is flagged "Confirm" with
+  its best candidate shown (one click to accept, or pick a different track
+  from the whole collection via the existing `Combobox`), below 55% is
+  "Missing". Any resolved row (matched or confirmed) can be marked missing
+  instead, and any decision can be reset back to automatic.
+- Each entry links back to its YouTube Music page (`openUrl`); missing
+  entries can be copied to the clipboard as a plain title list for a
+  hand-off to Media Fetch, satisfying the roadmap's third list without a
+  separate tab — the single results table already shows the full source
+  playlist in its original order.
+- **Export, not a new Rust surface:** both `.m3u8` and Rekordbox-XML export
+  are built as plain strings in `rekordboxExport.ts` from data already in
+  memory (loaded tags/files) and written via the existing generic
+  `write_text_file` command — no new file-writing Rust code needed. The XML
+  follows the same TRACK-attribute/NODE-Type schema `rekordbox_import.rs`
+  (item 36) already reads back correctly, and `Location` is built as the
+  exact inverse of that module's `location_to_path()`.
+- 6 Rust unit tests for the flat-playlist JSON parsing (entries-wrapper and
+  single-video shapes, `null` entries for removed/private videos, entries
+  missing an `id`, an empty playlist, the `uploader`/`channel` fallback)
+  plus one `#[ignore]`d real-network test.
 
----
+**Validated against real YouTube data before writing the matching logic**,
+not just fixtures: fetched a real channel's uploads playlist through both
+`youtube.com` and `music.youtube.com` URLs for the same list ID (confirming
+both domains route through yt-dlp's same extractor) and inspected several
+real "official" video/track pages directly. This is what showed
+`track`/`artist`/`album` aren't reliably populated even for legitimate
+official-channel uploads — including Rick Astley's and The Weeknd's own
+"Official Video" uploads — which is why the matching step leans on the
+title/duration heuristic above rather than assuming those fields exist. The
+real-network Rust test (`real_playlist_fetch_smoke_test`) was also run for
+real (not left unverified) against a live playlist and confirmed the exact
+JSON shape `parse_playlist_json` expects.
 
-# v0.9 — Library features
+**Not built / unverified:** the Rekordbox-XML export path matches the
+documented schema and what this app's own importer (item 36) reads back
+correctly, but — unlike that importer — it hasn't been round-tripped
+through a real Rekordbox install (none available in the dev environment);
+treat a first import as unverified until it's been tried once. Fingerprint
+confirmation for near-miss matches (mentioned as an option in the original
+roadmap item) wasn't built — title+duration scoring already resolves
+real playlists cleanly enough in testing that the extra fingerprinting
+pass didn't look worth the cost.
 
-### F4. YouTube Music playlist → Rekordbox
-Paste a YouTube Music playlist URL. The app:
+## Roadmap — v1.0
 
-1. fetches the playlist's entries (title / artist / duration / album)
-2. matches each against the collection — normalized artist+title first, then
-   fuzzy scoring with duration as tiebreaker, then optional fingerprint
-   confirmation for near-misses
-3. returns three lists:
-   - **Matched** → exported as a Rekordbox playlist (`.m3u8` **and** rekordbox
-     XML), in the playlist's original order
-   - **Missing** → the tracks not in the collection, as a copyable list, with a
-     hand-off to Media Fetch for downloading
-   - **The source playlist** itself, with links back to each YouTube Music entry
-4. flags ambiguous matches for manual confirmation rather than guessing — an
-   80 % match asks, it never silently accepts
+v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
+accounts, pricing and payments — and is a product/business decision as much
+as an engineering one; none of it has been started.
 
-### F5. Rekordbox cue import — done, see item 36
 ---
 
 # v1.0 — Accounts, pricing, payments

@@ -346,6 +346,28 @@ export interface ImportResult {
   errors: string[];
 }
 
+// v0.9 F4 — YouTube Music playlist import. Matches the camelCase structs in
+// `src-tauri/src/commands/ytmusic.rs`.
+export interface YtDlpInfo {
+  installed: boolean;
+  path?: string | null;
+  version?: string | null;
+}
+
+export interface PlaylistEntry {
+  index: number;
+  videoId: string;
+  url: string;
+  title: string;
+  durationSecs?: number | null;
+  uploader?: string | null;
+}
+
+export interface PlaylistFetchResult {
+  title: string;
+  entries: PlaylistEntry[];
+}
+
 export function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }

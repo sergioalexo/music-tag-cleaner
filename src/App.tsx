@@ -24,6 +24,7 @@ import { useTags } from "./hooks/useTags";
 import { ComponentsPage } from "./pages/ComponentsPage";
 import { LibraryPage } from "./pages/LibraryPage";
 import { DuplicatesPage } from "./pages/DuplicatesPage";
+import { YtMusicImportPage } from "./pages/YtMusicImportPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { LogsPage } from "./pages/LogsPage";
 import {
@@ -1487,6 +1488,16 @@ export default function App() {
               tags={libraryTags}
               notify={notify}
               onDelete={deleteDuplicateFiles}
+              onInspect={(path) => {
+                const file = filesApi.files.find((f) => f.path === path);
+                if (file) inspect(file);
+              }}
+            />
+          ) : page === "ytmusic" ? (
+            <YtMusicImportPage
+              files={filesApi.files}
+              tags={libraryTags}
+              notify={notify}
               onInspect={(path) => {
                 const file = filesApi.files.find((f) => f.path === path);
                 if (file) inspect(file);

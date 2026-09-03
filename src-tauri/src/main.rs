@@ -111,6 +111,9 @@ fn main() {
             commands::backup_archive::read_backup_manifest,
             commands::rekordbox_import::import_rekordbox_cues,
             commands::rekordbox_import::get_cues_for_path,
+            commands::ytmusic::ytdlp_info,
+            commands::ytmusic::install_ytdlp,
+            commands::ytmusic::fetch_ytmusic_playlist,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");

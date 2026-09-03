@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner"
-version = "0.9.1"
+version = "0.9.2"
 description = "Strip audio tags to the essentials and clean them up with AI"
 edition = "2021"
 
