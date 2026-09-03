@@ -3,6 +3,7 @@ import {
   Archive,
   Braces,
   Eraser,
+  FileArchive,
   FilePlus2,
   FolderOpen,
   GitCompare,
@@ -94,6 +95,7 @@ interface Props {
   onRenameGenre: (oldName: string, newName: string) => void;
   onBackup: () => void;
   onRestore: () => void;
+  onBackupArchive: () => void;
   onEditField: (paths: string[], field: keyof TagData & string, value: string) => void;
   onEditRawField: (paths: string[], rawKey: string, value: string) => void;
   onEditRating: (paths: string[], stars: number) => void;
@@ -150,6 +152,7 @@ export function LibraryPage({
   onRenameGenre,
   onBackup,
   onRestore,
+  onBackupArchive,
   onEditField,
   onEditRawField,
   onEditRating,
@@ -403,6 +406,20 @@ export function LibraryPage({
           >
             <Undo2 />
             Restore{backupCount > 0 ? ` (${backupCount})` : ""}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onBackupArchive}
+            disabled={busy || filesApi.files.length === 0}
+            title={
+              selectedCount > 0
+                ? `Save ${selectedCount} selected file(s) as a single uncompressed .zip you move somewhere safe`
+                : "Save the whole loaded collection as a single uncompressed .zip you move somewhere safe"
+            }
+          >
+            <FileArchive />
+            Backup Archive
           </Button>
 
           <span className="mx-1 h-6 w-px bg-border" />

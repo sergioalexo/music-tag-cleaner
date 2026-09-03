@@ -783,11 +783,53 @@ comparison stage, ~278s instead of ~1170s): **35 groups, exactly the 6 false
 positives gone, every remaining score ≤3.14** — no new omissions or false
 positives introduced.
 
+### 35. Simple backup archive — v0.9 F6
+New **Backup Archive** button in the Library toolbar (distinct from the
+existing tag-level "Backup"/"Restore" — this one archives whole *files*,
+not tag snapshots): picks the ticked selection, or the whole loaded
+collection if nothing's ticked, and writes a single **store-only ZIP**
+(`CompressionMethod::Stored` — audio doesn't compress, and storing keeps it
+fast and byte-exact) via the new [backup_archive.rs](src-tauri/src/commands/backup_archive.rs).
+
+- A size estimate (from the already-loaded `AudioFile.size` values, no new
+  Rust command needed) is shown in the confirm dialog before anything runs.
+- The generated filename follows the planned pattern exactly:
+  `MusicTagCleaner-backup-2026-09-02-1432-412-tracks.zip`; the user still
+  picks the destination folder via the native save dialog.
+- Progress reported via a `backup-archive-progress` event (the same
+  `AppHandle::emit` pattern used elsewhere), shown in the existing status
+  bar progress UI rather than new UI.
+- Each entry is stored at a collision-proof path derived from the file's
+  original absolute path (`C:\Users\x\Music\a.mp3` → `C/Users/x/Music/a.mp3`
+  inside the zip) rather than flattened by filename, so two same-named files
+  from different folders never collide and the original layout is
+  recoverable.
+- A `manifest.json` is written as the last entry, listing every file's
+  original path, its path inside the archive, size, and a blake3 hash (the
+  same hashing already used for exact-duplicate detection) — enough to
+  verify or restore the archive later without opening every audio file. A
+  `read_backup_manifest` command can read it back out of an existing zip
+  without extracting anything else, though no frontend UI calls it yet
+  (see below).
+- On success, `revealItemInDir` (the frontend `@tauri-apps/plugin-opener`
+  API — not previously used, only `openUrl` was) highlights the finished
+  file in Explorer.
+- Three Rust tests: the path-to-entry-name conversion (both backslash and
+  forward-slash inputs), and a full round trip that writes a real archive,
+  reads it back, and checks the stored bytes are byte-identical, the
+  compression method is genuinely `Stored`, and the manifest parses with
+  the right track count.
+
+**Not built:** no UI to browse/verify an existing backup's manifest (the
+`read_backup_manifest` command exists but nothing calls it yet) — left for
+if it turns out to be needed, rather than built speculatively now.
+
 ## Roadmap — v0.9 → v1.0
 
-Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34).
-Ordered by release. Each item notes the suspected cause where the code has
-already been read, so the fix doesn't start from zero.
+Planning only from here on. v0.6, v0.7 and v0.8 are complete (items 1–34);
+v0.9 F6 (item 35) is done — F4 and F5 remain. Ordered by release. Each item
+notes the suspected cause where the code has already been read, so the fix
+doesn't start from zero.
 
 ---
 
@@ -819,20 +861,6 @@ cues survive renames and moves.
 Longer-term goal: a neutral cue model that can be written back out to Rekordbox
 / Serato / Traktor so a library survives switching software. **This release only
 reads and preserves — no writing back.**
-
-### F6. Simple backup archive
-Deliberately minimal: pick the selection or the whole collection → produce a
-**store-only ZIP** (compression level 0 — audio doesn't compress, and storing
-keeps it fast and byte-exact) with a generated name:
-
-```
-MusicTagCleaner-backup-2026-09-02-1432-412-tracks.zip
-```
-
-Size estimate before starting, progress bar during, reveal in Explorer when
-done. A small `manifest.json` inside lists paths, sizes and hashes so the
-archive can be verified later. No scheduling, no incremental logic, no cloud —
-the user moves the file somewhere safe themselves.
 
 ---
 

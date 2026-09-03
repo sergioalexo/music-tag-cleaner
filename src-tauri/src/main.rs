@@ -107,6 +107,8 @@ fn main() {
             commands::components::delete_model,
             commands::duplicates::scan_duplicates,
             commands::duplicates::get_waveform,
+            commands::backup_archive::create_backup_archive,
+            commands::backup_archive::read_backup_manifest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");

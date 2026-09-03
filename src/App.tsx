@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { Upload, X } from "lucide-react";
@@ -913,6 +914,60 @@ export default function App() {
     return removed > 0;
   };
 
+  /**
+   * Simple backup archive (v0.9 F6): a store-only ZIP of the selection (or
+   * the whole loaded collection if nothing is ticked) with a generated
+   * name, a size estimate up front, and a manifest inside for later
+   * verification. The user picks where it goes and moves it somewhere safe
+   * themselves — no scheduling, no cloud, no incremental logic.
+   */
+  const runBackupArchive = async () => {
+    const paths = filesApi.selectedPaths.length ? filesApi.selectedPaths : filesApi.files.map((f) => f.path);
+    if (!paths.length) return notify("No files loaded", "info");
+    const totalBytes = paths.reduce(
+      (sum, p) => sum + (filesApi.files.find((f) => f.path === p)?.size ?? 0),
+      0,
+    );
+    const now = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const defaultName = `MusicTagCleaner-backup-${stamp}-${paths.length}-tracks.zip`;
+
+    const ok = await confirm(
+      `Archive ${paths.length} file${paths.length === 1 ? "" : "s"} (${formatBytes(totalBytes)}, uncompressed) into a single ZIP?`,
+      { title: "Backup Archive", kind: "info" },
+    );
+    if (!ok) return;
+
+    const dest = await saveDialog({
+      title: "Save Backup Archive",
+      defaultPath: defaultName,
+      filters: [{ name: "ZIP Archive", extensions: ["zip"] }],
+    });
+    if (!dest) return;
+
+    setBusy(true);
+    setProgress({ done: 0, total: paths.length, label: `Archiving 0 of ${paths.length}` });
+    const unlisten = await listen<{ done: number; total: number }>("backup-archive-progress", (e) =>
+      setProgress({
+        done: e.payload.done,
+        total: e.payload.total,
+        label: `Archiving ${e.payload.done} of ${e.payload.total}`,
+      }),
+    );
+    try {
+      await invoke("create_backup_archive", { paths, destPath: dest });
+      notify(`Backup archive saved (${paths.length} tracks, ${formatBytes(totalBytes)})`, "success");
+      await revealItemInDir(dest);
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      unlisten();
+      setProgress(null);
+      setBusy(false);
+    }
+  };
+
   const setCoverArt = async (file: AudioFile) => {
     const picked = await open({
       title: "Choose Artwork",
@@ -1406,6 +1461,7 @@ export default function App() {
               onRenameGenre={renameGenreInPreset}
               onBackup={withTrack("backup", runBackup)}
               onRestore={withTrack("restore", restoreBackup)}
+              onBackupArchive={withTrack("backupArchive", runBackupArchive)}
               onEditField={editField}
               onEditRawField={editRawField}
               onEditRating={editRating}
