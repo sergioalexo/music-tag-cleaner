@@ -958,8 +958,55 @@ pass didn't look worth the cost.
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
-accounts, pricing and payments — and is a product/business decision as much
-as an engineering one; none of it has been started.
+accounts, pricing and payments.
+
+**2026-09-03 — architecture decided.** Four forks in P1–P3 were resolved:
+
+- **Backend: Path A**, the managed stack — Supabase Auth + Postgres, a thin
+  Edge Function layer for entitlements/usage/webhooks, no custom-built auth
+  server. Full plan and the rejected Path B (custom Rust/Node backend) are
+  in the [Accounts & Pricing Plan](https://claude.ai/code/artifact/123d03a8-c826-41c8-b91e-92c6d2ae44fa) artifact.
+- **Payments: Paddle**, as merchant of record, over Lemon Squeezy or Stripe.
+- **Scope: Music Tag Cleaner first.** The Forgexus account ships here; the
+  API is designed so Media Fetch can plug into the same backend later
+  without a rework, but it doesn't have to launch alongside this.
+- **Timing: starting now**, beginning with Phase 0 below.
+
+The schema this implies is already in the repo:
+[supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql)
+(`entitlements`, `usage_counters`, `devices`, RLS policies restricting the
+desktop app's own client to reading its own rows — every write goes through
+a service-role Edge Function).
+
+### Phase 0 — setup (you, not code)
+Nothing below needs Claude; these are accounts and settings only Sergio can
+create. Once they exist, Phase 1 (the Edge Functions) and Phase 2 (the
+Rust `commands/account.rs` + Settings UI) get built and *validated against
+the real endpoints*, the same way F4/F5 this session were validated against
+a real playlist and a real `rekordbox.xml` rather than shipped on fixtures
+alone.
+
+1. Create a Supabase project (suggest naming the org **Forgexus**). Note
+   the project URL and anon public key once it exists — both are meant to
+   be embedded in the app, safe to share here.
+2. Authentication → Providers: enable email/password and magic-link at
+   minimum; add Google OAuth if wanted.
+3. Authentication → URL Configuration → Redirect URLs: add
+   `musictagcleaner://auth-callback`. Confirm that custom URL scheme
+   doesn't collide with anything Media Fetch already registers.
+4. Run `supabase/migrations/0001_init.sql` against the new project (SQL
+   editor, or `supabase db push` via the CLI) once it exists.
+5. Create a Paddle account, Paddle Billing (not Classic). Set up the
+   subscription products from P2 below — Pro ($8/mo, $60/yr) and Studio
+   ($18/mo, $150/yr) — and the one-time Lifetime product ($180) if it's
+   launching in this same window rather than as a later promo.
+6. Confirm the P2 tier names/prices and the P2 feature-to-tier table stand
+   as written, or flag what should change before checkout UI gets built
+   around specific numbers.
+
+Paddle's webhook endpoint (step 5's missing piece — pointed at the
+`paddle-webhook` Edge Function) gets wired up in Phase 1, once that
+function exists to point it at.
 
 ---
 
