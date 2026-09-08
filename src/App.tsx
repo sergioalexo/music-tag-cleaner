@@ -932,7 +932,9 @@ export default function App() {
     // radius is bigger and less obviously intentional.
     const isPartialSelection = files.length < filesApi.files.length;
     if (!isPartialSelection) {
-      const pattern = settings.strictFilenames ? "artist-title-id" : "artist - title - id";
+      const pattern = settings.strictFilenames
+        ? "Artist - Title - id (accents folded, punctuation removed)"
+        : "Artist - Title - id";
       const ok = await confirm(
         `Rename ${files.length} file${files.length === 1 ? "" : "s"} to "${pattern}"? ` +
           "Original tags are not affected.",

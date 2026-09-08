@@ -39,7 +39,7 @@ function stripTitleNoise(title: string): string {
 }
 
 /** Folds a string down for comparison: diacritics stripped (NFKD, same
- * approach as `sanitizeForFilenameStrict` in standardize.ts), lowercased,
+ * same NFKD approach the filename sanitizers use), lowercased,
  * punctuation collapsed to spaces, whitespace normalized. */
 export function normalizeForMatch(value: string): string {
   const folded = value.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase();

@@ -1069,7 +1069,7 @@ export function SettingsPage({
           </Row>
           <Row
             label="Strict file names"
-            hint='Rename to Standard uses only a-z, 0-9 and "-" — e.g. "beyonce-halo-000123" instead of "Beyoncé - Halo - 000123"'
+            hint='Rename to Standard folds accents away and drops punctuation, keeping letters, numbers and spaces — e.g. "Beyonce - Halo - 000123" instead of "Beyoncé - Halo! - 000123". Cyrillic (Russian/Ukrainian) is kept as written.'
           >
             <Toggle
               checked={settings.strictFilenames}

@@ -1153,6 +1153,35 @@ and `longtask` never fire and `setTimeout` is throttled to ~1/s (a mock with a
 per-file delay looks exactly like a hang), and Tauri v2 delivers events through
 `__TAURI_INTERNALS__.runCallback(id, …)`, not `window[_id]`.
 
+### 41. Readable strict file names, Cyrillic kept — v0.11.2
+
+Strict mode forced everything down to `a-z0-9-`, so "Beyoncé - Halo (Radio
+Edit)" became `beyonce-halo-radio-edit` and any Cyrillic title was erased
+outright. It now keeps letters, numbers and spaces, folds accented Latin to
+ASCII, turns punctuation into spaces, and upper-cases the first letter. Both
+modes lay out as `Artist - Title - id`; strict differs only in folding accents
+and dropping punctuation. The tag's own casing is preserved rather than
+title-cased, so "The Weeknd" stays as written and the user's Standardize
+capitalization choice still applies.
+
+Cyrillic (Russian and Ukrainian) passes through unchanged. The subtlety worth
+remembering: the accent folding is NFKD decomposition, which splits **й** into
+`и` + a combining breve and **ё** into `е` + a diaeresis — folding the whole
+string would have silently rewritten those letters, corrupting names rather
+than dropping them. So each character is classified first (`\p{Script=Cyrillic}`,
+which also covers Ukrainian і ї є ґ and Belarusian ў) and only non-Cyrillic
+characters are folded. Other non-Latin scripts still come out empty; there is
+no transliteration to fall back on.
+
+Settings' hint and the Rename to Standard confirmation both described the old
+`beyonce-halo-000123` shape and were updated.
+
+**Verification:** the real `sanitizeForFilenameStrict`/`buildRenameStem` run
+over accented Latin, punctuation, lowercase tags, `AC/DC`, Russian (Ляпис,
+Ёлка, Май, Соловей, Йогурт), Ukrainian (Океан Ельзи, Їжак і Ґудзик Є, Воплі
+Відоплясова), Japanese and empty input — with an explicit check that й and ё
+survive as themselves.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

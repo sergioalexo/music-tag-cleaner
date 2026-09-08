@@ -27,6 +27,9 @@ export const ALLOWED_DESCRIPTION = "letters, numbers, spaces, - ' ( )";
  */
 export const DEFAULT_FLAG_EXTRA_CHARS = "()";
 
+/** Cyrillic letters (А-Я, а-я, ё, and the Ukrainian/Belarusian extras). */
+const CYRILLIC = /\p{Script=Cyrillic}/u;
+
 /** Escapes regex metacharacters so a literal string can be used in a RegExp. */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -183,28 +186,46 @@ export function sanitizeForFilename(value: string): string {
 }
 
 /**
- * Strict filename mode: ASCII-folds accented Latin letters (é → e, ñ → n, ü
- * → u, …) via Unicode NFKD decomposition, then forces the result down to
- * exactly `a-z`, `0-9` and `-` — the only characters guaranteed safe across
- * every filesystem, OS and DJ tool. Anything else (spaces, punctuation, and
- * — this can't attempt real script transliteration — any non-Latin
- * character) becomes a dash; runs of dashes collapse to one and the ends
- * are trimmed.
+ * Strict filename mode: keeps letters, numbers and spaces, folding accented
+ * Latin letters down to plain ASCII (é → e, ñ → n, ü → u, …). Punctuation and
+ * symbols become spaces, and runs of spaces collapse.
+ *
+ * Spaces and capitals are deliberately kept: the point of strict mode is that
+ * every character is safe on any filesystem and DJ tool, not that the name is
+ * hard to read. The tag's own casing carries through — it is usually already
+ * correct ("The Weeknd") and respects whatever the user chose under
+ * Standardize — with the first letter upper-cased so an all-lowercase tag
+ * still reads as a name.
+ *
+ * Cyrillic is passed through unchanged rather than dropped, so Russian and
+ * Ukrainian titles keep their names. That has to happen *before* the accent
+ * folding: NFKD decomposition splits "й" into "и" + a combining breve and "ё"
+ * into "е" + a diaeresis, so folding the whole string would quietly rewrite
+ * those letters. Each character is classified first, and only non-Cyrillic
+ * ones are folded.
  */
 export function sanitizeForFilenameStrict(value: string): string {
-  const folded = value
-    .normalize("NFKD")
-    // Strip the combining diacritical marks NFKD split off (U+0300-U+036F).
-    .replace(/[̀-ͯ]/g, "")
-    .toLowerCase();
-  return folded.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const out = [...value.normalize("NFC")]
+    .map((ch) => {
+      if (CYRILLIC.test(ch)) return ch;
+      // Fold this character to ASCII: NFKD splits an accented letter into its
+      // base plus combining marks (U+0300-U+036F), which are then dropped.
+      const folded = ch.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+      // Anything with no ASCII letter/digit left (punctuation, symbols, other
+      // scripts) becomes a space, so words don't run together.
+      return folded.replace(/[^A-Za-z0-9]/g, "") || " ";
+    })
+    .join("");
+  const cleaned = collapseSpaces(out);
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
 /**
- * Builds the standard rename stem from tag values: "artist - title - uid"
- * normally, or "artist-title-uid" (fully lowercase, dash-only) when `strict`
- * is set. Empty parts are dropped, so a missing artist or uid doesn't leave
- * a stray separator.
+ * Builds the standard rename stem from tag values: "Artist - Title - uid".
+ * `strict` folds each part down to plain ASCII (see
+ * `sanitizeForFilenameStrict`); the layout is the same either way. Empty
+ * parts are dropped, so a missing artist or uid doesn't leave a stray
+ * separator.
  */
 export function buildRenameStem(
   artist: string | undefined,
@@ -216,7 +237,9 @@ export function buildRenameStem(
   const parts = [artist, title, uid]
     .map((p) => sanitize((p ?? "").trim()))
     .filter((p) => p.length > 0);
-  return parts.join(strict ? "-" : " - ");
+  // Both modes read the same way now that strict keeps spaces; they differ
+  // only in strict folding everything down to plain ASCII.
+  return parts.join(" - ");
 }
 
 /**
