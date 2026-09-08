@@ -233,7 +233,6 @@ export interface Settings {
   ollamaModel: string;
   batchSize: number;
   backupBeforeChanges: boolean;
-  stripToCommon: boolean;
   preserveCoverArt: boolean;
   /** "Standardize Art" downscales the longest side of embedded cover art to this many px. */
   artworkMaxDim: number;
@@ -306,7 +305,7 @@ export const TRANSLITERATE_SCRIPTS = [
   { id: "Chinese/Japanese/Korean", label: "Chinese / Japanese / Korean", hint: "" },
 ] as const;
 
-export type PreviewMode = "strip" | "ai" | "standardize" | "genre" | "clear" | "history";
+export type PreviewMode = "ai" | "standardize" | "genre" | "clear" | "history";
 
 /** Fields the Clear Fields action can target. */
 export const CLEARABLE_FIELDS = [

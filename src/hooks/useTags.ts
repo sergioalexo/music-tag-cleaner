@@ -1,8 +1,8 @@
 import { useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   basename,
-  FIELD_LABELS,
   KEPT_FIELD_KEYS,
   type AudioFile,
   type PendingChange,
@@ -17,26 +17,63 @@ function backupArg(s: Settings): string | null {
   return s.searchableBackup ? s.backupField : null;
 }
 
+/** One file's worth of work for `write_tags_batch`. */
+interface WriteItem {
+  path: string;
+  tags: TagData;
+  keepExtra: string[];
+}
+
+/** Per-file outcome of a batch write; `error` is null on success. */
+interface WriteResult {
+  path: string;
+  error: string | null;
+}
+
 /**
- * Builds the argument object for the `write_tags` command. Every call site goes
- * through here: the keys must match write_tags' Rust parameter names exactly,
- * and a mismatched optional key (e.g. `backupField`) deserializes to None
- * rather than erroring, which silently disables the searchable backup.
+ * Writes every item in one `write_tags_batch` call.
+ *
+ * Doing this file-by-file from here meant an IPC round trip *and* a React
+ * re-render per file, which on a big selection cost far more than the writes
+ * themselves — applying a preview to ~850 tracks took over ten minutes, of
+ * which only about a minute was actual disk work. One call, parallelised on
+ * the Rust side, with progress arriving as throttled events instead.
+ *
+ * Callers must pass at most one item per path: two writes to the same file
+ * would run on different threads and one would overwrite the other.
+ *
+ * The keys below must match `write_tags_batch`'s Rust parameter names exactly:
+ * a mismatched optional key (e.g. `backupField`) deserializes to None rather
+ * than erroring, which would silently disable the searchable backup.
  */
-function writeTagsArgs(
-  path: string,
-  tags: TagData,
-  settings: Settings,
-  keepExtra: string[],
-): Record<string, unknown> {
-  return {
-    path,
-    tags,
+async function writeBatch(items: WriteItem[], settings: Settings): Promise<ApplyResult> {
+  if (!items.length) return { written: 0, errors: [] };
+  const results = await invoke<WriteResult[]>("write_tags_batch", {
+    items,
     backup: settings.backupBeforeChanges,
-    keepExtra,
     preserveArt: settings.preserveCoverArt,
     backupField: backupArg(settings),
-  };
+  });
+  const errors = results
+    .filter((r) => r.error)
+    .map((r) => `${basename(r.path)}: ${r.error}`);
+  return { written: results.length - errors.length, errors };
+}
+
+/** Subscribes to the batch writers' progress events for the duration of `run`. */
+async function withWriteProgress<T>(
+  onProgress: Progress | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  if (!onProgress) return run();
+  const unlisten = await listen<{ done: number; total: number }>("write-progress", (e) =>
+    onProgress(e.payload.done, e.payload.total),
+  );
+  try {
+    return await run();
+  } finally {
+    unlisten();
+  }
 }
 
 export interface ApplyResult {
@@ -48,7 +85,12 @@ export interface ApplyResult {
 
 export type Progress = (done: number, total: number) => void;
 
-const DISPLAY_FIELDS = Object.keys(FIELD_LABELS) as (keyof TagData & string)[];
+/**
+ * Files per chunk for the stoppable batch writers (Backup / Restore). Small
+ * enough that Stop feels immediate and the progress bar keeps moving, large
+ * enough that the per-call overhead disappears.
+ */
+const WRITE_CHUNK = 32;
 
 /** Fields the Standardize action transforms. */
 export const STANDARDIZE_FIELDS = ["title", "artist", "album", "albumArtist"] as const;
@@ -71,6 +113,37 @@ function preserveExtras(tags: TagData): string[] {
 export function useTags() {
   const stopRef = useRef(false);
 
+  /**
+   * Runs `write` over `paths` a chunk at a time. Each chunk is written in
+   * parallel on the Rust side; the chunking exists so the Stop button stays
+   * responsive (checked between chunks) and so progress still moves — a
+   * single call over the whole selection would do neither.
+   */
+  const runInChunks = async (
+    paths: string[],
+    onProgress: Progress | undefined,
+    write: (chunk: string[]) => Promise<WriteResult[]>,
+  ): Promise<ApplyResult> => {
+    stopRef.current = false;
+    let written = 0;
+    const errors: string[] = [];
+    onProgress?.(0, paths.length);
+    for (let i = 0; i < paths.length; i += WRITE_CHUNK) {
+      if (stopRef.current) return { written, errors, stopped: true };
+      const chunk = paths.slice(i, i + WRITE_CHUNK);
+      try {
+        for (const r of await write(chunk)) {
+          if (r.error) errors.push(`${basename(r.path)}: ${r.error}`);
+          else written++;
+        }
+      } catch (e) {
+        errors.push(String(e));
+      }
+      onProgress?.(Math.min(i + chunk.length, paths.length), paths.length);
+    }
+    return { written, errors };
+  };
+
   const read = async (paths: string[]) => {
     const results = await invoke<TagReadResult[]>("read_tags_batch", { paths });
     const map: Record<string, TagData> = {};
@@ -80,44 +153,6 @@ export function useTags() {
       else errors.push(`${basename(r.path)}: ${r.error ?? "could not read tags"}`);
     }
     return { map, errors };
-  };
-
-  /** Rows for the strip preview: kept fields (unchanged) + extras to remove. */
-  const buildStripPreview = (map: Record<string, TagData>): PendingChange[] => {
-    const rows: PendingChange[] = [];
-    for (const [path, tags] of Object.entries(map)) {
-      const filename = basename(path);
-      for (const field of DISPLAY_FIELDS) {
-        const value = (tags[field] as string | undefined) ?? "";
-        if (!value) continue;
-        rows.push({
-          id: `${path}::keep::${field}`,
-          path,
-          filename,
-          field,
-          before: value,
-          after: value,
-          include: false,
-          changed: false,
-          kind: "update",
-        });
-      }
-      for (const [key, value] of Object.entries(tags.allFields)) {
-        if (KEPT_FIELD_KEYS.has(key)) continue;
-        rows.push({
-          id: `${path}::remove::${key}`,
-          path,
-          filename,
-          field: key,
-          before: value,
-          after: "(removed)",
-          include: true,
-          changed: true,
-          kind: "remove",
-        });
-      }
-    }
-    return rows;
   };
 
   /** Rows for the Clear Fields preview: empties each chosen field. */
@@ -196,56 +231,19 @@ export function useTags() {
   };
 
   /**
-   * Writes the strip result. Unchecked removal rows are passed to the
-   * backend as keepExtra so those fields survive.
-   */
-  const applyStrip = async (
-    rows: PendingChange[],
-    map: Record<string, TagData>,
-    settings: Settings,
-    onProgress?: Progress,
-  ): Promise<ApplyResult> => {
-    let written = 0;
-    const errors: string[] = [];
-    const groups = groupByPath(rows);
-    let done = 0;
-    for (const [path, fileRows] of groups) {
-      done++;
-      onProgress?.(done, groups.size);
-      const tags = map[path];
-      if (!tags) continue;
-      const removals = fileRows.filter((r) => r.kind === "remove");
-      if (!removals.some((r) => r.include)) continue; // nothing to strip for this file
-      const keepExtra = removals.filter((r) => !r.include).map((r) => r.field);
-      try {
-        await invoke("write_tags", writeTagsArgs(path, tags, settings, keepExtra));
-        written++;
-      } catch (e) {
-        errors.push(`${basename(path)}: ${e}`);
-      }
-    }
-    return { written, errors };
-  };
-
-  /**
    * Writes included field updates (AI / standardize / clear) merged over the
-   * current tags. `keepAllExtras` forces every non-common field to survive
-   * regardless of the strip setting (used by targeted actions like Clear).
+   * current tags. Non-common fields are always carried over untouched — the
+   * only thing that removes a field is the user ticking it in Clear Fields,
+   * which arrives here as a `raw` row.
    */
   const applyUpdates = async (
     rows: PendingChange[],
     map: Record<string, TagData>,
     settings: Settings,
-    keepAllExtras = false,
     onProgress?: Progress,
   ): Promise<ApplyResult> => {
-    let written = 0;
-    const errors: string[] = [];
-    const groups = groupByPath(rows);
-    let done = 0;
-    for (const [path, fileRows] of groups) {
-      done++;
-      onProgress?.(done, groups.size);
+    const items: WriteItem[] = [];
+    for (const [path, fileRows] of groupByPath(rows)) {
       const current = map[path];
       if (!current) continue;
       const included = fileRows.filter((r) => r.changed && r.include);
@@ -256,20 +254,12 @@ export function useTags() {
         if (r.raw) clearedRaw.add(r.field);
         else (tags as unknown as Record<string, string>)[r.field] = r.after;
       }
-      // When stripping is disabled (or forced), carry every non-common field
-      // over untouched; otherwise the write also strips (per settings). Raw
-      // fields the user asked to clear are dropped from that carry-over list —
-      // an extra frame is cleared by not preserving it.
-      let keepExtra = keepAllExtras || !settings.stripToCommon ? preserveExtras(current) : [];
-      if (clearedRaw.size) keepExtra = keepExtra.filter((k) => !clearedRaw.has(k));
-      try {
-        await invoke("write_tags", writeTagsArgs(path, tags, settings, keepExtra));
-        written++;
-      } catch (e) {
-        errors.push(`${basename(path)}: ${e}`);
-      }
+      // Carry every non-common field over, minus the raw frames the user
+      // asked to clear — an extra frame is cleared by not preserving it.
+      const keepExtra = preserveExtras(current).filter((k) => !clearedRaw.has(k));
+      items.push({ path, tags, keepExtra });
     }
-    return { written, errors };
+    return withWriteProgress(onProgress, () => writeBatch(items, settings));
   };
 
   /** Inline edit of a single field; preserves all other tags untouched. */
@@ -280,8 +270,55 @@ export function useTags() {
     value: string | number,
     settings: Settings,
   ): Promise<void> => {
-    const tags = { ...current, [field]: value } as TagData;
-    await invoke("write_tags", writeTagsArgs(path, tags, settings, preserveExtras(current)));
+    const result = await updateFieldMany([{ path, current, field, value }], settings);
+    if (result.errors.length) throw new Error(result.errors[0]);
+  };
+
+  /**
+   * The same edit applied to many files in one batch write — used by every
+   * bulk path (multi-select cell edit, ratings, undo/redo replay), which
+   * would otherwise be one round trip per file.
+   */
+  const updateFieldMany = async (
+    edits: {
+      path: string;
+      current: TagData;
+      field: keyof TagData & string;
+      value: string | number;
+    }[],
+    settings: Settings,
+  ): Promise<ApplyResult> =>
+    writeBatch(
+      edits.map(({ path, current, field, value }) => ({
+        path,
+        tags: { ...current, [field]: value } as TagData,
+        keepExtra: preserveExtras(current),
+      })),
+      settings,
+    );
+
+  /**
+   * Writes pre-built tag objects, one per file. Use this when several fields
+   * of the same file change together — passing that file twice through
+   * `updateFieldMany` would queue two parallel writes to one path.
+   */
+  const updateFieldsMany = async (
+    writes: { path: string; tags: TagData }[],
+    settings: Settings,
+  ): Promise<ApplyResult> =>
+    writeBatch(
+      writes.map(({ path, tags }) => ({ path, tags, keepExtra: preserveExtras(tags) })),
+      settings,
+    );
+
+  /** Bulk edit (or, with an empty value, removal) of a raw "All Tags" field. */
+  const updateRawFieldMany = async (
+    edits: { path: string; fieldKey: string; value: string }[],
+  ): Promise<ApplyResult> => {
+    if (!edits.length) return { written: 0, errors: [] };
+    const results = await invoke<WriteResult[]>("write_raw_fields_batch", { items: edits });
+    const errors = results.filter((r) => r.error).map((r) => `${basename(r.path)}: ${r.error}`);
+    return { written: results.length - errors.length, errors };
   };
 
   /**
@@ -297,21 +334,19 @@ export function useTags() {
     settings: Settings,
   ): Promise<ApplyResult & { assigned: number; nextId: number }> => {
     let counter = settings.nextTrackId;
-    let written = 0;
-    const errors: string[] = [];
-    for (const path of paths) {
-      const current = map[path];
-      if (!current) continue;
-      const id = formatTrackId(counter, settings.trackIdDigits);
-      try {
-        await updateField(path, current, "trackId", id, settings);
-        written++;
-        counter++;
-      } catch (e) {
-        errors.push(`${basename(path)}: ${e}`);
-      }
-    }
-    return { written, assigned: written, errors, nextId: counter };
+    const edits = paths
+      .filter((path) => map[path])
+      .map((path) => ({
+        path,
+        current: map[path],
+        field: "trackId" as keyof TagData & string,
+        value: formatTrackId(counter++, settings.trackIdDigits),
+      }));
+    const result = await updateFieldMany(edits, settings);
+    // The counter advances past every id handed out, including any whose write
+    // failed — an id is never reused, so a retry can't collide with a file that
+    // did get written.
+    return { ...result, assigned: result.written, nextId: counter };
   };
 
   /**
@@ -328,6 +363,8 @@ export function useTags() {
     let written = 0;
     const errors: string[] = [];
     const mapping: Record<string, AudioFile> = {};
+    /** [old path, new path] for each successful rename, resolved in one go below. */
+    const renamed: [string, string][] = [];
     for (const file of files) {
       const tags = map[file.path];
       if (!tags) continue;
@@ -338,12 +375,23 @@ export function useTags() {
         continue;
       }
       try {
-        const newPath = await invoke<string>("rename_file", { path: file.path, newStem: stem });
-        const [updated] = await invoke<AudioFile[]>("list_files", { paths: [newPath] });
-        if (updated) mapping[file.path] = updated;
+        // Renames stay sequential: the backend resolves collisions by
+        // appending " (2)", which only works if it sees one rename at a time.
+        renamed.push([file.path, await invoke<string>("rename_file", { path: file.path, newStem: stem })]);
         written++;
       } catch (e) {
         errors.push(`${file.filename}: ${e}`);
+      }
+    }
+    // One list_files call for every renamed file rather than one per file.
+    if (renamed.length) {
+      const updated = await invoke<AudioFile[]>("list_files", {
+        paths: renamed.map(([, newPath]) => newPath),
+      });
+      const byPath = new Map(updated.map((f) => [f.path, f]));
+      for (const [oldPath, newPath] of renamed) {
+        const info = byPath.get(newPath);
+        if (info) mapping[oldPath] = info;
       }
     }
     return { written, errors, mapping };
@@ -361,42 +409,18 @@ export function useTags() {
     settings: Settings,
     onProgress?: Progress,
   ): Promise<ApplyResult> => {
-    stopRef.current = false;
-    let written = 0;
-    const errors: string[] = [];
-    onProgress?.(0, paths.length);
-    for (let i = 0; i < paths.length; i++) {
-      if (stopRef.current) return { written, errors, stopped: true };
-      const path = paths[i];
-      try {
-        await invoke("backup_file", { path, backupField: settings.backupField });
-        written++;
-      } catch (e) {
-        errors.push(`${basename(path)}: ${e}`);
-      }
-      onProgress?.(i + 1, paths.length);
-    }
-    return { written, errors };
+    return runInChunks(paths, onProgress, (chunk) =>
+      invoke<WriteResult[]>("backup_files_batch", {
+        paths: chunk,
+        backupField: settings.backupField,
+      }),
+    );
   };
 
-  const restore = async (paths: string[], onProgress?: Progress): Promise<ApplyResult> => {
-    stopRef.current = false;
-    let written = 0;
-    const errors: string[] = [];
-    onProgress?.(0, paths.length);
-    for (let i = 0; i < paths.length; i++) {
-      if (stopRef.current) return { written, errors, stopped: true };
-      const path = paths[i];
-      try {
-        await invoke("restore_from_backup", { path });
-        written++;
-      } catch (e) {
-        errors.push(`${basename(path)}: ${e}`);
-      }
-      onProgress?.(i + 1, paths.length);
-    }
-    return { written, errors };
-  };
+  const restore = async (paths: string[], onProgress?: Progress): Promise<ApplyResult> =>
+    runInChunks(paths, onProgress, (chunk) =>
+      invoke<WriteResult[]>("restore_from_backup_batch", { paths: chunk }),
+    );
 
   /** Requests the in-progress backup/restore run to stop after the current file. */
   const stopBackup = () => {
@@ -405,12 +429,13 @@ export function useTags() {
 
   return {
     read,
-    buildStripPreview,
     buildStandardizePreview,
     buildClearPreview,
-    applyStrip,
     applyUpdates,
     updateField,
+    updateFieldMany,
+    updateFieldsMany,
+    updateRawFieldMany,
     generateIds,
     renameFiles,
     backupSelected,

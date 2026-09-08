@@ -124,3 +124,59 @@ pub struct GenreResult {
     pub index: u32,
     pub genre: Option<String>,
 }
+
+/// One file's table thumbnail, as returned by `read_cover_thumbnails`.
+/// `data_url` is `None` both for "no embedded art" and for an unreadable
+/// file — the table draws the same placeholder either way, and a per-file
+/// error here would only produce a toast storm on a large library.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverThumbnail {
+    pub path: String,
+    pub data_url: Option<String>,
+}
+
+/// One file's artwork metadata, as returned by `image_info_batch`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageInfoResult {
+    pub path: String,
+    pub info: Option<ImageInfo>,
+}
+
+/// One file's worth of work for `write_tags_batch`. The flags that are the
+/// same for every file in a run (backup, art preservation, backup field) are
+/// passed once on the command itself rather than repeated per item.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteTagsItem {
+    pub path: String,
+    pub tags: TagData,
+    /// Canonical key names of non-common fields to carry over untouched.
+    pub keep_extra: Vec<String>,
+}
+
+/// One file's worth of work for `write_raw_fields_batch`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteRawFieldItem {
+    pub path: String,
+    pub field_key: String,
+    pub value: String,
+}
+
+/// Outcome of one file in a batch write. `error` is `None` on success.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteResult {
+    pub path: String,
+    pub error: Option<String>,
+}
+
+/// Progress payload for the `write-progress` event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteProgress {
+    pub done: usize,
+    pub total: usize,
+}

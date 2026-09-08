@@ -47,9 +47,7 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
       <div className="flex items-center justify-between border-b px-4 py-3">
         <div>
           <h2 className="text-sm font-semibold">
-            {mode === "strip"
-              ? "Preview — Tag Strip"
-              : mode === "ai"
+            {mode === "ai"
                 ? "Preview — AI Cleanup"
                 : mode === "genre"
                   ? "Preview — Genre Match"

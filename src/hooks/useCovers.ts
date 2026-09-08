@@ -6,12 +6,29 @@ import type { AudioFile } from "../types";
 const THUMB_SIZE = 128;
 
 /**
- * Lazily loads small cover-art thumbnails for the given files, one at a time to
- * keep the UI responsive, and caches them by path. Thumbnails (not the full
- * embedded art) so a few hundred files cost ~1 MB of base64 rather than
- * hundreds; state is flushed in batches so the table re-renders ~20× fewer
- * times. A null cache entry means "loaded, no art"; undefined means "not yet
- * loaded".
+ * How many files one `read_cover_thumbnails` call covers. The backend fans a
+ * batch out across several threads, so a bigger chunk is faster; a smaller one
+ * paints sooner and loses less work when the loop is cancelled (a file list
+ * change restarts it). This is the compromise.
+ */
+const CHUNK = 48;
+
+interface CoverThumbnail {
+  path: string;
+  dataUrl: string | null;
+}
+
+/**
+ * Lazily loads small cover-art thumbnails for the given files and caches them
+ * by path. Thumbnails (not the full embedded art) so a few hundred files cost
+ * ~1 MB of base64 rather than hundreds. A null cache entry means "loaded, no
+ * art"; undefined means "not yet loaded".
+ *
+ * Files are fetched a chunk at a time rather than one by one: each thumbnail
+ * costs a tag parse plus an image decode/resize/encode, so the old per-file
+ * round trip made opening a large folder take tens of seconds of visibly
+ * empty artwork cells. One call per chunk also means the table re-renders
+ * once per chunk instead of once per 20 files.
  */
 export function useCovers(files: AudioFile[]) {
   const [covers, setCovers] = useState<Record<string, string | null>>({});
@@ -23,30 +40,31 @@ export function useCovers(files: AudioFile[]) {
 
   useEffect(() => {
     let cancelled = false;
-    const queue = files.filter((f) => !(f.path in coversRef.current));
+    const queue = files.filter((f) => !(f.path in coversRef.current)).map((f) => f.path);
     if (queue.length === 0) return;
 
     (async () => {
-      let batch: Record<string, string | null> = {};
-      const flush = () => {
-        if (cancelled || !Object.keys(batch).length) return;
-        const pending = batch;
-        batch = {};
-        setCovers((prev) => ({ ...prev, ...pending }));
-      };
-      for (let i = 0; i < queue.length; i++) {
+      for (let i = 0; i < queue.length; i += CHUNK) {
         if (cancelled) return;
+        const chunk = queue.slice(i, i + CHUNK);
+        let results: CoverThumbnail[];
         try {
-          batch[queue[i].path] = await invoke<string | null>("read_cover_thumbnail", {
-            path: queue[i].path,
+          results = await invoke<CoverThumbnail[]>("read_cover_thumbnails", {
+            paths: chunk,
             size: THUMB_SIZE,
           });
         } catch {
-          batch[queue[i].path] = null;
+          // Cache the whole chunk as "no art" so a hard failure can't put the
+          // loader into a refetch loop on every re-render.
+          results = chunk.map((path) => ({ path, dataUrl: null }));
         }
-        if ((i + 1) % 20 === 0) flush();
+        if (cancelled) return;
+        setCovers((prev) => {
+          const next = { ...prev };
+          for (const r of results) next[r.path] = r.dataUrl;
+          return next;
+        });
       }
-      flush();
     })();
 
     return () => {

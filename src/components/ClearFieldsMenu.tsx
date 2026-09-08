@@ -72,6 +72,7 @@ export function ClearFieldsMenu({ selected, rawKeys, disabled, backupFieldKey, o
           .join(", ");
 
   const rawOptions = rawKeys.map((k) => RAW_PREFIX + k);
+  const allRawChecked = rawOptions.length > 0 && rawOptions.every((k) => draft.includes(k));
 
   return (
     <div ref={wrapRef} className="relative inline-flex">
@@ -119,9 +120,20 @@ export function ClearFieldsMenu({ selected, rawKeys, disabled, backupFieldKey, o
 
             {rawOptions.length > 0 && (
               <>
-                <p className="px-2 pb-1 pt-2 text-xs font-medium text-muted-foreground">
-                  Other tags on the selection
-                </p>
+                <div className="flex items-baseline justify-between gap-2 px-2 pb-1 pt-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    Other tags on the selection ({rawOptions.length})
+                  </p>
+                  {/* One click to tick every extra frame — this is what the old
+                      Clean Tags button did, except here you can see and unpick
+                      exactly what is about to go. */}
+                  <button
+                    className="shrink-0 text-xs text-primary hover:underline"
+                    onClick={() => setDraft((d) => (allRawChecked ? d.filter((k) => !k.startsWith(RAW_PREFIX)) : [...new Set([...d, ...rawOptions])]))}
+                  >
+                    {allRawChecked ? "None" : "All"}
+                  </button>
+                </div>
                 <div className="max-h-48 overflow-y-auto">
                   {rawOptions.map((k) => (
                     <Option

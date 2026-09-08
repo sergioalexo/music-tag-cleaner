@@ -1029,6 +1029,67 @@ title + Track ID carry over when run with ffmpeg on PATH. [App-level end-to-end
 verification against the real library is the remaining step — see the plan's
 verification section.]
 
+### 39. Load/write performance, Clean Tags retired — v0.11
+
+**Problem.** Applying a preview to a real selection (848 tracks) took over ten
+minutes. Benchmarking the write itself on copies of 40 real tracks (1.1 GB)
+showed only **62 ms/file** — about 53 s for the whole run. The rest was
+overhead: `applyStrip`/`applyUpdates` did one `invoke` **and** one React
+re-render per file, so 848 files meant ~1,700 IPC round trips and 848 full
+re-renders of an 848-row table.
+
+**Batched writes.** New commands `files::write_tags_batch`,
+`files::write_raw_fields_batch`, `files::backup_files_batch` and
+`backup::restore_from_backup_batch` write across `par_map`'s threads and report
+progress through a throttled `write-progress` event (~50 per run, not one per
+file). Every bulk path now goes through them — Apply, multi-select cell edits,
+ratings, Generate IDs, Unify IDs, undo/redo replay, Backup, Restore. Backup and
+Restore go in chunks of 32 so their Stop button stays responsive; the others
+send the whole run in one call. Measured in the UI on 848 files: **2 IPC calls
+instead of ~1,700**, and the parallel write is 22 ms/file — roughly
+**10 min → ~20 s**, nearly all of it now real disk work.
+
+`writeBatch` requires **at most one item per path**: two writes to one file
+would land on different threads and one would be lost. `useHistory` folds every
+change for a file into a single write for exactly this reason (an entry of
+"4,240 changes across 848 files" issues 848 writes, verified).
+
+**Load speed.** `read_cover_thumbnails` / `image_info_batch` replace the
+one-file-at-a-time thumbnail loaders (96 files: 1.18 s → 366 ms of compute, 96
+round trips → 2). `file_info` now parses with `ParseOptions::read_cover_art(false)`
+— it only ever wanted duration/bitrate/backup presence, and was pulling every
+track's embedded JPEG into memory (300 files: 287 ms → 126 ms; verified
+byte-identical properties and text tags across 391 real files). The table's tag
+read is chunked at 200 files so a big folder paints its first rows immediately.
+Non-Library pages and the three dialogs are `React.lazy` chunks prefetched on
+idle (launch bundle 405 kB → 181 kB app + 142 kB React), and the startup
+`ffmpeg_info` probe moved to that same idle window.
+
+**Clean Tags removed** (user request — Clear Fields does the same job, visibly).
+Gone: the toolbar button, `runCleanTags`, `buildStripPreview`, `applyStrip`, the
+`"strip"` preview mode and its branch of the dedicated preview table. The
+**"Strip to common tags only"** setting went with it (settings **v6**): it also
+silently dropped every non-common frame on each AI Clean / Standardize / Genre
+apply, which is the same bulk removal, just invisible. Nothing removes a tag
+field now except an explicit Clear Fields run. Clear Fields' dropdown gained an
+**All / None** shortcut for the raw-frame group, so the old one-click behaviour
+is still one click — but previewed and unpickable per field.
+
+Verified that "All Tags" really does surface everything: on 590 files from the
+real library, `all_fields` contained every text item of every tag — no file had
+a second tag hiding fields and no field was binary-only.
+
+**Also:** `artworkMaxDim` default 1000 → **600 px**; the v6 migration moves
+existing settings to 600 only if they were still on the old default. Undo/redo
+extracted from `App.tsx` (1,922 lines) into
+[useHistory.ts](src/hooks/useHistory.ts).
+
+**Verification.** `tsc`, `cargo clippy` and all 41 Rust tests clean. The UI was
+driven end-to-end against a mocked Tauri IPC with 848 files: load, all five lazy
+pages, Clear Fields → Apply → Undo → Redo (call counts and toasts as above),
+"All Tags" columns, and the Settings changes. The packaged app was not launched —
+worth a Clear Fields run on a small folder before a large one.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

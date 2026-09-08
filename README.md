@@ -10,11 +10,12 @@ hands you the same prompt to paste into any AI you already use.
 
 - **Select Folder / Add Files** — native pickers; supports `.mp3`, `.flac`,
   `.ogg`, `.aac`, `.m4a`, `.wav`, `.aiff`
-- **Clean Tags** — strips every tag field except Title, Artist, Album,
-  Album Artist, Track/Disc Number, Year, Genre, Comment, and embedded cover
-  art. Everything else (TXXX, PRIV, MusicBrainz IDs, replaygain, encoder info,
-  …) is deleted. Before/after preview with per-field checkboxes; nothing is
-  written until you confirm.
+- **Clear Fields** — erases exactly the fields you tick. The dropdown lists the
+  common fields plus every extra frame actually present on the selection (TXXX,
+  PRIV, MusicBrainz IDs, replaygain, encoder info, …), with an **All** shortcut
+  to tick every extra at once. Before/after preview with per-cell checkboxes;
+  nothing is written until you confirm, and nothing is ever removed that you
+  did not pick.
 - **AI Clean** — sends the tags to a local Ollama model that removes featured
   artists / legal names from the artist field, strips `(Radio Edit)`-style
   title suffixes, corrects the year to the original release, and normalizes

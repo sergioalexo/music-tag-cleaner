@@ -7,10 +7,14 @@ use lofty::config::WriteOptions;
 use lofty::file::AudioFile as _;
 use lofty::prelude::*;
 use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+use tauri::Emitter;
 use walkdir::WalkDir;
 
 use crate::commands::backup::{find_backup_in_file, make_backup_string, BACKUP_KEY};
-use crate::models::{AudioFile, ImageInfo, TagData, TagReadResult};
+use crate::models::{
+    AudioFile, CoverThumbnail, ImageInfo, ImageInfoResult, TagData, TagReadResult,
+    WriteProgress, WriteRawFieldItem, WriteResult, WriteTagsItem,
+};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
 
@@ -47,7 +51,7 @@ where
 /// independent file read + decode, so a folder scan or a batch tag read of a
 /// few hundred files is otherwise a multi-second sequential stall. Small
 /// inputs stay single-threaded to avoid the spawn overhead.
-fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     const MAX_THREADS: usize = 8;
     if items.len() <= 16 {
         return items.iter().map(&f).collect();
@@ -93,9 +97,29 @@ fn is_audio(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Parses a file's tags without pulling its embedded artwork into memory.
+///
+/// Cover art is by far the largest thing in a typical music file's tag — often
+/// hundreds of kilobytes per track — and the callers here only ever look at
+/// text fields and audio properties. Skipping it makes scanning a folder
+/// dramatically cheaper in both I/O and allocation.
+fn read_without_pictures(path: &Path) -> Option<lofty::file::TaggedFile> {
+    use lofty::config::ParseOptions;
+    use lofty::probe::Probe;
+
+    // Mirrors what `lofty::read_from_path` does (open, then read), with cover
+    // art switched off — deliberately no extra content sniffing, so a file
+    // that parses one way here parses the same way everywhere else.
+    Probe::open(path)
+        .ok()?
+        .options(ParseOptions::new().read_cover_art(false))
+        .read()
+        .ok()
+}
+
 fn file_info(path: &Path) -> AudioFile {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let tagged = lofty::read_from_path(path).ok();
+    let tagged = read_without_pictures(path);
     let has_backup = tagged
         .as_ref()
         .map(|t| find_backup_in_file(t).is_some())
@@ -535,6 +559,112 @@ pub(crate) fn write_tags_blocking(
         .map_err(|e| e.to_string())
 }
 
+/// Writes many files in one call, across `par_map`'s threads.
+///
+/// The per-file `write_tags` command is still there for one-off edits, but
+/// applying a preview to a whole library through it meant one IPC round trip
+/// *and* one React re-render per file — which dominated the actual write work
+/// by an order of magnitude. This does the whole run in a single call and
+/// reports progress through the `write-progress` event instead, throttled so a
+/// 1000-file run emits ~50 events rather than 1000.
+///
+/// Every file reports its own error, so one locked or read-only file never
+/// fails the rest of the batch. Results come back in input order.
+#[tauri::command]
+pub async fn write_tags_batch(
+    app: tauri::AppHandle,
+    items: Vec<WriteTagsItem>,
+    backup: bool,
+    preserve_art: bool,
+    backup_field: Option<String>,
+) -> Vec<WriteResult> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fallback: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+    let total = items.len();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let done = AtomicUsize::new(0);
+        // Report ~50 times over the run, never more often than every file.
+        let step = (total / 50).max(1);
+        par_map(&items, |item| {
+            let result = write_tags_blocking(
+                &item.path,
+                item.tags.clone(),
+                backup,
+                item.keep_extra.clone(),
+                preserve_art,
+                backup_field.clone(),
+            );
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % step == 0 || n == total {
+                let _ = app.emit("write-progress", WriteProgress { done: n, total });
+            }
+            WriteResult {
+                path: item.path.clone(),
+                error: result.err(),
+            }
+        })
+    })
+    .await;
+
+    joined.unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| WriteResult {
+                path,
+                error: Some("Writing tags failed unexpectedly".to_string()),
+            })
+            .collect()
+    })
+}
+
+/// `write_raw_field` for many files at once — same batching rationale as
+/// `write_tags_batch`, used by bulk edits of an "All Tags" column.
+#[tauri::command]
+pub async fn write_raw_fields_batch(items: Vec<WriteRawFieldItem>) -> Vec<WriteResult> {
+    let fallback: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        par_map(&items, |item| WriteResult {
+            path: item.path.clone(),
+            error: write_raw_field_blocking(&item.path, &item.field_key, &item.value).err(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| WriteResult {
+                path,
+                error: Some("Writing tags failed unexpectedly".to_string()),
+            })
+            .collect()
+    })
+}
+
+/// `backup_file` for a chunk of files at once. The caller keeps sending
+/// chunks so its Stop button stays responsive between them; within a chunk the
+/// files are written in parallel.
+#[tauri::command]
+pub async fn backup_files_batch(paths: Vec<String>, backup_field: String) -> Vec<WriteResult> {
+    let fallback = paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        par_map(&paths, |p| WriteResult {
+            path: p.clone(),
+            error: backup_file_blocking(p, &backup_field).err(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| WriteResult {
+                path,
+                error: Some("Backing up failed unexpectedly".to_string()),
+            })
+            .collect()
+    })
+}
+
 /// Writes (or, when `value` is empty, completely removes) a raw tag field
 /// identified by its `key_name()` display string — the same name shown in
 /// the "All Tags" view. Matches against the tag's existing items rather than
@@ -669,34 +799,66 @@ fn read_cover_art_blocking(path: &str) -> Result<Option<String>, String> {
 /// base64 and freeze the UI. `size` is the longest side in px (clamped 16–512).
 #[tauri::command]
 pub async fn read_cover_thumbnail(path: String, size: u32) -> Result<Option<String>, String> {
-    run_blocking(move || {
-        use base64::Engine;
-        use image::GenericImageView;
+    run_blocking(move || read_cover_thumbnail_blocking(&path, size)).await
+}
 
-        let size = size.clamp(16, 512);
-        let tagged = lofty::read_from_path(&path).map_err(|e| e.to_string())?;
-        let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-            return Ok(None);
-        };
-        let Some(pic) = tag.pictures().first() else {
-            return Ok(None);
-        };
-        let img = image::load_from_memory(pic.data()).map_err(|e| e.to_string())?;
-        let thumb = if img.dimensions().0.max(img.dimensions().1) > size {
-            img.resize(size, size, image::imageops::FilterType::Triangle)
-        } else {
-            img
-        };
-        let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 78)
-            .encode_image(&thumb.to_rgb8())
-            .map_err(|e| e.to_string())?;
-        Ok(Some(format!(
-            "data:image/jpeg;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(&out)
-        )))
+fn read_cover_thumbnail_blocking(path: &str, size: u32) -> Result<Option<String>, String> {
+    use base64::Engine;
+    use image::GenericImageView;
+
+    let size = size.clamp(16, 512);
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return Ok(None);
+    };
+    let Some(pic) = tag.pictures().first() else {
+        return Ok(None);
+    };
+    let img = image::load_from_memory(pic.data()).map_err(|e| e.to_string())?;
+    let thumb = if img.dimensions().0.max(img.dimensions().1) > size {
+        img.resize(size, size, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 78)
+        .encode_image(&thumb.to_rgb8())
+        .map_err(|e| e.to_string())?;
+    Ok(Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&out)
+    )))
+}
+
+/// Thumbnails for many files in one call, decoded across `par_map`'s threads.
+///
+/// The table needs a thumbnail for every row, and doing that one file at a
+/// time — a full IPC round trip per file, each costing a tag parse plus an
+/// image decode/resize/encode — was the single slowest thing about opening a
+/// large folder. Batching turns N round trips into N/chunk, and each chunk
+/// fans out over several threads.
+///
+/// Always returns exactly one entry per input path, in order, so the caller
+/// can mark every path as "loaded" and never re-request it.
+#[tauri::command]
+pub async fn read_cover_thumbnails(paths: Vec<String>, size: u32) -> Vec<CoverThumbnail> {
+    let fallback = paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        par_map(&paths, |p| CoverThumbnail {
+            path: p.clone(),
+            data_url: read_cover_thumbnail_blocking(p, size).ok().flatten(),
+        })
     })
     .await
+    .unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| CoverThumbnail {
+                path,
+                data_url: None,
+            })
+            .collect()
+    })
 }
 
 /// Returns byte size, pixel dimensions, and mime type of the first embedded
@@ -705,6 +867,27 @@ pub async fn read_cover_thumbnail(path: String, size: u32) -> Result<Option<Stri
 #[tauri::command]
 pub async fn image_info(path: String) -> Result<Option<ImageInfo>, String> {
     run_blocking(move || image_info_blocking(&path)).await
+}
+
+/// Artwork metadata for many files in one call — the `image_info` equivalent
+/// of `read_cover_thumbnails`, and used the same way by the Artwork column.
+/// Always returns one entry per input path, in order.
+#[tauri::command]
+pub async fn image_info_batch(paths: Vec<String>) -> Vec<ImageInfoResult> {
+    let fallback = paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        par_map(&paths, |p| ImageInfoResult {
+            path: p.clone(),
+            info: image_info_blocking(p).ok().flatten(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| ImageInfoResult { path, info: None })
+            .collect()
+    })
 }
 
 fn image_info_blocking(path: &str) -> Result<Option<ImageInfo>, String> {

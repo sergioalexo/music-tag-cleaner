@@ -71,6 +71,29 @@ pub async fn restore_from_backup(path: String) -> Result<(), String> {
     crate::commands::files::run_blocking(move || restore_from_backup_blocking(&path)).await
 }
 
+/// `restore_from_backup` for a chunk of files at once — see
+/// `backup_files_batch` for why this takes chunks rather than the whole run.
+#[tauri::command]
+pub async fn restore_from_backup_batch(paths: Vec<String>) -> Vec<crate::models::WriteResult> {
+    let fallback = paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::commands::files::par_map(&paths, |p| crate::models::WriteResult {
+            path: p.clone(),
+            error: restore_from_backup_blocking(p).err(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        fallback
+            .into_iter()
+            .map(|path| crate::models::WriteResult {
+                path,
+                error: Some("Restoring failed unexpectedly".to_string()),
+            })
+            .collect()
+    })
+}
+
 fn restore_from_backup_blocking(path: &str) -> Result<(), String> {
     let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let backup =

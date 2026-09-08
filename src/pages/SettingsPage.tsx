@@ -631,9 +631,6 @@ export function SettingsPage({
               </select>
             </Row>
           )}
-          <Row label="Strip to common tags only">
-            <Toggle checked={settings.stripToCommon} onChange={(v) => set("stripToCommon", v)} />
-          </Row>
           <Row label="Preserve embedded cover art">
             <Toggle
               checked={settings.preserveCoverArt}

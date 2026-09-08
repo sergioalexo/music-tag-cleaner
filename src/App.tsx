@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -8,27 +8,19 @@ import { Upload, X } from "lucide-react";
 
 import { Sidebar, type Page } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
-import {
-  ManualAIDialog,
-  type ManualMode,
-  type ManualResults,
-} from "./components/ManualAIDialog";
-import { ConvertDialog, type ConvertOptions } from "./components/ConvertDialog";
-import { UnifyDialog, type UnifyGroup } from "./components/UnifyDialog";
+import type { ManualMode, ManualResults } from "./components/ManualAIDialog";
+import type { ConvertOptions } from "./components/ConvertDialog";
+import type { UnifyGroup } from "./components/UnifyDialog";
 import { Card, cn } from "./components/ui";
 import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
 import { useImageInfo } from "./hooks/useImageInfo";
 import { useAnalytics } from "./hooks/useAnalytics";
 import { useFiles } from "./hooks/useFiles";
+import { useHistory, type HistoryChange } from "./hooks/useHistory";
 import { useSettings } from "./hooks/useSettings";
 import { useTags } from "./hooks/useTags";
-import { ComponentsPage } from "./pages/ComponentsPage";
 import { LibraryPage } from "./pages/LibraryPage";
-import { DuplicatesPage } from "./pages/DuplicatesPage";
-import { YtMusicImportPage } from "./pages/YtMusicImportPage";
-import { SettingsPage } from "./pages/SettingsPage";
-import { LogsPage } from "./pages/LogsPage";
 import {
   applyCapitalization,
   applyReplacements,
@@ -54,6 +46,46 @@ import {
   type TagData,
 } from "./types";
 
+/**
+ * Everything that isn't the Library page — the app's landing screen — is split
+ * into its own chunk so the initial bundle the webview parses at launch stays
+ * small. `prefetchSecondaryChunks` pulls them in once the app is idle, so the
+ * first click on Settings or Duplicates is still instant.
+ */
+const ComponentsPage = lazy(() =>
+  import("./pages/ComponentsPage").then((m) => ({ default: m.ComponentsPage })),
+);
+const DuplicatesPage = lazy(() =>
+  import("./pages/DuplicatesPage").then((m) => ({ default: m.DuplicatesPage })),
+);
+const YtMusicImportPage = lazy(() =>
+  import("./pages/YtMusicImportPage").then((m) => ({ default: m.YtMusicImportPage })),
+);
+const SettingsPage = lazy(() =>
+  import("./pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+);
+const LogsPage = lazy(() => import("./pages/LogsPage").then((m) => ({ default: m.LogsPage })));
+const ManualAIDialog = lazy(() =>
+  import("./components/ManualAIDialog").then((m) => ({ default: m.ManualAIDialog })),
+);
+const ConvertDialog = lazy(() =>
+  import("./components/ConvertDialog").then((m) => ({ default: m.ConvertDialog })),
+);
+const UnifyDialog = lazy(() =>
+  import("./components/UnifyDialog").then((m) => ({ default: m.UnifyDialog })),
+);
+
+function prefetchSecondaryChunks() {
+  void import("./pages/SettingsPage");
+  void import("./pages/DuplicatesPage");
+  void import("./pages/LogsPage");
+  void import("./pages/ComponentsPage");
+  void import("./pages/YtMusicImportPage");
+  void import("./components/ManualAIDialog");
+  void import("./components/ConvertDialog");
+  void import("./components/UnifyDialog");
+}
+
 interface Toast {
   id: number;
   message: string;
@@ -69,19 +101,8 @@ export interface LogEntry {
 
 const LOG_LIMIT = 500;
 
-interface HistoryChange {
-  path: string;
-  field: string;
-  before: string | number;
-  after: string | number;
-}
-
-interface HistoryEntry {
-  label: string;
-  changes: HistoryChange[];
-}
-
-const HISTORY_LIMIT = 50;
+/** Files per `read_tags_batch` call when filling the table in the background. */
+const TAG_READ_CHUNK = 200;
 
 let toastId = 0;
 
@@ -130,136 +151,31 @@ export default function App() {
     [libraryTags],
   );
   const [pending, setPending] = useState<PendingChange[] | null>(null);
-  const [previewMode, setPreviewMode] = useState<PreviewMode>("strip");
+  const [previewMode, setPreviewMode] = useState<PreviewMode>("clear");
   const [tagsMap, setTagsMap] = useState<Record<string, TagData>>({});
   const [busy, setBusy] = useState(false);
   const [aiRunning, setAiRunning] = useState(false);
   const [backupRunning, setBackupRunning] = useState(false);
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [redoStack, setRedoStack] = useState<HistoryEntry[]>([]);
-
-  const pushHistory = (entry: HistoryEntry) => {
-    if (!entry.changes.length) return;
-    setHistory((h) => [...h.slice(-(HISTORY_LIMIT - 1)), entry]);
-    setRedoStack([]);
-  };
-
-  /** Writes `before` (undo) or `after` (redo) for every change in `changes`. */
-  const applyHistoryChanges = async (changes: HistoryChange[], useAfter: boolean) => {
-    const artChanges = changes.filter((c) => c.field === "__coverArt");
-    const rawChanges = changes.filter((c) => c.field.startsWith("__raw:"));
-    const tagChanges = changes.filter((c) => c.field !== "__coverArt" && !c.field.startsWith("__raw:"));
-
-    for (const c of artChanges) {
-      const value = String(useAfter ? c.after : c.before);
-      await invoke("restore_cover_art", { path: c.path, dataUrl: value || null });
-    }
-    if (artChanges.length) invalidateCovers(artChanges.map((c) => c.path));
-
-    for (const c of rawChanges) {
-      const value = String(useAfter ? c.after : c.before);
-      await invoke("write_raw_field", { path: c.path, fieldKey: c.field.slice("__raw:".length), value });
-    }
-
-    const paths = [...new Set(tagChanges.map((c) => c.path))];
-    const { map } = await tagsApi.read(paths);
-    for (const c of tagChanges) {
-      const current = map[c.path];
-      if (!current) continue;
-      const value = useAfter ? c.after : c.before;
-      const field = c.field as keyof TagData & string;
-      const tagsForWrite = c.field === "rating" ? { ...current, rating: Number(value) } : current;
-      await tagsApi.updateField(c.path, tagsForWrite, field, value, settings);
-      (map[c.path] as unknown as Record<string, string | number>)[c.field] = value;
-    }
-  };
-
-  const undo = async () => {
-    const entry = history[history.length - 1];
-    if (!entry || busy) return;
-    setBusy(true);
-    try {
-      await applyHistoryChanges(entry.changes, false);
-      setHistory((h) => h.slice(0, -1));
-      setRedoStack((r) => [...r, entry]);
-      dropLibraryTags(entry.changes.map((c) => c.path));
-      await filesApi.refreshPaths(entry.changes.map((c) => c.path));
-      notify(`Undid: ${entry.label}`, "success");
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const redo = async () => {
-    const entry = redoStack[redoStack.length - 1];
-    if (!entry || busy) return;
-    setBusy(true);
-    try {
-      await applyHistoryChanges(entry.changes, true);
-      setRedoStack((r) => r.slice(0, -1));
-      setHistory((h) => [...h, entry]);
-      dropLibraryTags(entry.changes.map((c) => c.path));
-      await filesApi.refreshPaths(entry.changes.map((c) => c.path));
-      notify(`Redid: ${entry.label}`, "success");
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /** Full session timeline in chronological order: applied entries followed by undone-but-redoable ones. */
-  const historyTimeline = [...history, ...[...redoStack].reverse()];
-  /** Index (into historyTimeline) of the last applied entry — -1 means nothing applied. */
-  const historyIndex = history.length - 1;
-
-  /** Moves the undo/redo boundary directly to `targetIndex`, applying/reverting every entry in between in one go. */
-  const jumpToHistory = async (targetIndex: number) => {
-    if (busy || targetIndex === historyIndex) return;
-    setBusy(true);
-    try {
-      if (targetIndex < historyIndex) {
-        const toUndo = historyTimeline.slice(targetIndex + 1, historyIndex + 1).reverse();
-        for (const entry of toUndo) await applyHistoryChanges(entry.changes, false);
-      } else {
-        const toRedo = historyTimeline.slice(historyIndex + 1, targetIndex + 1);
-        for (const entry of toRedo) await applyHistoryChanges(entry.changes, true);
-      }
-      setHistory(historyTimeline.slice(0, targetIndex + 1));
-      setRedoStack([...historyTimeline.slice(targetIndex + 1)].reverse());
-      setLibraryTags({});
-      await filesApi.refresh();
-      notify(
-        targetIndex < 0 ? "Jumped to session start" : `Jumped to: ${historyTimeline[targetIndex].label}`,
-        "success",
-      );
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  };
+  const history = useHistory({
+    tagsApi,
+    settings,
+    notify,
+    busy,
+    setBusy,
+    invalidateCovers,
+    dropLibraryTags: (paths) => dropLibraryTags(paths),
+    resetLibraryTags: () => setLibraryTags({}),
+    refreshPaths: (paths) => filesApi.refreshPaths(paths),
+    refreshAll: () => filesApi.refresh(),
+  });
+  const pushHistory = history.push;
 
   /** Read-only diff of every change applied so far this session, reusing the preview table. */
   const showHistoryCompare = () => {
-    const rows: PendingChange[] = history.flatMap((entry, i) =>
-      entry.changes.map((c, j) => ({
-        id: `hist::${i}::${j}`,
-        path: c.path,
-        filename: basename(c.path),
-        field: c.field,
-        before: String(c.before),
-        after: String(c.after),
-        include: true,
-        changed: true,
-        kind: "update" as const,
-      })),
-    );
     setPreviewMode("history");
-    setPending(rows);
+    setPending(history.compareRows());
   };
+
   const [dropActive, setDropActive] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number; label: string } | null>(
     null,
@@ -292,9 +208,6 @@ export default function App() {
       setFfmpegInfo({ installed: false, managed: false });
     }
   }, []);
-  useEffect(() => {
-    void refreshFfmpeg();
-  }, [refreshFfmpeg]);
 
   const clearUnresolved = (path: string) =>
     setUnresolved((prev) => {
@@ -308,6 +221,26 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.theme === "dark");
   }, [settings.theme]);
+
+  // Warm the code-split chunks once the first paint is done, so switching
+  // pages or opening a dialog never waits on a chunk fetch. FFmpeg detection
+  // rides along: the Convert dialog needs its answer before it can render
+  // correctly, but nothing on screen at launch does, and probing it means
+  // spawning `ffmpeg -version` — work worth keeping off the startup path.
+  const warmUp = useCallback(() => {
+    prefetchSecondaryChunks();
+    void refreshFfmpeg();
+  }, [refreshFfmpeg]);
+  useEffect(() => {
+    // Called through `window` on purpose: these are Window methods and throw
+    // "Illegal invocation" when detached into a bare local.
+    if (typeof window.requestIdleCallback === "function") {
+      const handle = window.requestIdleCallback(warmUp, { timeout: 3000 });
+      return () => window.cancelIdleCallback?.(handle);
+    }
+    const timer = setTimeout(warmUp, 1200);
+    return () => clearTimeout(timer);
+  }, [warmUp]);
 
   useEffect(() => {
     if (loaded) ai.check(settings.ollamaUrl);
@@ -343,16 +276,24 @@ export default function App() {
   }, []);
 
   // Eagerly read tags for files in the list so table columns fill in.
+  // Chunked so a large folder paints its first rows in a fraction of a second
+  // instead of showing an empty table until every file has been parsed —
+  // each chunk is still parsed across several threads on the Rust side.
   useEffect(() => {
     const missing = filesApi.files.map((f) => f.path).filter((p) => !libraryTags[p]);
     if (!missing.length) return;
     let cancelled = false;
     (async () => {
-      try {
-        const { map } = await tagsApi.read(missing);
-        if (!cancelled) setLibraryTags((prev) => ({ ...prev, ...map }));
-      } catch (e) {
-        console.error("Failed to read tags for table:", e);
+      for (let i = 0; i < missing.length; i += TAG_READ_CHUNK) {
+        if (cancelled) return;
+        try {
+          const { map } = await tagsApi.read(missing.slice(i, i + TAG_READ_CHUNK));
+          if (cancelled) return;
+          setLibraryTags((prev) => ({ ...prev, ...map }));
+        } catch (e) {
+          console.error("Failed to read tags for table:", e);
+          return;
+        }
       }
     })();
     return () => {
@@ -430,28 +371,6 @@ export default function App() {
     } else {
       setLibraryTags({});
       await filesApi.refresh();
-    }
-  };
-
-  const runCleanTags = async () => {
-    const paths = filesApi.selectedPaths;
-    if (!paths.length) return notify("No files selected", "info");
-    if (!settings.stripToCommon)
-      return notify('Enable "Strip to common tags only" in Settings to use Clean Tags', "info");
-    setBusy(true);
-    try {
-      const { map, errors } = await tagsApi.read(paths);
-      errors.forEach((e) => notify(e, "error"));
-      const rows = tagsApi.buildStripPreview(map);
-      setTagsMap(map);
-      setPreviewMode("strip");
-      setPending(rows);
-      if (!rows.some((r) => r.changed))
-        notify("Nothing to strip — these files already contain only common tags", "info");
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -709,37 +628,20 @@ export default function App() {
     const onWriteProgress = (done: number, total: number) =>
       setProgress({ done, total, label: `Writing ${Math.min(done, total)} of ${total}` });
     try {
-      const result =
-        previewMode === "strip"
-          ? await tagsApi.applyStrip(pending, tagsMap, settings, onWriteProgress)
-          : await tagsApi.applyUpdates(
-              pending,
-              tagsMap,
-              settings,
-              previewMode === "clear",
-              onWriteProgress,
-            );
+      const result = await tagsApi.applyUpdates(pending, tagsMap, settings, onWriteProgress);
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(`Updated ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
-      // Strip removes arbitrary non-common fields we don't have "before" values
-      // for beyond what's shown here, so it isn't added to the undo stack —
-      // "Restore Backup" is the full-fidelity revert path for that action.
-      if (previewMode !== "strip") {
-        // Cleared raw frames stay out of history (they can't be re-created by
-        // key alone — "Restore Backup" is their revert path, as with strip);
-        // curated clears are `kind: "remove"` now, so match those too.
-        const changes = pending
-          .filter(
-            (r) =>
-              r.changed &&
-              r.include &&
-              !r.raw &&
-              (r.kind === "update" || previewMode === "clear"),
-          )
-          .map((r) => ({ path: r.path, field: r.field, before: r.before, after: r.after }));
-        pushHistory({ label: `Apply ${previewMode}`, changes });
-      }
+      // Cleared raw frames stay out of history — they can't be re-created from
+      // the key alone, so "Restore Backup" is their revert path. Curated
+      // clears are `kind: "remove"`, so match those too.
+      const changes = pending
+        .filter(
+          (r) =>
+            r.changed && r.include && !r.raw && (r.kind === "update" || previewMode === "clear"),
+        )
+        .map((r) => ({ path: r.path, field: r.field, before: r.before, after: r.after }));
+      pushHistory({ label: `Apply ${previewMode}`, changes });
       await afterWrite(affected);
       if (previewMode === "standardize" && settings.standardizeFilename && lastStandardizeTransformRef.current) {
         await renameFilenamesInPlace(affected, lastStandardizeTransformRef.current);
@@ -955,16 +857,24 @@ export default function App() {
     setBusy(true);
     try {
       const changes: HistoryChange[] = [];
+      const edits = [];
       let maxCounter = settings.nextTrackId;
+      const { map } = await tagsApi.read(
+        state.groups.flatMap((g) => g.members.filter((m) => m.changes).map((m) => m.path)),
+      );
       for (const g of state.groups) {
         const idNum = Number(g.canonicalId);
         if (g.generated && Number.isFinite(idNum)) maxCounter = Math.max(maxCounter, idNum + 1);
-        const { map } = await tagsApi.read(g.members.map((m) => m.path));
         for (const m of g.members) {
           if (!m.changes) continue;
           const current = map[m.path];
           if (!current) continue;
-          await tagsApi.updateField(m.path, current, "trackId", g.canonicalId, settings);
+          edits.push({
+            path: m.path,
+            current,
+            field: "trackId" as keyof TagData & string,
+            value: g.canonicalId,
+          });
           changes.push({
             path: m.path,
             field: "trackId",
@@ -973,6 +883,8 @@ export default function App() {
           });
         }
       }
+      const result = await tagsApi.updateFieldMany(edits, settings);
+      result.errors.forEach((e) => notify(e, "error"));
       if (changes.length) {
         setLibraryTags((prev) => {
           const next = { ...prev };
@@ -1318,15 +1230,18 @@ export default function App() {
     setBusy(true);
     try {
       const changes: HistoryChange[] = [];
+      const edits = [];
       for (const path of paths) {
         const current = libraryTags[path];
         if (!current) continue;
         const before = (current as unknown as Record<string, string | undefined>)[field] ?? "";
         if (before === value) continue;
-        await tagsApi.updateField(path, current, field, value, settings);
+        edits.push({ path, current, field, value });
         changes.push({ path, field, before, after: value });
         clearUnresolved(path);
       }
+      const result = await tagsApi.updateFieldMany(edits, settings);
+      result.errors.forEach((e) => notify(e, "error"));
       if (changes.length) {
         setLibraryTags((prev) => {
           const next = { ...prev };
@@ -1351,13 +1266,16 @@ export default function App() {
     setBusy(true);
     try {
       const changes: HistoryChange[] = [];
+      const edits = [];
       for (const path of paths) {
         const current = libraryTags[path];
         const before = current?.allFields?.[rawKey] ?? "";
         if (before === value) continue;
-        await invoke("write_raw_field", { path, fieldKey: rawKey, value });
+        edits.push({ path, fieldKey: rawKey, value });
         changes.push({ path, field: `__raw:${rawKey}`, before, after: value });
       }
+      const result = await tagsApi.updateRawFieldMany(edits);
+      result.errors.forEach((e) => notify(e, "error"));
       if (changes.length) {
         setLibraryTags((prev) => {
           const next = { ...prev };
@@ -1388,14 +1306,17 @@ export default function App() {
     setBusy(true);
     try {
       const changes: HistoryChange[] = [];
+      const edits = [];
       for (const path of paths) {
         const current = libraryTags[path];
         if (!current) continue;
         const before = current.rating ?? 0;
         if (before === stars) continue;
-        await tagsApi.updateField(path, { ...current, rating: stars }, "rating", stars, settings);
+        edits.push({ path, current: { ...current, rating: stars }, field: "rating" as const, value: stars });
         changes.push({ path, field: "rating", before, after: stars });
       }
+      const result = await tagsApi.updateFieldMany(edits, settings);
+      result.errors.forEach((e) => notify(e, "error"));
       if (changes.length) {
         setLibraryTags((prev) => {
           const next = { ...prev };
@@ -1612,14 +1533,14 @@ export default function App() {
         if (!busy) filesApi.selectFolder();
       } else if (!isEditable && matchesShortcut(e, "undo", overrides)) {
         e.preventDefault();
-        void undo();
+        void history.undo();
       } else if (!isEditable && matchesShortcut(e, "redo", overrides)) {
         e.preventDefault();
-        void redo();
+        void history.redo();
       } else if (!isEditable && e.ctrlKey && e.key.toLowerCase() === "y") {
         // Legacy secondary redo binding, not user-customizable.
         e.preventDefault();
-        void redo();
+        void history.redo();
       } else if (e.key === "Escape") {
         if (inspected) setInspected(null);
         else if (pending) setPending(null);
@@ -1645,6 +1566,7 @@ export default function App() {
           errorLogCount={logs.filter((l) => l.kind === "error").length}
         />
         <main className="relative min-w-0 flex-1 overflow-y-auto">
+          <Suspense fallback={null}>
           {page === "library" ? (
             <LibraryPage
               filesApi={filesApi}
@@ -1656,13 +1578,16 @@ export default function App() {
               aiRunning={aiRunning}
               backupRunning={backupRunning}
               onStopBackup={tagsApi.stopBackup}
-              canUndo={history.length > 0}
-              canRedo={redoStack.length > 0}
-              onUndo={withTrack("undo", undo)}
-              onRedo={withTrack("redo", redo)}
-              historyTimeline={historyTimeline.map((e) => ({ label: e.label, changeCount: e.changes.length }))}
-              historyIndex={historyIndex}
-              onJumpToHistory={jumpToHistory}
+              canUndo={history.canUndo}
+              canRedo={history.canRedo}
+              onUndo={withTrack("undo", () => void history.undo())}
+              onRedo={withTrack("redo", () => void history.redo())}
+              historyTimeline={history.timeline.map((e) => ({
+                label: e.label,
+                changeCount: e.changes.length,
+              }))}
+              historyIndex={history.index}
+              onJumpToHistory={history.jumpTo}
               onCompare={withTrack("compare", showHistoryCompare)}
               pending={pending}
               previewMode={previewMode}
@@ -1670,7 +1595,6 @@ export default function App() {
               onPendingChange={setPending}
               onApplyPending={applyPending}
               onCancelPending={() => setPending(null)}
-              onCleanTags={withTrack("cleanTags", runCleanTags)}
               onAIClean={withTrack("aiClean", runAIClean)}
               onStopAI={ai.stop}
               onStandardize={withTrack("standardize", runStandardizeRules)}
@@ -1756,6 +1680,7 @@ export default function App() {
               notify={notify}
             />
           )}
+          </Suspense>
         </main>
       </div>
 
@@ -1777,6 +1702,7 @@ export default function App() {
         </div>
       )}
 
+      <Suspense fallback={null}>
       {manual && (
         <ManualAIDialog
           mode={manual.mode}
@@ -1822,6 +1748,7 @@ export default function App() {
           onConfirm={() => void applyUnify()}
         />
       )}
+      </Suspense>
 
       {inspected && (
         <div

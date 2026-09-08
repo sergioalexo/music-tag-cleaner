@@ -10,7 +10,6 @@ import {
   Hash,
   History,
   ImageDown,
-  Paintbrush,
   RotateCcw,
   RotateCw,
   Sparkles,
@@ -82,7 +81,6 @@ interface Props {
   onPendingChange: (rows: PendingChange[]) => void;
   onApplyPending: () => void;
   onCancelPending: () => void;
-  onCleanTags: () => void;
   onAIClean: () => void;
   onStopAI: () => void;
   onStandardize: () => void;
@@ -142,7 +140,6 @@ export function LibraryPage({
   onPendingChange,
   onApplyPending,
   onCancelPending,
-  onCleanTags,
   onAIClean,
   onStopAI,
   onStandardize,
@@ -223,12 +220,10 @@ export function LibraryPage({
     return () => window.removeEventListener("mousedown", close);
   }, [historyOpen]);
 
-  // AI/Standardize/Genre/Clear previews are shown inline in the table itself.
-  // Strip keeps the dedicated table below, since it removes arbitrary custom
-  // tag fields that have no corresponding column to show a diff in.
-  // "history" is a read-only session diff and "strip" needs its own table, so
-  // neither gets the inline editable preview (or its Apply bar).
-  const inlinePreview = !!pending && previewMode !== "strip" && previewMode !== "history";
+  // Every preview is shown inline in the table itself, except "history" —
+  // a read-only session diff that gets the dedicated table below instead of
+  // the inline editable preview (and its Apply bar).
+  const inlinePreview = !!pending && previewMode !== "history";
   const changedCount = pending?.filter((r) => r.changed).length ?? 0;
   const includedCount = pending?.filter((r) => r.changed && r.include).length ?? 0;
   const fileCount = pending
@@ -249,7 +244,7 @@ export function LibraryPage({
         <div className="min-w-0">
           <h1 className="text-xl font-bold">Library</h1>
           <p className="truncate text-sm text-muted-foreground" title={lastFolder}>
-            {lastFolder || "Strip messy tags, then let AI clean the rest"}
+            {lastFolder || "Tidy messy tags, then let AI clean the rest"}
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -441,10 +436,6 @@ export function LibraryPage({
 
           <span className="mx-1 h-6 w-px bg-border" />
 
-          <Button variant="secondary" onClick={onCleanTags} disabled={noSel}>
-            <Paintbrush />
-            Clean Tags
-          </Button>
           {aiRunning ? (
             <Button variant="destructive" onClick={onStopAI}>
               <StopCircle />
@@ -585,7 +576,7 @@ export function LibraryPage({
           onWidthChange={(w) => onSaveSettings({ ...settings, sidebarWidth: w })}
           onCollapsedChange={(c) => onSaveSettings({ ...settings, sidebarCollapsed: c })}
         />
-        {pending && (previewMode === "strip" || previewMode === "history") ? (
+        {pending && previewMode === "history" ? (
           <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
             <PreviewTable
               rows={pending}

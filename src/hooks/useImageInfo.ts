@@ -9,11 +9,20 @@ export interface ImageInfo {
   height: number;
 }
 
+/** Files per `image_info_batch` call — see the note on useCovers' CHUNK. */
+const CHUNK = 48;
+
+interface ImageInfoResult {
+  path: string;
+  info: ImageInfo | null;
+}
+
 /**
- * Lazily loads embedded cover art size/dimensions/format, one file at a time.
- * Only fetches while `enabled` is true, but keeps whatever it already loaded
- * cached so toggling the column back on doesn't refetch. A null cache entry
- * means "loaded, no art"; undefined means "not yet loaded".
+ * Lazily loads embedded cover art size/dimensions/format, a chunk of files per
+ * backend call (each decodes across several threads). Only fetches while
+ * `enabled` is true, but keeps whatever it already loaded cached so toggling
+ * the column back on doesn't refetch. A null cache entry means "loaded, no
+ * art"; undefined means "not yet loaded".
  */
 export function useImageInfo(files: AudioFile[], enabled: boolean) {
   const [info, setInfo] = useState<Record<string, ImageInfo | null>>({});
@@ -28,20 +37,25 @@ export function useImageInfo(files: AudioFile[], enabled: boolean) {
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
-    const queue = files.filter((f) => !(f.path in infoRef.current));
+    const queue = files.filter((f) => !(f.path in infoRef.current)).map((f) => f.path);
     if (queue.length === 0) return;
 
     (async () => {
-      for (const f of queue) {
+      for (let i = 0; i < queue.length; i += CHUNK) {
         if (cancelled) return;
+        const chunk = queue.slice(i, i + CHUNK);
+        let results: ImageInfoResult[];
         try {
-          const result = await invoke<ImageInfo | null>("image_info", { path: f.path });
-          if (cancelled) return;
-          setInfo((prev) => ({ ...prev, [f.path]: result }));
+          results = await invoke<ImageInfoResult[]>("image_info_batch", { paths: chunk });
         } catch {
-          if (cancelled) return;
-          setInfo((prev) => ({ ...prev, [f.path]: null }));
+          results = chunk.map((path) => ({ path, info: null }));
         }
+        if (cancelled) return;
+        setInfo((prev) => {
+          const next = { ...prev };
+          for (const r of results) next[r.path] = r.info;
+          return next;
+        });
       }
     })();
 

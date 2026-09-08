@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-export const CURRENT_SETTINGS_VERSION = 5;
+export const CURRENT_SETTINGS_VERSION = 6;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -12,9 +12,8 @@ export const DEFAULT_SETTINGS: Settings = {
   ollamaModel: "",
   batchSize: 50,
   backupBeforeChanges: true,
-  stripToCommon: true,
   preserveCoverArt: true,
-  artworkMaxDim: 1000,
+  artworkMaxDim: 600,
   artworkJpegQuality: 85,
   recursive: true,
   searchableBackup: true,
@@ -70,7 +69,8 @@ const STORE_FILE = "settings.json";
  * v4 adds the dedicated "Track ID" column (Generate IDs no longer writes to
  * Track Number). v5 adds Convert defaults (`convertPreset`, `convertOutput`) —
  * both already filled in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge, so
- * this bump only records that the shape grew.
+ * this bump only records that the shape grew. v6 retires "Strip to common
+ * tags only" along with the Clean Tags action, and lowers the artwork target.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -93,6 +93,15 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     if (ti >= 0) cols.splice(ti + 1, 0, "trackId");
     else cols.push("trackId");
     next.visibleColumns = cols;
+  }
+  if (savedVersion < 6) {
+    // "Strip to common tags only" is gone: nothing removes tag fields
+    // silently any more, only an explicit Clear Fields run. Drop the stored
+    // flag so it can't linger in the settings file.
+    delete (next as unknown as Record<string, unknown>).stripToCommon;
+    // Lower the artwork target to the new 600px default, but only for users
+    // still on the old default — a deliberately chosen size is left alone.
+    if (next.artworkMaxDim === 1000) next.artworkMaxDim = DEFAULT_SETTINGS.artworkMaxDim;
   }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;
