@@ -16,6 +16,7 @@ import {
 } from "../types";
 import { migrate, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
 import { STANDARDIZE_FIELDS } from "../hooks/useTags";
+import { ALLOWED_DESCRIPTION, DEFAULT_FLAG_EXTRA_CHARS } from "../lib/standardize";
 import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
 import type { GenreGroup } from "../lib/genres";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
@@ -685,12 +686,34 @@ export function SettingsPage({
         <div className="px-5 py-2">
           <Row
             label="Highlight unusual symbols"
-            hint="Flags characters like & $ ! in Title/Artist so you can filter them"
+            hint={`Anything that isn't ${ALLOWED_DESCRIPTION} is flagged in Title/Artist, so you can highlight and filter those tracks`}
           >
             <Toggle
               checked={settings.highlightSymbols}
               onChange={(v) => set("highlightSymbols", v)}
             />
+          </Row>
+          <Row
+            label="Also flag these characters"
+            hint="Characters to flag even though the rule above treats them as normal — brackets by default. Type the characters themselves, no separators."
+          >
+            <div className="flex items-center gap-2">
+              <input
+                className={cn(inputClass, "w-40 font-mono")}
+                value={settings.flagExtraChars}
+                spellCheck={false}
+                placeholder="none"
+                onChange={(e) => set("flagExtraChars", e.target.value)}
+              />
+              {settings.flagExtraChars !== DEFAULT_FLAG_EXTRA_CHARS && (
+                <button
+                  className="shrink-0 text-xs text-primary hover:underline"
+                  onClick={() => set("flagExtraChars", DEFAULT_FLAG_EXTRA_CHARS)}
+                >
+                  Reset
+                </button>
+              )}
+            </div>
           </Row>
           <Row
             label="Field naming"

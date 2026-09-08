@@ -171,6 +171,8 @@ interface Props {
   visibleColumns: string[];
   columnWidths: Record<string, number>;
   highlightSymbols: boolean;
+  /** Extra characters to flag, on top of the built-in rule. */
+  flagExtraChars: string;
   fieldNaming: "friendly" | "raw" | "both";
   rowHeight: RowHeight;
   genreOptions: string[];
@@ -354,6 +356,7 @@ export function TrackTable({
   visibleColumns,
   columnWidths,
   highlightSymbols,
+  flagExtraChars,
   fieldNaming,
   rowHeight,
   genreOptions,
@@ -667,10 +670,15 @@ export function TrackTable({
     const set = new Set<string>();
     for (const f of files) {
       const t = tags[f.path];
-      if (t && (hasWeirdChars(t.title ?? "") || hasWeirdChars(t.artist ?? ""))) set.add(f.path);
+      if (
+        t &&
+        (hasWeirdChars(t.title ?? "", flagExtraChars) ||
+          hasWeirdChars(t.artist ?? "", flagExtraChars))
+      )
+        set.add(f.path);
     }
     return set;
-  }, [files, tags]);
+  }, [files, tags, flagExtraChars]);
 
   const filteredRows = useMemo(() => {
     let out = files;
@@ -680,13 +688,47 @@ export function TrackTable({
   }, [files, onlyFlagged, onlyUnresolved, flagged, unresolved]);
 
   /**
-   * Raw tag keys (from TagData.allFields) not already shown as a curated
-   * column, one dynamic column per key found on any currently visible row,
-   * auto-hidden the moment no visible row has a value for that key anymore.
+   * Curated tag columns the user has switched off, brought back while "All
+   * Tags" is on so the toggle really does show every tag in the file.
+   *
+   * Without this, hiding a column made its tag invisible even under All Tags:
+   * the curated column was gone, and `extraColumns` skips that field's raw
+   * frame as a KEPT_FIELD_KEY to avoid showing it twice — so e.g. hiding
+   * "Track #" hid TrackNumber outright. Restoring the *curated* column (rather
+   * than a raw `TrackNumber` one) keeps the friendly label, the right editor
+   * and the numeric sort.
+   *
+   * Only columns some visible row actually has a value for, matching how the
+   * raw columns below come and go — All Tags shouldn't add a wall of empty
+   * columns. File properties (Preview, File Name, Format, Size, Artwork) are
+   * not tags and are left to the Columns menu.
+   */
+  const restoredColumns = useMemo<ColumnDef[]>(() => {
+    if (!showAllTags) return [];
+    const shown = new Set(visibleColumns);
+    const candidates = ALL_COLUMNS.filter(
+      (c) => !shown.has(c.id) && (c.field || c.custom === "rating"),
+    );
+    return candidates
+      .filter((c) =>
+        filteredRows.some((f) => {
+          const t = tags[f.path];
+          if (!t) return false;
+          return c.custom === "rating" ? (t.rating ?? 0) > 0 : !!c.value(f, t);
+        }),
+      )
+      .map((c) => ({ ...c, dynamic: true }));
+  }, [showAllTags, visibleColumns, filteredRows, tags]);
+
+  /**
+   * Raw tag keys (from TagData.allFields) with no curated column of their own,
+   * one dynamic column per key found on any currently visible row, auto-hidden
+   * the moment no visible row has a value for that key anymore.
    *
    * Keys in KEPT_FIELD_KEYS (TrackTitle, TrackArtist, Year, …) are the raw
-   * frames the curated Title/Artist/Year columns already show, so they're
-   * skipped here — otherwise every common field appears twice.
+   * frames the curated Title/Artist/Year columns show, so they're skipped here
+   * — otherwise every common field would appear twice. `restoredColumns` above
+   * is what makes that safe when the curated column is currently hidden.
    */
   const extraColumns: ColumnDef[] = useMemo(() => {
     if (!showAllTags) return [];
@@ -715,7 +757,7 @@ export function TrackTable({
   const previewColumns = useMemo<ColumnDef[]>(() => {
     if (!pending) return [];
     const shown = new Set<string>();
-    for (const c of curatedColumns) shown.add(c.field ?? c.id);
+    for (const c of [...curatedColumns, ...restoredColumns]) shown.add(c.field ?? c.id);
     for (const c of extraColumns) shown.add(c.rawKey ?? c.id);
     const byId = new Map(ALL_COLUMNS.map((c) => [c.id, c]));
     const seen = new Set<string>();
@@ -735,11 +777,14 @@ export function TrackTable({
       );
     }
     return out;
-  }, [pending, curatedColumns, extraColumns]);
+  }, [pending, curatedColumns, restoredColumns, extraColumns]);
+
+  /** How many columns All Tags is adding — restored curated ones plus raw frames. */
+  const addedColumnCount = restoredColumns.length + extraColumns.length;
 
   const columns = useMemo(
-    () => [...curatedColumns, ...previewColumns, ...extraColumns],
-    [curatedColumns, previewColumns, extraColumns],
+    () => [...curatedColumns, ...previewColumns, ...restoredColumns, ...extraColumns],
+    [curatedColumns, previewColumns, restoredColumns, extraColumns],
   );
   const columnById = useMemo(() => new Map(columns.map((c) => [c.id, c])), [columns]);
   const widthOf = (c: ColumnDef) => widths[c.id] ?? c.width;
@@ -1178,9 +1223,15 @@ export function TrackTable({
       return highlightSearch(value, searchQuery.trim());
     }
     if (highlightSymbols && col.field && HIGHLIGHT_FIELDS.has(col.field) && value) {
-      return markWeird(value).map((seg, i) =>
+      return markWeird(value, flagExtraChars).map((seg, i) =>
         seg.weird ? (
-          <mark key={i} className="rounded-sm bg-amber-500/30 text-amber-300">
+          // amber-300 is near-white: legible on the dark theme, invisible on
+          // the light one. Each theme gets a text colour with real contrast
+          // against its own background.
+          <mark
+            key={i}
+            className="rounded-sm bg-amber-500/30 text-amber-800 dark:text-amber-300"
+          >
             {seg.text}
           </mark>
         ) : (
@@ -1272,10 +1323,10 @@ export function TrackTable({
             variant={showAllTags ? "secondary" : "ghost"}
             size="sm"
             onClick={() => setShowAllTags((v) => !v)}
-            title="Show every raw tag field found on these tracks, as extra columns — a column hides itself once none of the visible tracks have a value for it"
+            title="Show every tag field found on these tracks as extra columns, including ones hidden from the Columns menu — a column hides itself once none of the visible tracks have a value for it"
           >
             <Layers />
-            All Tags{extraColumns.length > 0 ? ` (${extraColumns.length})` : ""}
+            All Tags{addedColumnCount > 0 ? ` (${addedColumnCount})` : ""}
           </Button>
           <div className="relative" ref={pickerRef}>
             <Button variant="ghost" size="sm" onClick={() => setPickerOpen((o) => !o)}>
@@ -1432,20 +1483,44 @@ export function TrackTable({
                         ? undefined
                         : (e) => {
                             e.dataTransfer.effectAllowed = "move";
+                            // Chromium (so WebView2, so the app) treats a drag
+                            // carrying no data as un-droppable and shows the
+                            // "no drop" cursor over every target, however the
+                            // dragover handler replies. The payload itself is
+                            // unused — `dragCol` carries the column id — but it
+                            // has to be there for the drag to be valid at all.
+                            e.dataTransfer.setData("text/plain", c.id);
                             internalDrag.active = true;
                             setDragCol(c.id);
                           }
                     }
                     onDragEnter={
-                      c.dynamic ? undefined : () => dragCol && dragCol !== c.id && setDragOverCol(c.id)
+                      c.dynamic
+                        ? undefined
+                        : (e) => {
+                            // Marks this header a valid drop target; without it
+                            // the first dragenter cancels the drop for the cell.
+                            e.preventDefault();
+                            if (dragCol && dragCol !== c.id) setDragOverCol(c.id);
+                          }
                     }
-                    onDragOver={c.dynamic ? undefined : (e) => e.preventDefault()}
+                    onDragOver={
+                      c.dynamic
+                        ? undefined
+                        : (e) => {
+                            e.preventDefault();
+                            // Without an explicit dropEffect the cursor stays
+                            // "no drop" even though the drop would be accepted.
+                            e.dataTransfer.dropEffect = "move";
+                          }
+                    }
                     onDrop={
                       c.dynamic
                         ? undefined
                         : (e) => {
                             e.preventDefault();
                             if (dragCol) reorderColumn(dragCol, c.id);
+                            internalDrag.active = false;
                             setDragCol(null);
                             setDragOverCol(null);
                           }
@@ -1731,7 +1806,7 @@ export function TrackTable({
                           title={
                             pend
                               ? `${pend.before || "(empty)"} → ${pend.after || "(empty)"} — click to ${pend.include ? "exclude" : "include"}, double-click to edit`
-                              : c.dynamic
+                              : c.rawKey
                                 ? `${value} — double-click to edit, clear it to delete this field entirely`
                                 : c.id === "filename"
                                   ? `${f.path} — double-click to rename`

@@ -8,8 +8,24 @@ export const DEFAULT_REPLACEMENTS: CharReplacement[] = [
   { from: "0", to: "O", enabled: false },
 ];
 
-/** Characters considered "normal" in a title/artist — anything else is flagged. */
+/**
+ * Characters considered "normal" in a title/artist — anything else is flagged.
+ * Letters and numbers of any script, whitespace, hyphen, apostrophe and
+ * brackets. Shown to the user (as `ALLOWED_DESCRIPTION`) in Settings, next to
+ * the box for flagging extra characters on top of this.
+ */
 const ALLOWED = /[\p{L}\p{N}\s\-'()]/u;
+
+/** Plain-English version of `ALLOWED`, for the Settings screen. */
+export const ALLOWED_DESCRIPTION = "letters, numbers, spaces, - ' ( )";
+
+/**
+ * Characters flagged on top of the rule above, out of the box. Brackets are
+ * allowed characters but usually mark something worth looking at — "(Radio
+ * Edit)", "(Official Video)" — so they are flagged by default and can be
+ * removed in Settings like any other.
+ */
+export const DEFAULT_FLAG_EXTRA_CHARS = "()";
 
 /** Escapes regex metacharacters so a literal string can be used in a RegExp. */
 function escapeRegExp(s: string): string {
@@ -130,20 +146,26 @@ function collapseSpaces(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-/** True if the string contains any character outside the allowed set. */
-export function hasWeirdChars(value: string): boolean {
-  for (const ch of value) {
-    if (/\s/.test(ch)) continue;
-    if (!ALLOWED.test(ch)) return true;
-  }
+/**
+ * True when `ch` should be flagged: outside the allowed set, or one of the
+ * user's own extra characters. Whitespace is never flagged.
+ */
+function isWeird(ch: string, extra: string): boolean {
+  if (/\s/.test(ch)) return false;
+  return extra.includes(ch) || !ALLOWED.test(ch);
+}
+
+/** True if the string contains any flagged character. */
+export function hasWeirdChars(value: string, extra = ""): boolean {
+  for (const ch of value) if (isWeird(ch, extra)) return true;
   return false;
 }
 
 /** Splits a string into segments marking which characters are flagged. */
-export function markWeird(value: string): { text: string; weird: boolean }[] {
+export function markWeird(value: string, extra = ""): { text: string; weird: boolean }[] {
   const out: { text: string; weird: boolean }[] = [];
   for (const ch of value) {
-    const weird = !/\s/.test(ch) && !ALLOWED.test(ch);
+    const weird = isWeird(ch, extra);
     const last = out[out.length - 1];
     if (last && last.weird === weird) last.text += ch;
     else out.push({ text: ch, weird });

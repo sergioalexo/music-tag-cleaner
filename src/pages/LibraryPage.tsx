@@ -601,6 +601,7 @@ export function LibraryPage({
             visibleColumns={settings.visibleColumns}
             columnWidths={settings.columnWidths}
             highlightSymbols={settings.highlightSymbols}
+            flagExtraChars={settings.flagExtraChars}
             fieldNaming={settings.fieldNaming}
             rowHeight={settings.rowHeight}
             genreOptions={genreOptions}

@@ -51,12 +51,24 @@ where
 /// independent file read + decode, so a folder scan or a batch tag read of a
 /// few hundred files is otherwise a multi-second sequential stall. Small
 /// inputs stay single-threaded to avoid the spawn overhead.
+///
+/// One core is deliberately left free. A fixed eight threads oversubscribed
+/// anything smaller than an 8-core machine and saturated the rest, starving
+/// the webview's own rendering — a long batch made the window itself feel
+/// frozen, which is worse than the batch taking slightly longer.
+fn worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1))
+        .unwrap_or(4)
+        .clamp(1, 8)
+}
+
 pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    const MAX_THREADS: usize = 8;
     if items.len() <= 16 {
         return items.iter().map(&f).collect();
     }
-    let chunk = items.len().div_ceil(MAX_THREADS.min(items.len()));
+    let threads = worker_threads();
+    let chunk = items.len().div_ceil(threads.min(items.len()));
     std::thread::scope(|s| {
         items
             .chunks(chunk)

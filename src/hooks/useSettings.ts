@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { load, type Store } from "@tauri-apps/plugin-store";
 import type { Settings } from "../types";
-import { DEFAULT_REPLACEMENTS } from "../lib/standardize";
+import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
 export const CURRENT_SETTINGS_VERSION = 6;
@@ -40,6 +40,7 @@ export const DEFAULT_SETTINGS: Settings = {
   replacements: DEFAULT_REPLACEMENTS,
   capitalization: "asis",
   highlightSymbols: false,
+  flagExtraChars: DEFAULT_FLAG_EXTRA_CHARS,
   fieldNaming: "friendly",
   removeChars: ",.",
   genrePresets: DEFAULT_GENRE_PRESETS,

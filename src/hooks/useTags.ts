@@ -332,6 +332,7 @@ export function useTags() {
     paths: string[],
     map: Record<string, TagData>,
     settings: Settings,
+    onProgress?: Progress,
   ): Promise<ApplyResult & { assigned: number; nextId: number }> => {
     let counter = settings.nextTrackId;
     const edits = paths
@@ -342,7 +343,7 @@ export function useTags() {
         field: "trackId" as keyof TagData & string,
         value: formatTrackId(counter++, settings.trackIdDigits),
       }));
-    const result = await updateFieldMany(edits, settings);
+    const result = await withWriteProgress(onProgress, () => updateFieldMany(edits, settings));
     // The counter advances past every id handed out, including any whose write
     // failed — an id is never reused, so a retry can't collide with a file that
     // did get written.

@@ -258,6 +258,8 @@ export interface Settings {
   capitalization: Capitalization;
   /** Highlight non-standard symbols in Title/Artist cells in the table. */
   highlightSymbols: boolean;
+  /** Characters always flagged in Title/Artist, on top of the built-in rule. */
+  flagExtraChars: string;
   /** How curated field names are labeled: the friendly name, the raw tag frame name, or both. */
   fieldNaming: "friendly" | "raw" | "both";
   /** Characters removed by the "Remove characters" action. */

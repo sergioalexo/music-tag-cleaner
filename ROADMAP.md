@@ -1090,6 +1090,69 @@ pages, Clear Fields → Apply → Undo → Redo (call counts and toasts as above
 "All Tags" columns, and the Settings changes. The packaged app was not launched —
 worth a Clear Fields run on a small folder before a large one.
 
+### 40. v0.11 follow-ups: the post-write freeze, All Tags, drag, flagging — v0.11.1
+
+All six reported against v0.11.0.
+
+**The app froze after an apply** (AI Clean, Capitalization — any Apply). Measured
+before touching anything: React was never the problem (worst commit 46 ms,
+via a temporary `<Profiler>`). The cost was `afterWrite` dropping the cover-art
+cache for *every* affected file after *every* tag write, so applying to 848
+tracks regenerated 848 thumbnails — decode, resize, re-encode, base64. At the
+3.8 ms/file benchmarked in item 39 that is **~3.2 s with every core pegged**,
+immediately after the write.
+
+None of it was needed: `write_tags` carries the existing pictures over while
+"Preserve embedded cover art" is on, so the cached thumbnails were still valid.
+The cache is now dropped only when the write could actually have changed the
+art (`!preserveCoverArt`); `restore_from_backup` re-pushes the current pictures
+too, so it is safe there as well. Verified: applying to 848 files now
+regenerates **0** thumbnails.
+
+The user's other clue — "my cursor changes like it is text everywhere" — was the
+same fault: with every core busy the WebView renderer is starved and Windows
+keeps showing the last cursor set, which over the table is the I-beam from the
+editable cells. Two follow-ons: `par_map` now leaves one core free
+(`available_parallelism() - 1`, clamped 1–8) instead of always spawning eight
+and oversubscribing anything smaller, and the post-write refresh shows
+"Refreshing library…" rather than going silent.
+
+**"All Tags" hid columns switched off in the Columns menu.** `extraColumns`
+skipped every `KEPT_FIELD_KEYS` raw frame to avoid duplicating a curated column
+— but that set is fixed while a column's visibility is not, so hiding "Track #"
+lost `TrackNumber` entirely (same for Album Artist, Disc #, Composer, Comment,
+Original Artist). All Tags now also restores hidden *curated* columns that have
+data, keeping the friendly label, editor and numeric sort (Track # shows
+"1/12", not the raw "1"). The button's count covers what it adds, and a
+restored column no longer carries the raw frame's "clear it to delete this
+field entirely" tooltip.
+
+**Column drag-and-drop showed the "no drop" cursor.** Three compounding HTML5
+bugs in the header: `dragstart` never called `setData`, so Chromium treated the
+drag as carrying nothing and refused every target regardless of what `dragover`
+replied; `dragenter` never called `preventDefault()`; and `dragover` never set
+`dropEffect`. The reorder logic itself was fine.
+
+**Generate IDs** was already parallel (it goes through `write_tags_batch`) but
+reported no progress — now wired to the same `write-progress` events, verified
+showing "Assigning ID 30 of 60" mid-run.
+
+**Flagged characters are now visible and editable** (`settings.flagExtraChars`,
+default `"()"`): Settings spells out the built-in rule via `ALLOWED_DESCRIPTION`
+and adds an "Also flag these characters" box with a Reset link. Brackets are
+flagged out of the box, as asked.
+
+**Light-theme highlight was invisible.** The flagged-symbol `<mark>` used
+`text-amber-300` — near-white, fine on dark, unreadable on light. Now
+`text-amber-800 dark:text-amber-300`, checked in both themes.
+
+**Verification.** `tsc`, `cargo clippy` and 41 Rust tests clean. Driven
+end-to-end against a mocked Tauri IPC at 848 files. Two harness gotchas worth
+remembering for next time: with the browser pane hidden, `requestAnimationFrame`
+and `longtask` never fire and `setTimeout` is throttled to ~1/s (a mock with a
+per-file delay looks exactly like a hang), and Tauri v2 delivers events through
+`__TAURI_INTERNALS__.runCallback(id, …)`, not `window[_id]`.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

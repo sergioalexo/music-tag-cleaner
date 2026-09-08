@@ -366,12 +366,21 @@ export default function App() {
     setInspected(null);
     if (affected.length) {
       dropLibraryTags(affected);
-      invalidateCovers(affected);
+      // Only re-read artwork if the write could actually have changed it.
+      // `write_tags` carries the existing pictures over when "Preserve
+      // embedded cover art" is on, so the cached thumbnails are still valid —
+      // and dropping them made every apply regenerate a thumbnail per file
+      // (decode + resize + re-encode), which on a big selection pegged every
+      // core for seconds afterwards and read as the app hanging.
+      if (!settingsRef.current.preserveCoverArt) invalidateCovers(affected);
+      setProgress({ done: 0, total: affected.length, label: "Refreshing library…" });
       await filesApi.refreshPaths(affected);
     } else {
       setLibraryTags({});
+      setProgress({ done: 0, total: 0, label: "Refreshing library…" });
       await filesApi.refresh();
     }
+    setProgress(null);
   };
 
   // Remembers the transform used to build the current standardize preview so
@@ -686,7 +695,9 @@ export default function App() {
     try {
       const { map, errors } = await tagsApi.read(paths);
       errors.forEach((e) => notify(e, "error"));
-      const result = await tagsApi.generateIds(paths, map, settings);
+      const result = await tagsApi.generateIds(paths, map, settings, (done, total) =>
+        setProgress({ done, total, label: `Assigning ID ${Math.min(done, total)} of ${total}` }),
+      );
       result.errors.forEach((e) => notify(e, "error"));
       if (result.assigned) void update((prev) => ({ ...prev, nextTrackId: result.nextId }));
       notify(
@@ -701,6 +712,7 @@ export default function App() {
     } catch (e) {
       notify(String(e), "error");
     } finally {
+      setProgress(null);
       setBusy(false);
     }
   };
