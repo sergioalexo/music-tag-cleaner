@@ -16,6 +16,8 @@ import {
   Sparkles,
   SquarePen,
   StopCircle,
+  Link2,
+  Repeat,
   Tags,
   Trash2,
   Type,
@@ -34,6 +36,7 @@ import type {
 import { KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { activePreset } from "../lib/genres";
+import { buildTrackGroups, trackIdFormats } from "../lib/trackGroups";
 import { shortcutFor } from "../lib/shortcuts";
 import { TrackTable } from "../components/TrackTable";
 import PreviewTable from "../components/PreviewTable";
@@ -88,6 +91,9 @@ interface Props {
   onRemoveChars: () => void;
   onGenre: () => void;
   onGenerateIds: () => void;
+  onUnifyIds: () => void;
+  onConvert: () => void;
+  onConvertFile: (file: AudioFile) => void;
   onStandardizeArt: () => void;
   onRename: () => void;
   onClearFields: (fields: string[]) => void;
@@ -145,6 +151,9 @@ export function LibraryPage({
   onRemoveChars,
   onGenre,
   onGenerateIds,
+  onUnifyIds,
+  onConvert,
+  onConvertFile,
   onStandardizeArt,
   onRename,
   onClearFields,
@@ -177,6 +186,14 @@ export function LibraryPage({
   const sidebarFilteredFiles = useMemo(
     () => filesApi.files.filter((f) => matchesSidebarFilter(f, libraryTags, sidebarFilter)),
     [filesApi.files, libraryTags, sidebarFilter],
+  );
+  const trackGroups = useMemo(
+    () => buildTrackGroups(filesApi.files, libraryTags, settings.trackIdDigits),
+    [filesApi.files, libraryTags, settings.trackIdDigits],
+  );
+  const tidFormats = useMemo(
+    () => trackIdFormats(filesApi.files, libraryTags),
+    [filesApi.files, libraryTags],
   );
   const backupCount = filesApi.files.filter(
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
@@ -517,6 +534,26 @@ export function LibraryPage({
           <Button
             variant="secondary"
             size="sm"
+            onClick={onUnifyIds}
+            disabled={busy || filesApi.files.length < 2}
+            title="Find files that are the same recording (any format) and give them one shared Track ID so they group as one track"
+          >
+            <Link2 />
+            Unify IDs
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onConvert}
+            disabled={noSel}
+            title="Convert the selected tracks to another format (MP3, FLAC, ALAC, AAC…) — tags and Track ID are carried over"
+          >
+            <Repeat />
+            Convert
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={onStandardizeArt}
             disabled={noSel}
             title={`Re-encode embedded cover art to JPEG q${settings.artworkJpegQuality}, longest side ≤ ${settings.artworkMaxDim}px`}
@@ -540,6 +577,7 @@ export function LibraryPage({
         <LibrarySidebar
           files={filesApi.files}
           tags={libraryTags}
+          trackGroups={trackGroups}
           width={settings.sidebarWidth}
           collapsed={settings.sidebarCollapsed}
           filter={sidebarFilter}
@@ -587,6 +625,8 @@ export function LibraryPage({
             onInspect={onInspect}
             onAddGenre={onAddGenre}
             onRenameGenre={onRenameGenre}
+            onConvertFile={onConvertFile}
+            trackIdFormats={tidFormats}
             onDeleteFile={onDeleteFile}
             onRenameFile={onRenameFile}
             backupFieldId={backupFieldId}

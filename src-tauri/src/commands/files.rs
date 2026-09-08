@@ -421,7 +421,7 @@ pub async fn write_tags(
     .await
 }
 
-fn write_tags_blocking(
+pub(crate) fn write_tags_blocking(
     path: &str,
     tags: TagData,
     backup: bool,
@@ -1011,6 +1011,49 @@ pub async fn delete_file(path: String) -> Result<(), String> {
             return Err(format!("File not found: {path}"));
         }
         trash::delete(src).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Opens the OS "Open with…" chooser for a file. On Windows this is the
+/// native `shell32` "How do you want to open this file?" dialog, so the user
+/// can hand a track straight to a converter, player or editor without leaving
+/// the app. macOS opens the file's Info panel (the closest equivalent to a
+/// chooser); on Linux there's no standard dialog, so it falls back to `xdg-open`.
+#[tauri::command]
+pub async fn open_with(path: String) -> Result<(), String> {
+    run_blocking(move || {
+        if !Path::new(&path).is_file() {
+            return Err(format!("File not found: {path}"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("rundll32.exe")
+                .args(["shell32.dll,OpenAs_RunDLL", &path])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(|e| format!("Could not open the chooser: {e}"))?;
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // `open -R` reveals in Finder; there is no CLI "open with" chooser.
+            std::process::Command::new("open")
+                .args(["-R", &path])
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
     })
     .await
 }

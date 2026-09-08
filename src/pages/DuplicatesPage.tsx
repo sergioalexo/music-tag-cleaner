@@ -2,17 +2,10 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Copy, Loader2, Trash2 } from "lucide-react";
-import type { AudioFile, TagData } from "../types";
+import type { AudioFile, DuplicateGroup, TagData } from "../types";
 import { formatBytes } from "../types";
 import { Button, Card, cn } from "../components/ui";
 import { Waveform } from "../components/Waveform";
-
-interface DuplicateGroup {
-  id: string;
-  kind: "duplicate" | "alternate";
-  paths: string[];
-  score: number;
-}
 
 type RowState = "keep" | "remove" | "skip";
 

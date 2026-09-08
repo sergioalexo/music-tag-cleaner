@@ -188,6 +188,7 @@ export function useFiles(
     selectedPaths,
     totalSize,
     scanning,
+    merge,
     selectFolder,
     addFiles,
     importPaths,

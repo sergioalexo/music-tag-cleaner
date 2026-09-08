@@ -64,6 +64,78 @@ export interface ComponentProgress {
   total: number;
 }
 
+/** FFmpeg — an optional managed component (v0.10), used by Convert. */
+export interface FfmpegInfo {
+  installed: boolean;
+  /** The copy found is the one downloaded into the app's data dir (vs. on PATH). */
+  managed: boolean;
+  ffmpegPath?: string | null;
+  ffprobePath?: string | null;
+  version?: string | null;
+}
+
+export interface FfmpegInstallProgress {
+  phase: "downloading" | "extracting" | "done";
+  downloaded: number;
+  total: number;
+}
+
+/** Target formats for Convert. `value` must match `preset()` in convert.rs. */
+export type ConvertPreset =
+  | "mp3-320"
+  | "mp3-v0"
+  | "flac"
+  | "alac"
+  | "aac-256"
+  | "wav"
+  | "aiff"
+  | "ogg-q8"
+  | "opus-192";
+
+export const CONVERT_PRESETS: { value: ConvertPreset; label: string; ext: string; hint: string }[] = [
+  { value: "mp3-320", label: "MP3 · 320 kbps CBR", ext: "mp3", hint: "Universally compatible, DJ-safe" },
+  { value: "mp3-v0", label: "MP3 · V0 VBR", ext: "mp3", hint: "Transparent, slightly smaller than 320" },
+  { value: "flac", label: "FLAC · lossless", ext: "flac", hint: "Lossless, larger files" },
+  { value: "alac", label: "ALAC · lossless (.m4a)", ext: "m4a", hint: "Lossless, Apple ecosystem" },
+  { value: "aac-256", label: "AAC · 256 kbps (.m4a)", ext: "m4a", hint: "Efficient lossy, good for Serato/Rekordbox" },
+  { value: "wav", label: "WAV · 16-bit PCM", ext: "wav", hint: "Uncompressed, no embedded art" },
+  { value: "aiff", label: "AIFF · 16-bit PCM", ext: "aiff", hint: "Uncompressed, Rekordbox-friendly" },
+  { value: "ogg-q8", label: "Ogg Vorbis · q8", ext: "ogg", hint: "Open lossy format" },
+  { value: "opus-192", label: "Opus · 192 kbps", ext: "opus", hint: "Best-in-class lossy; limited DJ support" },
+];
+
+/** One file's result from `convert_files`. */
+export interface ConvertOutcome {
+  source: string;
+  output?: string | null;
+  ok: boolean;
+  /** Error on failure, or a "converted, but …" warning when tag copy failed. */
+  error?: string | null;
+}
+
+/** A cluster from `scan_duplicates` (matches the Rust `DuplicateGroup`). */
+export interface DuplicateGroup {
+  id: string;
+  kind: "duplicate" | "alternate";
+  paths: string[];
+  score: number;
+}
+
+/**
+ * A set of loaded files that are the same recording — grouped by a shared
+ * Track ID (assigned by "Generate IDs", "Unify Track IDs", or carried over by
+ * Convert). Used by the library sidebar's "Tracks" mode.
+ */
+export interface TrackGroup {
+  /** The shared Track ID value. */
+  trackId: string;
+  /** "Artist — Title" from the first member, for display. */
+  name: string;
+  /** Distinct uppercased formats present, e.g. ["FLAC", "MP3"]. */
+  formats: string[];
+  paths: string[];
+}
+
 export interface CharReplacement {
   from: string;
   to: string;
@@ -219,6 +291,10 @@ export interface Settings {
   standardizeFilename: boolean;
   /** Tracks per copy/paste batch in manual AI mode. */
   manualChunkSize: number;
+  /** Default target format/quality for Convert. */
+  convertPreset: ConvertPreset;
+  /** Where Convert writes output: next to each source, or a `converted/` subfolder. */
+  convertOutput: "alongside" | "subfolder";
 }
 
 /** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */

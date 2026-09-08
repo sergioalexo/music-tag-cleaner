@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-export const CURRENT_SETTINGS_VERSION = 4;
+export const CURRENT_SETTINGS_VERSION = 5;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -57,6 +57,8 @@ export const DEFAULT_SETTINGS: Settings = {
   standardizeFields: ["title", "artist", "album", "albumArtist"],
   standardizeFilename: false,
   manualChunkSize: 50,
+  convertPreset: "mp3-320",
+  convertOutput: "alongside",
 };
 
 const STORE_FILE = "settings.json";
@@ -66,7 +68,9 @@ const STORE_FILE = "settings.json";
  * columns (added after some users' settings were first saved) are visible.
  * v3 retires the never-shipped "claude" backend in favour of "manual".
  * v4 adds the dedicated "Track ID" column (Generate IDs no longer writes to
- * Track Number).
+ * Track Number). v5 adds Convert defaults (`convertPreset`, `convertOutput`) —
+ * both already filled in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge, so
+ * this bump only records that the shape grew.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };

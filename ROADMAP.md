@@ -955,6 +955,80 @@ roadmap item) wasn't built — title+duration scoring already resolves
 real playlists cleanly enough in testing that the extra fingerprinting
 pass didn't look worth the cost.
 
+### 38. FFmpeg component + format conversion + cross-format track grouping — v0.10
+
+Three linked features. The trigger was the user (who conflates this app with
+the sibling Media Fetch, where FFmpeg already lives) asking to "show ffmpeg in
+components" and build conversion on top of it.
+
+**F1 — FFmpeg as an optional managed component**
+([ffmpeg.rs](src-tauri/src/commands/ffmpeg.rs), new). Same pattern as `yt-dlp`
+in `ytmusic.rs` and Ollama in `components.rs`: `resolve_ffmpeg()` prefers a
+copy we downloaded into `app_data_dir()/bin`, then anything on `PATH` (plus the
+Homebrew dirs on macOS). `install_ffmpeg` (Windows only) pulls the latest
+`ffmpeg-master-latest-win64-gpl.zip` from `BtbN/FFmpeg-Builds`, streams it with
+`ffmpeg-install-progress` events, and extracts just `ffmpeg.exe` + `ffprobe.exe`
+(the `wanted_zip_entry` matcher, unit-tested); macOS/Linux get a "install it
+with brew/apt" message and PATH detection. The `zip` dep gained
+`features = ["deflate-flate2"]` (it was `Stored`-only for the backup archive;
+BtbN's zip is DEFLATE). New **FFmpeg** card on the Components page between
+Ollama and Models — status (Installed / On PATH / Not installed), version +
+path tiles, an Install button with a progress bar.
+
+**F2 — Convert to different formats**
+([convert.rs](src-tauri/src/commands/convert.rs), new;
+[ConvertDialog.tsx](src/components/ConvertDialog.tsx), new). Nine presets
+(`mp3-320`, `mp3-v0`, `flac`, `alac`, `aac-256`, `wav`, `aiff`, `ogg-q8`,
+`opus-192`) in one unit-tested `ffmpeg_args` builder — `-map_metadata 0`,
+audio-stream map, and `-c:v copy` art passthrough for the containers that can
+hold it. **After the encode, the source's tags are re-applied to the output
+with `write_tags_blocking`** (made `pub(crate)`), including the private
+`TXXX:TRACKID` frame — so a converted copy lands already carrying the Track ID
+that groups it with its original (F3), no matter how faithfully the container's
+own metadata survived. Toolbar **Convert** button + right-click menu entry;
+`convert-progress` events drive the status bar; results are merged into the
+library, with an optional "move originals to Recycle Bin" and "converted/"
+subfolder option. Preset/location defaults persist to
+`settings.convertPreset`/`convertOutput` (settings v5). If FFmpeg is missing
+the dialog shows a "required — go to Components" panel instead.
+
+**F3 — Group the same recording across formats under one Track ID**
+(frontend only — reuses `scan_duplicates` unchanged). New toolbar **Unify IDs**
+action: runs the existing chromaprint duplicate scan over the loaded files,
+takes the `kind: "duplicate"` clusters (same recording, includes re-encodes
+across formats; `"alternate"` edits/remixes are counted but left alone), and
+for each cluster picks a canonical Track ID — an existing app-assigned id on
+one of the members, or a freshly generated one — then previews the change in
+[UnifyDialog.tsx](src/components/UnifyDialog.tsx) before writing it to every
+member via the normal undoable `updateField` path. The library sidebar gains a
+**Tracks** mode ([LibrarySidebar.tsx](src/components/LibrarySidebar.tsx))
+listing multi-format groups with format badges; clicking one filters the table
+to that group (`SidebarFilter` gained a `"group"` variant keyed by Track ID).
+The Track ID cell in [TrackTable.tsx](src/components/TrackTable.tsx) shows a
+small link glyph when other loaded files share the id. Grouping is built on
+`buildTrackGroups`/`trackIdFormats` in
+[trackGroups.ts](src/lib/trackGroups.ts).
+
+**Also — right-click row menu** ([TrackTable.tsx](src/components/TrackTable.tsx),
+requested mid-build): Open, **Open with…** (Windows `shell32` "OpenAs_RunDLL"
+chooser via the new `files::open_with` command, so a track can be handed
+straight to a converter or player), Reveal in File Explorer, Copy path,
+Convert…, Inspect tags, Delete.
+
+**Simplified / not built:** no collapsible group rows inside the virtualized
+track table (sidebar + badge only, as scoped with the user); no
+loudness/sample-rate/bit-depth conversion UI beyond the fixed preset list; no
+separate "release group" id — grouping is strictly same-recording; no
+auto-unify on import (kept an explicit, previewed action); macOS "Open with…"
+falls back to Finder reveal (no CLI chooser exists). FFmpeg auto-install is
+Windows-only, same as Media Fetch's.
+
+**Verification:** `ffmpeg_args`/preset/zip-matcher unit tests pass; an
+`#[ignore]` `convert_roundtrip_carries_tags` test (synth WAV → MP3) confirms
+title + Track ID carry over when run with ffmpeg on PATH. [App-level end-to-end
+verification against the real library is the remaining step — see the plan's
+verification section.]
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   Download,
   ExternalLink,
+  FileAudio,
   Loader2,
   Play,
   RefreshCw,
@@ -20,7 +21,13 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import type { ComponentProgress, OllamaInfo, OllamaStatus } from "../types";
+import type {
+  ComponentProgress,
+  FfmpegInfo,
+  FfmpegInstallProgress,
+  OllamaInfo,
+  OllamaStatus,
+} from "../types";
 import { formatBytes } from "../types";
 import { Badge, Button, Card, cn, inputClass } from "../components/ui";
 
@@ -28,6 +35,7 @@ interface Props {
   ollamaUrl: string;
   notify: (message: string, kind?: "success" | "error" | "info") => void;
   onOllamaChanged: () => void;
+  onFfmpegChanged: () => void;
 }
 
 /** Solid general-purpose models that fit typical desktop hardware. */
@@ -80,8 +88,12 @@ function InfoTile({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
+export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegChanged }: Props) {
   const [info, setInfo] = useState<OllamaInfo | null>(null);
+  const [ffmpeg, setFfmpeg] = useState<FfmpegInfo | null>(null);
+  const [ffmpegInstalling, setFfmpegInstalling] = useState(false);
+  const [ffmpegProgress, setFfmpegProgress] = useState<FfmpegInstallProgress | null>(null);
+  const isWindows = navigator.userAgent.includes("Windows");
   const [models, setModels] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -166,13 +178,42 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
     }
   }, [ollamaUrl, notify, onOllamaChanged]);
 
+  const refreshFfmpeg = useCallback(async () => {
+    try {
+      setFfmpeg(await invoke<FfmpegInfo>("ffmpeg_info"));
+    } catch {
+      setFfmpeg({ installed: false, managed: false });
+    }
+    onFfmpegChanged();
+  }, [onFfmpegChanged]);
+
+  const installFfmpeg = async () => {
+    setFfmpegInstalling(true);
+    setFfmpegProgress(null);
+    try {
+      await invoke("install_ffmpeg");
+      notify("FFmpeg installed", "success");
+      await refreshFfmpeg();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setFfmpegInstalling(false);
+      setFfmpegProgress(null);
+    }
+  };
+
   useEffect(() => {
     refresh();
+    refreshFfmpeg();
     const unlisten = listen<ComponentProgress>("component-progress", (e) => {
       setProgress(e.payload);
     });
+    const unlistenFfmpeg = listen<FfmpegInstallProgress>("ffmpeg-install-progress", (e) => {
+      setFfmpegProgress(e.payload);
+    });
     return () => {
       unlisten.then((fn) => fn());
+      unlistenFfmpeg.then((fn) => fn());
       if (pollTimer.current) window.clearTimeout(pollTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -263,10 +304,18 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
         <div>
           <h1 className="text-xl font-bold">Components</h1>
           <p className="text-sm text-muted-foreground">
-            Everything AI Clean needs to run locally
+            Optional tools — Ollama powers AI Clean, FFmpeg powers Convert
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            void refresh();
+            void refreshFfmpeg();
+          }}
+          disabled={loading}
+        >
           <RefreshCw className={loading ? "animate-spin" : ""} />
           Refresh
         </Button>
@@ -424,6 +473,86 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged }: Props) {
                 : `Downloading installer ${formatBytes(ollamaProgress?.downloaded ?? 0)}${
                     ollamaProgress && ollamaProgress.total > 0
                       ? ` / ${formatBytes(ollamaProgress.total)}`
+                      : ""
+                  }`}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* FFmpeg — used by Convert */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">
+              <FileAudio className="h-5 w-5 text-muted-foreground" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">FFmpeg</span>
+                {ffmpeg === null ? (
+                  <Badge>…</Badge>
+                ) : ffmpeg.installed ? (
+                  <Badge className="gap-1 bg-primary/15 text-primary">
+                    <CheckCircle2 className="h-3 w-3" />
+                    {ffmpeg.managed ? "Installed" : "On PATH"}
+                  </Badge>
+                ) : (
+                  <Badge className="gap-1 bg-destructive/15 text-destructive">
+                    <XCircle className="h-3 w-3" /> Not installed
+                  </Badge>
+                )}
+              </div>
+              <button
+                onClick={() =>
+                  void openUrl("https://github.com/BtbN/FFmpeg-Builds/releases")
+                }
+                className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"
+              >
+                Static builds (BtbN) <ExternalLink className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 gap-2">
+            {ffmpeg && !ffmpeg.installed && (
+              <Button size="sm" onClick={installFfmpeg} disabled={ffmpegInstalling}>
+                {ffmpegInstalling ? <Loader2 className="animate-spin" /> : <Download />}
+                Install
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <p className="mt-3 text-xs text-muted-foreground">
+          Used by <span className="font-medium">Convert</span> to transcode between formats (MP3,
+          FLAC, ALAC, AAC, WAV, AIFF, Ogg, Opus). Not needed for tag editing.
+          {ffmpeg && !ffmpeg.installed && !isWindows && (
+            <> Install it with <span className="font-mono">brew install ffmpeg</span> (macOS) or your
+            package manager — it's detected automatically.</>
+          )}
+        </p>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <InfoTile label="Version" value={ffmpeg?.version ?? "—"} />
+          <InfoTile label="Path" value={ffmpeg?.ffmpegPath ?? "—"} />
+        </div>
+
+        {ffmpegInstalling && (
+          <div className="mt-3">
+            <ProgressBar
+              value={
+                ffmpegProgress && ffmpegProgress.total > 0 && ffmpegProgress.phase === "downloading"
+                  ? ffmpegProgress.downloaded / ffmpegProgress.total
+                  : null
+              }
+            />
+            <div className="mt-1 text-xs text-muted-foreground">
+              {ffmpegProgress?.phase === "extracting"
+                ? "Extracting…"
+                : `Downloading ${formatBytes(ffmpegProgress?.downloaded ?? 0)}${
+                    ffmpegProgress && ffmpegProgress.total > 0
+                      ? ` / ${formatBytes(ffmpegProgress.total)}`
                       : ""
                   }`}
             </div>

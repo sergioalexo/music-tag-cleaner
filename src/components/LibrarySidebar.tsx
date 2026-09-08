@@ -1,12 +1,25 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronLeft, ChevronRight, Folder, Music2, Search, User, X } from "lucide-react";
-import type { AudioFile, TagData } from "../types";
+import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Folder,
+  Link2,
+  Music2,
+  Search,
+  User,
+  X,
+} from "lucide-react";
+import type { AudioFile, TagData, TrackGroup } from "../types";
 import { cn } from "./ui";
 
-export type SidebarMode = "folders" | "genres" | "artists";
+export type SidebarMode = "folders" | "genres" | "artists" | "tracks";
 
 /** What the sidebar currently narrows the track table down to, if anything. */
-export type SidebarFilter = { mode: "folder"; value: string } | { mode: "genre" | "artist"; value: string };
+export type SidebarFilter =
+  | { mode: "folder"; value: string }
+  | { mode: "genre" | "artist"; value: string }
+  | { mode: "group"; value: string };
 
 interface FolderNode {
   name: string;
@@ -125,6 +138,7 @@ function subtreeMatches(node: FolderNode, q: string): boolean {
 export function LibrarySidebar({
   files,
   tags,
+  trackGroups,
   width,
   collapsed,
   filter,
@@ -134,6 +148,7 @@ export function LibrarySidebar({
 }: {
   files: AudioFile[];
   tags: Record<string, TagData>;
+  trackGroups: TrackGroup[];
   width: number;
   collapsed: boolean;
   filter: SidebarFilter | null;
@@ -189,6 +204,14 @@ export function LibrarySidebar({
   const q = query.trim().toLowerCase();
   const filteredGenres = q ? genreCounts.filter((g) => g.name.toLowerCase().includes(q)) : genreCounts;
   const filteredArtists = q ? artistCounts.filter((a) => a.name.toLowerCase().includes(q)) : artistCounts;
+  const filteredGroups = q
+    ? trackGroups.filter(
+        (g) =>
+          g.name.toLowerCase().includes(q) ||
+          g.trackId.toLowerCase().includes(q) ||
+          g.formats.some((f) => f.toLowerCase().includes(q)),
+      )
+    : trackGroups;
 
   return (
     <div
@@ -201,6 +224,7 @@ export function LibrarySidebar({
             { id: "folders", label: "Folders", icon: Folder },
             { id: "genres", label: "Genres", icon: Music2 },
             { id: "artists", label: "Artists", icon: User },
+            { id: "tracks", label: "Tracks", icon: Link2 },
           ] as const
         ).map((m) => (
           <button
@@ -230,7 +254,15 @@ export function LibrarySidebar({
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder={`Find a ${mode === "folders" ? "folder" : mode === "genres" ? "genre" : "artist"}…`}
+          placeholder={`Find a ${
+            mode === "folders"
+              ? "folder"
+              : mode === "genres"
+                ? "genre"
+                : mode === "artists"
+                  ? "artist"
+                  : "track"
+          }…`}
           className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
         />
         {query && (
@@ -248,7 +280,11 @@ export function LibrarySidebar({
           <span className="min-w-0 flex-1 truncate">
             Filtered to{" "}
             <span className="font-medium">
-              {filter.mode === "folder" ? filter.value.split(SEP).pop() : filter.value}
+              {filter.mode === "folder"
+                ? filter.value.split(SEP).pop()
+                : filter.mode === "group"
+                  ? (trackGroups.find((g) => g.trackId === filter.value)?.name ?? filter.value)
+                  : filter.value}
             </span>
           </span>
           <button onClick={() => onFilterChange(null)} className="shrink-0 text-muted-foreground hover:text-foreground">
@@ -311,6 +347,42 @@ export function LibrarySidebar({
               </button>
             ))
           ))}
+        {mode === "tracks" &&
+          (filteredGroups.length === 0 ? (
+            <p className="px-1.5 py-2 text-xs text-muted-foreground">
+              {trackGroups.length === 0
+                ? "No multi-format tracks. Convert a file, or run Unify IDs to link matches."
+                : "No tracks match."}
+            </p>
+          ) : (
+            filteredGroups.map((g) => (
+              <button
+                key={g.trackId}
+                onClick={() => select("group", g.trackId)}
+                title={`${g.name} · Track ID ${g.trackId}`}
+                className={cn(
+                  "flex w-full flex-col gap-0.5 rounded-md px-1.5 py-1 text-left hover:bg-accent",
+                  filter?.mode === "group" && filter.value === g.trackId && "bg-accent font-medium",
+                )}
+              >
+                <span className="flex items-center gap-1.5">
+                  <Link2 className="h-3 w-3 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate text-sm">{g.name}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground">{g.paths.length}</span>
+                </span>
+                <span className="flex flex-wrap gap-1 pl-[18px]">
+                  {g.formats.map((f) => (
+                    <span
+                      key={f}
+                      className="rounded bg-secondary px-1 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground"
+                    >
+                      {f}
+                    </span>
+                  ))}
+                </span>
+              </button>
+            ))
+          ))}
       </div>
 
       <div
@@ -335,5 +407,6 @@ export function matchesSidebarFilter(
   }
   const t = tags[file.path];
   if (filter.mode === "genre") return (t?.genre ?? "") === filter.value;
+  if (filter.mode === "group") return (t?.trackId ?? "") === filter.value;
   return (t?.artist ?? "") === filter.value;
 }

@@ -1,21 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  ClipboardCopy,
+  ExternalLink,
   Filter,
+  FolderOpen,
   Headphones,
   ImageOff,
   ImagePlus,
+  Info,
   Layers,
+  Link2,
   Loader2,
   Music,
   Pause,
   Play,
+  Repeat,
   Search,
   SlidersHorizontal,
   Trash2,
@@ -181,6 +188,10 @@ interface Props {
   onRenameGenre: (oldName: string, newName: string) => void;
   onDeleteFile: (file: AudioFile) => void;
   onRenameFile: (path: string, newStem: string) => void;
+  /** Open the Convert dialog for one right-clicked file. */
+  onConvertFile?: (file: AudioFile) => void;
+  /** Track ID → distinct loaded formats, for the "also loaded as" link badge. */
+  trackIdFormats?: Map<string, string[]>;
   /** Column id of the field currently holding the searchable backup, if enabled. */
   backupFieldId: string | null;
   shortcuts: Record<string, string>;
@@ -360,6 +371,8 @@ export function TrackTable({
   onRenameGenre,
   onDeleteFile,
   onRenameFile,
+  onConvertFile,
+  trackIdFormats,
   backupFieldId,
   shortcuts,
   onTrack,
@@ -800,6 +813,31 @@ export function TrackTable({
   // Full-screen artwork viewer — index into `rows` so Left/Right can step
   // through the whole (sorted/filtered) list, not just the virtualized window.
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
+
+  // Right-click row menu ("Open with…", Reveal, Convert, …). Positioned at the
+  // pointer; closed on any outside click, Escape, or scroll.
+  const [menu, setMenu] = useState<{ x: number; y: number; file: AudioFile } | null>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  const runMenuAction = (fn: () => unknown) => {
+    setMenu(null);
+    void Promise.resolve(fn()).catch((e) => console.error("row action failed:", e));
+  };
+
   // Guards against a single click (open the lightbox) firing on the first
   // half of a double-click (open Inspect) — see the artwork cell below.
   const artClickTimer = useRef<number | null>(null);
@@ -1525,6 +1563,10 @@ export function TrackTable({
                     data-path={f.path}
                     className={cn("border-b border-border/50 transition-colors", rowBg)}
                     onClick={(e) => handleRowClick(e, f.path)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setMenu({ x: e.clientX, y: e.clientY, file: f });
+                    }}
                   >
                     <td
                       className={cn("sticky left-0 z-10 cursor-pointer px-2", rh.py, stickyBg)}
@@ -1785,7 +1827,25 @@ export function TrackTable({
                               </span>
                             </span>
                           ) : t || !c.field ? (
-                            renderCellValue(c, value)
+                            (() => {
+                              const sib =
+                                c.id === "trackId" && value
+                                  ? (trackIdFormats?.get(value) ?? [])
+                                  : [];
+                              return sib.length > 1 ? (
+                                <span
+                                  className="flex items-center gap-1"
+                                  title={`Grouped track — also loaded as ${sib
+                                    .filter((fmt) => fmt !== (f.format || "?").toUpperCase())
+                                    .join(", ")}`}
+                                >
+                                  <span className="truncate">{renderCellValue(c, value)}</span>
+                                  <Link2 className="h-3 w-3 shrink-0 text-primary" />
+                                </span>
+                              ) : (
+                                renderCellValue(c, value)
+                              );
+                            })()
                           ) : (
                             <span className="italic opacity-50">…</span>
                           )}
@@ -1881,6 +1941,69 @@ export function TrackTable({
           }
         />
       )}
+
+      {menu &&
+        createPortal(
+          <div
+            className="fixed z-[60] min-w-[200px] overflow-hidden rounded-md border bg-popover py-1 text-sm shadow-lg"
+            style={{
+              left: Math.min(menu.x, window.innerWidth - 220),
+              top: Math.min(menu.y, window.innerHeight - 300),
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            {(
+              [
+                { icon: Play, label: "Open", run: () => openPath(menu.file.path) },
+                {
+                  icon: ExternalLink,
+                  label: "Open with…",
+                  run: () => invoke("open_with", { path: menu.file.path }),
+                },
+                {
+                  icon: FolderOpen,
+                  label: "Reveal in File Explorer",
+                  run: () => revealItemInDir(menu.file.path),
+                },
+                {
+                  icon: ClipboardCopy,
+                  label: "Copy path",
+                  run: () => navigator.clipboard.writeText(menu.file.path),
+                },
+                null,
+                onConvertFile
+                  ? { icon: Repeat, label: "Convert…", run: () => onConvertFile(menu.file) }
+                  : null,
+                { icon: Info, label: "Inspect tags", run: () => onInspect(menu.file) },
+                null,
+                {
+                  icon: Trash2,
+                  label: "Delete (Recycle Bin)",
+                  run: () => onDeleteFile(menu.file),
+                  danger: true,
+                },
+              ] as ({ icon: typeof Play; label: string; run: () => unknown; danger?: boolean } | null)[]
+            ).map((item, i) =>
+              item === null ? (
+                <div key={`sep${i}`} className="my-1 border-t" />
+              ) : (
+                <button
+                  key={item.label}
+                  onClick={() => runMenuAction(item.run)}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 px-3 py-1.5 text-left hover:bg-accent",
+                    item.danger && "text-destructive hover:bg-destructive/10",
+                  )}
+                >
+                  <item.icon className="h-3.5 w-3.5 shrink-0" />
+                  {item.label}
+                </button>
+              ),
+            )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

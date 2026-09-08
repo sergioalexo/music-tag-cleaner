@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { Download, ListMusic, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
 import type { CharReplacement, DjApp, GenrePreset, ImportResult, OllamaStatus, Settings } from "../types";
+import { CONVERT_PRESETS } from "../types";
 import {
   CAP_OPTIONS,
   CLEARABLE_FIELDS,
@@ -1054,6 +1055,40 @@ export function SettingsPage({
               checked={settings.strictFilenames}
               onChange={(v) => set("strictFilenames", v)}
             />
+          </Row>
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Convert"
+          hint="Default target format and output location for the Convert action (needs FFmpeg — install it on the Components page)"
+        />
+        <div className="px-5 py-3">
+          <Row label="Target format" hint="Codec and quality Convert defaults to">
+            <select
+              className={cn(selectClass, "w-64")}
+              value={settings.convertPreset}
+              onChange={(e) => set("convertPreset", e.target.value as Settings["convertPreset"])}
+            >
+              {CONVERT_PRESETS.map((p) => (
+                <option key={p.value} value={p.value}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </Row>
+          <Row label="Save to" hint="Where converted files are written">
+            <select
+              className={cn(selectClass, "w-64")}
+              value={settings.convertOutput}
+              onChange={(e) =>
+                set("convertOutput", e.target.value as Settings["convertOutput"])
+              }
+            >
+              <option value="alongside">Next to each original</option>
+              <option value="subfolder">A “converted/” subfolder</option>
+            </select>
           </Row>
         </div>
       </Card>

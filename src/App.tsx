@@ -13,6 +13,8 @@ import {
   type ManualMode,
   type ManualResults,
 } from "./components/ManualAIDialog";
+import { ConvertDialog, type ConvertOptions } from "./components/ConvertDialog";
+import { UnifyDialog, type UnifyGroup } from "./components/UnifyDialog";
 import { Card, cn } from "./components/ui";
 import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
@@ -31,6 +33,7 @@ import {
   applyCapitalization,
   applyReplacements,
   buildRenameStem,
+  formatTrackId,
   isUid,
   removeCharsFrom,
 } from "./lib/standardize";
@@ -43,6 +46,9 @@ import {
   formatBytes,
   type AudioFile,
   type Capitalization,
+  type ConvertOutcome,
+  type DuplicateGroup,
+  type FfmpegInfo,
   type PendingChange,
   type PreviewMode,
   type TagData,
@@ -268,6 +274,27 @@ export default function App() {
     map: Record<string, TagData>;
     genres: string[];
   } | null>(null);
+
+  // FFmpeg-backed conversion (v0.10). `ffmpegInfo` gates the Convert dialog.
+  const [ffmpegInfo, setFfmpegInfo] = useState<FfmpegInfo | null>(null);
+  const [convertOpen, setConvertOpen] = useState(false);
+  /** A right-clicked file to convert on its own (vs. the whole selection). */
+  const [convertSeedFile, setConvertSeedFile] = useState<AudioFile | null>(null);
+  /** Preview state for "Unify Track IDs" — null when the dialog is closed. */
+  const [unifyState, setUnifyState] = useState<{ groups: UnifyGroup[]; alternates: number } | null>(
+    null,
+  );
+
+  const refreshFfmpeg = useCallback(async () => {
+    try {
+      setFfmpegInfo(await invoke<FfmpegInfo>("ffmpeg_info"));
+    } catch {
+      setFfmpegInfo({ installed: false, managed: false });
+    }
+  }, []);
+  useEffect(() => {
+    void refreshFfmpeg();
+  }, [refreshFfmpeg]);
 
   const clearUnresolved = (path: string) =>
     setUnresolved((prev) => {
@@ -769,6 +796,203 @@ export default function App() {
         result.assigned ? "success" : "info",
       );
       await afterWrite(paths);
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ---- v0.10: format conversion + cross-format grouping -------------------
+
+  /** Opens the Convert dialog, optionally seeded with one right-clicked file. */
+  const openConvert = (file?: AudioFile) => {
+    if (!file && filesApi.selectedPaths.length === 0) {
+      return notify("No files selected", "info");
+    }
+    setConvertSeedFile(file ?? null);
+    setConvertOpen(true);
+    void refreshFfmpeg(); // pick up an install done since last check
+  };
+
+  const runConvert = async (opts: ConvertOptions) => {
+    setConvertOpen(false);
+    const paths = convertSeedFile
+      ? [convertSeedFile.path]
+      : filesApi.files.filter((f) => filesApi.selected.has(f.path)).map((f) => f.path);
+    setConvertSeedFile(null);
+    if (!paths.length) return;
+
+    setBusy(true);
+    setProgress({ done: 0, total: paths.length, label: "Converting…" });
+    const unlisten = await listen<{ done: number; total: number; file: string | null }>(
+      "convert-progress",
+      (e) => {
+        const { done, total, file } = e.payload;
+        setProgress({
+          done,
+          total,
+          label: file ? `Converting ${basename(file)} (${done + 1}/${total})` : "Finishing…",
+        });
+      },
+    );
+    try {
+      const outcomes = await invoke<ConvertOutcome[]>("convert_files", {
+        paths,
+        preset: opts.preset,
+        subfolder: opts.output === "subfolder",
+        overwrite: false,
+      });
+      const ok = outcomes.filter((o) => o.ok);
+      const failed = outcomes.filter((o) => !o.ok);
+      failed.forEach((o) => notify(`${basename(o.source)}: ${o.error}`, "error"));
+      ok.filter((o) => o.error).forEach((o) => notify(`${basename(o.source)}: ${o.error}`, "info"));
+
+      const newPaths = ok.map((o) => o.output!).filter(Boolean);
+      if (opts.addToLibrary && newPaths.length) {
+        const added = await invoke<AudioFile[]>("list_files", { paths: newPaths });
+        filesApi.merge(added);
+        dropLibraryTags(newPaths);
+      }
+      if (opts.deleteOriginals && ok.length) {
+        for (const o of ok) {
+          try {
+            await invoke("delete_file", { path: o.source });
+          } catch (e) {
+            notify(`Could not remove ${basename(o.source)}: ${e}`, "error");
+          }
+        }
+        const removed = ok.map((o) => o.source);
+        invalidateCovers(removed);
+        filesApi.removeFiles(removed);
+      }
+      if (ok.length) {
+        notify(
+          `Converted ${ok.length} file${ok.length === 1 ? "" : "s"}${
+            failed.length ? `, ${failed.length} failed` : ""
+          }`,
+          failed.length ? "info" : "success",
+        );
+      }
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      unlisten();
+      setProgress(null);
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Scans the loaded files for same-recording clusters (reusing the duplicate
+   * detector) and previews assigning each cluster a shared Track ID, so the
+   * files group as one track. Nothing is written until the dialog is confirmed.
+   */
+  const startUnify = async () => {
+    const paths = filesApi.files.map((f) => f.path);
+    if (paths.length < 2) return notify("Load at least two files first", "info");
+    setBusy(true);
+    setProgress({ done: 0, total: paths.length, label: "Scanning for matches…" });
+    const unlisten = await listen<{ done: number; total: number; phase: string }>(
+      "duplicate-scan-progress",
+      (e) => {
+        const { done, total, phase } = e.payload;
+        setProgress({ done, total, label: `${phase} ${done}/${total}` });
+      },
+    );
+    try {
+      const { map } = await tagsApi.read(paths);
+      setLibraryTags((prev) => ({ ...prev, ...map }));
+      const clusters = await invoke<DuplicateGroup[]>("scan_duplicates", { paths });
+      const dupes = clusters.filter((c) => c.kind === "duplicate");
+      const alternates = clusters.filter((c) => c.kind === "alternate").length;
+
+      let counter = settings.nextTrackId;
+      const groups: UnifyGroup[] = dupes.map((c) => {
+        const existing = c.paths
+          .map((p) => map[p]?.trackId)
+          .find((id) => isUid(id, settings.trackIdDigits));
+        const canonicalId = existing ?? formatTrackId(counter++, settings.trackIdDigits);
+        return {
+          canonicalId,
+          generated: !existing,
+          members: c.paths.map((p) => {
+            const fromId = map[p]?.trackId;
+            const file = filesApi.files.find((f) => f.path === p);
+            return {
+              path: p,
+              format: (file?.format || "?").toUpperCase(),
+              fromId,
+              changes: fromId !== canonicalId,
+            };
+          }),
+        };
+      });
+
+      if (groups.every((g) => g.members.every((m) => !m.changes))) {
+        notify(
+          dupes.length
+            ? "All matching files already share a Track ID"
+            : "No same-recording matches found",
+          "info",
+        );
+        return;
+      }
+      setUnifyState({ groups, alternates });
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      unlisten();
+      setProgress(null);
+      setBusy(false);
+    }
+  };
+
+  const applyUnify = async () => {
+    const state = unifyState;
+    setUnifyState(null);
+    if (!state) return;
+    setBusy(true);
+    try {
+      const changes: HistoryChange[] = [];
+      let maxCounter = settings.nextTrackId;
+      for (const g of state.groups) {
+        const idNum = Number(g.canonicalId);
+        if (g.generated && Number.isFinite(idNum)) maxCounter = Math.max(maxCounter, idNum + 1);
+        const { map } = await tagsApi.read(g.members.map((m) => m.path));
+        for (const m of g.members) {
+          if (!m.changes) continue;
+          const current = map[m.path];
+          if (!current) continue;
+          await tagsApi.updateField(m.path, current, "trackId", g.canonicalId, settings);
+          changes.push({
+            path: m.path,
+            field: "trackId",
+            before: m.fromId ?? "",
+            after: g.canonicalId,
+          });
+        }
+      }
+      if (changes.length) {
+        setLibraryTags((prev) => {
+          const next = { ...prev };
+          for (const c of changes) {
+            if (next[c.path]) next[c.path] = { ...next[c.path], trackId: String(c.after) };
+          }
+          return next;
+        });
+        pushHistory({ label: `Unify Track IDs (${changes.length})`, changes });
+        if (maxCounter !== settings.nextTrackId) {
+          void update((prev) => ({ ...prev, nextTrackId: maxCounter }));
+        }
+        await filesApi.refreshPaths(changes.map((c) => c.path));
+        notify(
+          `Linked ${changes.length} file${changes.length === 1 ? "" : "s"} across ${state.groups.length} track${
+            state.groups.length === 1 ? "" : "s"
+          }`,
+          "success",
+        );
+      }
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -1455,6 +1679,9 @@ export default function App() {
               onRemoveChars={withTrack("removeChars", runRemoveChars)}
               onGenre={withTrack("genre", runGenre)}
               onGenerateIds={withTrack("generateIds", generateIds)}
+              onUnifyIds={withTrack("unifyIds", () => void startUnify())}
+              onConvert={withTrack("convert", () => openConvert())}
+              onConvertFile={withTrack1("convertFile", (f: AudioFile) => openConvert(f))}
               onStandardizeArt={withTrack("standardizeArt", standardizeArtwork)}
               onRename={withTrack("renameToStandard", renameToStandard)}
               onClearFields={withTrack1("clearFields", runClearFields)}
@@ -1508,6 +1735,7 @@ export default function App() {
               ollamaUrl={settings.ollamaUrl}
               notify={notify}
               onOllamaChanged={() => void ai.check(settingsRef.current.ollamaUrl)}
+              onFfmpegChanged={refreshFfmpeg}
             />
           ) : page === "logs" ? (
             <LogsPage
@@ -1560,6 +1788,38 @@ export default function App() {
           onChunkSizeChange={(size) => void update((prev) => ({ ...prev, manualChunkSize: size }))}
           onCancel={() => setManual(null)}
           onDone={applyManualResults}
+        />
+      )}
+
+      {convertOpen && (
+        <ConvertDialog
+          ffmpeg={ffmpegInfo}
+          count={
+            convertSeedFile
+              ? 1
+              : filesApi.files.filter((f) => filesApi.selected.has(f.path)).length
+          }
+          settings={settings}
+          onSaveSettings={save}
+          onCancel={() => {
+            setConvertOpen(false);
+            setConvertSeedFile(null);
+          }}
+          onConvert={runConvert}
+          onGoComponents={() => {
+            setConvertOpen(false);
+            setConvertSeedFile(null);
+            setPage("components");
+          }}
+        />
+      )}
+
+      {unifyState && (
+        <UnifyDialog
+          groups={unifyState.groups}
+          alternates={unifyState.alternates}
+          onCancel={() => setUnifyState(null)}
+          onConfirm={() => void applyUnify()}
         />
       )}
 
