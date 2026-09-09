@@ -104,7 +104,10 @@ interface Props {
   onEditRawField: (paths: string[], rawKey: string, value: string) => void;
   onEditRating: (paths: string[], stars: number) => void;
   onInspect: (file: AudioFile) => void;
-  onDeleteFile: (file: AudioFile) => void;
+  /** Confirms with the user, then moves the file to the Recycle Bin.
+   * `onConfirmed` fires after the user says yes and before the file moves —
+   * Genre Mode uses it to advance playback off the track being deleted. */
+  onDeleteFile: (file: AudioFile, opts?: { onConfirmed?: () => void }) => void | Promise<void>;
   onRenameFile: (path: string, newStem: string) => void;
   onSaveSettings: (settings: Settings) => void;
   backupFieldId: string | null;

@@ -117,7 +117,25 @@ export function formatImageInfo(info: { mime: string; sizeBytes: number; width: 
 }
 
 const HIGHLIGHT_FIELDS = new Set(["title", "artist"]);
+/**
+ * True when a Space press belongs to the track table rather than to whatever
+ * currently has focus. Clicking a row leaves focus on `document.body` (a <td>
+ * isn't focusable), so that's the usual case; a press that lands inside the
+ * table's own scroller while some other non-typing element holds focus counts
+ * too. Anything that wants Space for itself — a text field, a button, a link —
+ * keeps it.
+ */
+function ownsSpace(target: HTMLElement | null, scroller: HTMLElement | null): boolean {
+  if (!target) return false;
+  if (target.closest("input,textarea,select,button,a,[contenteditable='true']")) return false;
+  return target === document.body || !!scroller?.contains(target);
+}
+
 const MIN_WIDTH = 50;
+/** How close to the table's edge a column drag has to get before the table
+ * pans, and how far it pans per mousemove. */
+const EDGE_PAN_ZONE = 48;
+const EDGE_PAN_STEP = 18;
 
 function stemOf(filename: string): string {
   const idx = filename.lastIndexOf(".");
@@ -188,7 +206,10 @@ interface Props {
   onInspect: (file: AudioFile) => void;
   onAddGenre: (genre: string) => void;
   onRenameGenre: (oldName: string, newName: string) => void;
-  onDeleteFile: (file: AudioFile) => void;
+  /** Confirms with the user, then moves the file to the Recycle Bin.
+   * `onConfirmed` fires after the user says yes and before the file moves —
+   * Genre Mode uses it to advance playback off the track being deleted. */
+  onDeleteFile: (file: AudioFile, opts?: { onConfirmed?: () => void }) => void | Promise<void>;
   onRenameFile: (path: string, newStem: string) => void;
   /** Open the Convert dialog for one right-clicked file. */
   onConvertFile?: (file: AudioFile) => void;
@@ -447,6 +468,9 @@ export function TrackTable({
   // means "checked, none imported"; `undefined` means "not fetched yet".
   const [gmCues, setGmCues] = useState<CueData | null | undefined>(undefined);
   const gmCuesCache = useRef<Record<string, CueData | null>>({});
+  // True while the Genre Mode delete confirmation is up, so holding Del (or
+  // hitting it again behind the dialog) can't stack a second one.
+  const gmDeletingRef = useRef(false);
 
   const gmSavePosition = useCallback(() => {
     const el = gmAudioRef.current;
@@ -502,6 +526,34 @@ export function TrackTable({
     const max = Number.isFinite(el.duration) ? el.duration : el.currentTime + Math.abs(delta);
     el.currentTime = Math.max(0, Math.min(max, el.currentTime + delta));
   }, []);
+
+  /**
+   * Needle drop: jump `path` to `fraction` (0-1) of its length and play from
+   * there. Driven by pressing/dragging on the Genre Mode waveform.
+   *
+   * When the track isn't the one loaded in the <audio> element yet, the
+   * position goes into `gmPositions` instead — `gmPlay` seeks there itself on
+   * `loadedmetadata`, once a duration actually exists to seek within.
+   */
+  const gmSeekTo = useCallback(
+    (path: string, fraction: number) => {
+      const el = gmAudioRef.current;
+      if (!el) return;
+      const clamped = Math.max(0, Math.min(1, fraction));
+      const known = rowsRef.current.find((f) => f.path === path)?.durationSecs ?? 0;
+      if (el.src === convertFileSrc(path)) {
+        const dur = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : known;
+        if (dur > 0) el.currentTime = dur * clamped;
+        gmPositions.current[path] = el.currentTime;
+        setGmTime(el.currentTime);
+      } else {
+        gmPositions.current[path] = known * clamped;
+        setGmTime(gmPositions.current[path]);
+      }
+      gmPlay(path);
+    },
+    [gmPlay],
+  );
 
   /** After a genre is saved, moves to the next row and starts it playing from
    * its own resume point — or stops if that was the last row. */
@@ -614,6 +666,42 @@ export function TrackTable({
             }
             return;
           }
+          if (e.key === "Delete") {
+            e.preventDefault();
+            if (gmDeletingRef.current) return;
+            const file = rowsRef.current.find((f) => f.path === currentPath);
+            if (!file) return;
+            gmDeletingRef.current = true;
+            // `onDeleteFile` asks first and only calls back on a yes, so a
+            // cancelled delete leaves this track playing where it was. On a
+            // yes, playback moves off this track *before* the file goes to the
+            // Recycle Bin — both because a deleted track shouldn't keep
+            // playing, and because the <audio> element should let go of the
+            // file first. Not `gmAdvance`: deleting the last row has to fall
+            // back to the row above rather than leave the anchor on a path
+            // that's about to stop existing.
+            void Promise.resolve(
+              gmActionsRef.current.onDeleteFile(file, {
+                onConfirmed: () => {
+                  const list = rowsRef.current;
+                  const idx = list.findIndex((f) => f.path === currentPath);
+                  const next = list[idx + 1] ?? list[idx - 1];
+                  if (next) {
+                    setAnchorPath(next.path);
+                    setRowSel(new Set([next.path]));
+                    gmPlay(next.path);
+                  } else {
+                    gmStop();
+                    setAnchorPath(null);
+                    setRowSel(new Set());
+                  }
+                },
+              }),
+            ).finally(() => {
+              gmDeletingRef.current = false;
+            });
+            return;
+          }
           if (/^[1-9]$/.test(e.key)) {
             e.preventDefault();
             const { genreOptions: liveOptions, onEditField: liveOnEditField } = gmActionsRef.current;
@@ -638,13 +726,16 @@ export function TrackTable({
         return;
       }
       // Space ticks the whole highlight selection (or just the anchor row when
-      // nothing is selected). Only when nothing else holds focus, so it never
-      // steals Space from an input or a button.
-      if (e.key === " " && e.target === document.body) {
+      // nothing is selected). The guard keeps it away from anything that wants
+      // Space for itself — a text field, a button, an open dialog — but is
+      // otherwise deliberately wide, and preventDefault runs even when there's
+      // nothing to tick: whenever Space belongs to the table, it must not fall
+      // through to the browser, which would page the table down instead.
+      if (e.key === " " && ownsSpace(e.target as HTMLElement | null, scrollRef.current)) {
+        e.preventDefault();
         const sel = rowSelRef.current;
         const targets = sel.size ? [...sel] : anchorRef.current ? [anchorRef.current] : [];
         if (!targets.length) return;
-        e.preventDefault();
         onSetMany(targets, !selectedRef.current.has(targets[0]));
       }
       // Escape clears the row highlight. Guarded to the body so it never
@@ -986,6 +1077,32 @@ export function TrackTable({
     return m;
   }, [pending]);
 
+  // Horizontal panning of the table: a tilt wheel / trackpad swipe (deltaX),
+  // and Shift+wheel for mice that have neither.
+  //
+  // Registered natively rather than as React's `onWheel`, because React
+  // attaches wheel at the root as a *passive* listener, where preventDefault
+  // is ignored — and without preventDefault a Shift+wheel gets applied twice,
+  // once here and once by Chromium's own shift-to-horizontal mapping.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      // deltaMode 1 is lines, 2 is pages; both need scaling to pixels.
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientWidth : 1;
+      const raw = e.deltaX !== 0 ? e.deltaX : e.shiftKey ? e.deltaY : 0;
+      if (raw === 0) return;
+      const max = el.scrollWidth - el.clientWidth;
+      if (max <= 0) return;
+      const next = Math.max(0, Math.min(max, el.scrollLeft + raw * unit));
+      if (next === el.scrollLeft) return;
+      el.scrollLeft = next;
+      e.preventDefault();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   // Resizing ends in a mouseup on the header, which would otherwise also fire a
   // click there and toggle sort right after — this flag suppresses that one click.
   const resizingRef = useRef(false);
@@ -1025,19 +1142,96 @@ export function TrackTable({
     onVisibleColumnsChange(next);
   };
 
+  // Column reordering, on plain mouse events rather than HTML5 drag-and-drop.
+  // On Windows the app needs Tauri's own OS drop target on the window (that's
+  // what delivers dropped file *paths* for import), and while that is
+  // installed WebView2 never delivers `drop` to the page — so a `draggable`
+  // <th> could be picked up but never let go, whatever `dragstart` /
+  // `dragover` replied. Mouse events don't go through the OS drag machinery
+  // at all, so they work either way.
   const [dragCol, setDragCol] = useState<string | null>(null);
-  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
+  const [dropAt, setDropAt] = useState<{ id: string; side: "left" | "right" } | null>(null);
+  const headerElsRef = useRef<Record<string, HTMLTableCellElement | null>>({});
+  // Set on the mouseup that ends a real drag so the click right after it
+  // doesn't also sort the column — same trick as `resizingRef`.
+  const columnDraggedRef = useRef(false);
 
-  const reorderColumn = (fromId: string, toId: string) => {
+  const moveColumn = (fromId: string, toId: string, side: "left" | "right") => {
     if (fromId === toId) return;
     const order = visibleColumns.slice();
     const fromIdx = order.indexOf(fromId);
     if (fromIdx === -1) return;
     order.splice(fromIdx, 1);
-    const toIdx = order.indexOf(toId);
+    let toIdx = order.indexOf(toId);
     if (toIdx === -1) return;
+    if (side === "right") toIdx += 1;
     order.splice(toIdx, 0, fromId);
     onVisibleColumnsChange(order);
+  };
+
+  /** Nearest reorderable header to `clientX`, and which of its edges to drop on. */
+  const dropTargetAt = (clientX: number): { id: string; side: "left" | "right" } | null => {
+    let best: { id: string; side: "left" | "right"; dist: number } | null = null;
+    for (const id of visibleColumns) {
+      const el = headerElsRef.current[id];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0) continue;
+      // Distance to the header box, so a pointer dragged past the last column
+      // still resolves to that column's outer edge instead of nothing.
+      const dist = clientX < r.left ? r.left - clientX : clientX > r.right ? clientX - r.right : 0;
+      const side: "left" | "right" = clientX < r.left + r.width / 2 ? "left" : "right";
+      if (!best || dist < best.dist) best = { id, side, dist };
+    }
+    return best ? { id: best.id, side: best.side } : null;
+  };
+
+  const startColumnDrag = (e: React.MouseEvent, colId: string) => {
+    // Left button only, and never when the press landed on one of the header's
+    // own controls (the include/clear checkboxes) or the resize grip.
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("input,button")) return;
+    // Stops the press selecting the header text mid-drag.
+    e.preventDefault();
+    const startX = e.clientX;
+    let moved = false;
+    let target: { id: string; side: "left" | "right" } | null = null;
+    const onMove = (ev: MouseEvent) => {
+      if (!moved) {
+        // A few pixels of slop, so a plain click still sorts.
+        if (Math.abs(ev.clientX - startX) < 4) return;
+        moved = true;
+        internalDrag.active = true;
+        setDragCol(colId);
+      }
+      // Pan the table when the pointer nears an edge, so a column can be
+      // dragged to a position that's currently scrolled off-screen.
+      const sc = scrollRef.current;
+      if (sc) {
+        const r = sc.getBoundingClientRect();
+        if (ev.clientX < r.left + EDGE_PAN_ZONE) sc.scrollLeft -= EDGE_PAN_STEP;
+        else if (ev.clientX > r.right - EDGE_PAN_ZONE) sc.scrollLeft += EDGE_PAN_STEP;
+      }
+      target = dropTargetAt(ev.clientX);
+      setDropAt(target);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      internalDrag.active = false;
+      setDragCol(null);
+      setDropAt(null);
+      if (!moved) return;
+      columnDraggedRef.current = true;
+      // Cleared after the click this mouseup generates has been swallowed, so
+      // a later plain click on the same header still sorts.
+      setTimeout(() => {
+        columnDraggedRef.current = false;
+      }, 0);
+      if (target) moveColumn(colId, target.id, target.side);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   };
 
   /** Proposed changes grouped by column — drives the header include/exclude box. */
@@ -1063,8 +1257,24 @@ export function TrackTable({
   // (declared above, before these exist) into a ref, so that handler's
   // effect can stay subscribed with a stable dependency list instead of
   // re-registering the window listener on every tags/props change.
-  const gmActionsRef = useRef({ tags, genreOptions, onEditField, onTrack, beginEdit, virtual });
-  gmActionsRef.current = { tags, genreOptions, onEditField, onTrack, beginEdit, virtual };
+  const gmActionsRef = useRef({
+    tags,
+    genreOptions,
+    onEditField,
+    onTrack,
+    beginEdit,
+    virtual,
+    onDeleteFile,
+  });
+  gmActionsRef.current = {
+    tags,
+    genreOptions,
+    onEditField,
+    onTrack,
+    beginEdit,
+    virtual,
+    onDeleteFile,
+  };
 
   // Fetches Rekordbox cues (see `get_cues_for_path`) for whichever track is
   // showing in the Genre Mode strip, so its Waveform can draw them.
@@ -1410,17 +1620,7 @@ export function TrackTable({
         </div>
       )}
 
-      <div
-        ref={scrollRef}
-        className="min-h-0 flex-1 overflow-auto"
-        onWheel={(e) => {
-          // Cross-mouse-hardware fallback: Shift+wheel always pans horizontally,
-          // even on mice without a tilt wheel or trackpad gesture support.
-          if (e.shiftKey && e.deltaY !== 0) {
-            e.currentTarget.scrollLeft += e.deltaY;
-          }
-        }}
-      >
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         {rows.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 py-16 text-muted-foreground">
             <p className="text-sm">
@@ -1477,77 +1677,23 @@ export function TrackTable({
                   return (
                   <th
                     key={c.id}
-                    draggable={!c.dynamic}
-                    onDragStart={
-                      c.dynamic
-                        ? undefined
-                        : (e) => {
-                            e.dataTransfer.effectAllowed = "move";
-                            // Chromium (so WebView2, so the app) treats a drag
-                            // carrying no data as un-droppable and shows the
-                            // "no drop" cursor over every target, however the
-                            // dragover handler replies. The payload itself is
-                            // unused — `dragCol` carries the column id — but it
-                            // has to be there for the drag to be valid at all.
-                            e.dataTransfer.setData("text/plain", c.id);
-                            internalDrag.active = true;
-                            setDragCol(c.id);
-                          }
-                    }
-                    onDragEnter={
-                      c.dynamic
-                        ? undefined
-                        : (e) => {
-                            // Marks this header a valid drop target; without it
-                            // the first dragenter cancels the drop for the cell.
-                            e.preventDefault();
-                            if (dragCol && dragCol !== c.id) setDragOverCol(c.id);
-                          }
-                    }
-                    onDragOver={
-                      c.dynamic
-                        ? undefined
-                        : (e) => {
-                            e.preventDefault();
-                            // Without an explicit dropEffect the cursor stays
-                            // "no drop" even though the drop would be accepted.
-                            e.dataTransfer.dropEffect = "move";
-                          }
-                    }
-                    onDrop={
-                      c.dynamic
-                        ? undefined
-                        : (e) => {
-                            e.preventDefault();
-                            if (dragCol) reorderColumn(dragCol, c.id);
-                            internalDrag.active = false;
-                            setDragCol(null);
-                            setDragOverCol(null);
-                          }
-                    }
-                    onDragEnd={
-                      c.dynamic
-                        ? undefined
-                        : () => {
-                            internalDrag.active = false;
-                            setDragCol(null);
-                            setDragOverCol(null);
-                          }
-                    }
+                    ref={(el) => {
+                      headerElsRef.current[c.id] = el;
+                    }}
+                    onMouseDown={c.dynamic ? undefined : (e) => startColumnDrag(e, c.id)}
                     onClick={() => {
-                      // Suppress the synthetic click that follows a resize drag
-                      // (the flag is cleared by startResize's mouseup handler).
-                      if (resizingRef.current) return;
+                      // Swallow the synthetic click that follows a resize or a
+                      // reorder drag (both flags clear on the next tick).
+                      if (resizingRef.current || columnDraggedRef.current) return;
                       toggleSort(c.id);
                     }}
                     className={cn(
                       "relative cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground",
-                      !c.dynamic && "cursor-move",
+                      !c.dynamic && (dragCol ? "cursor-grabbing" : "cursor-grab"),
                       headerSep,
                       c.align === "right" && "text-right",
                       c.align === "center" && "text-center",
                       dragCol === c.id && "opacity-40",
-                      dragOverCol === c.id && "bg-accent/40",
                       c.dynamic && "italic",
                     )}
                     title={
@@ -1597,13 +1743,19 @@ export function TrackTable({
                     </span>
                     <span
                       className="group absolute -right-px top-0 z-20 flex h-full w-2 cursor-col-resize items-center justify-center"
-                      draggable
-                      onDragStart={(e) => e.preventDefault()}
                       onMouseDown={(e) => startResize(e, c.id, widthOf(c))}
                       title="Drag to resize"
                     >
                       <span className="h-3.5 w-px bg-border group-hover:h-full group-hover:w-0.5 group-hover:bg-primary" />
                     </span>
+                    {dragCol && dropAt?.id === c.id && (
+                      <span
+                        className={cn(
+                          "pointer-events-none absolute top-0 z-40 h-full w-0.5 bg-primary",
+                          dropAt.side === "left" ? "left-0" : "right-0",
+                        )}
+                      />
+                    )}
                   </th>
                   );
                 })}
@@ -1966,7 +2118,7 @@ export function TrackTable({
                   </span>
                   <span className="shrink-0 font-mono text-muted-foreground">
                     {formatDuration(playingHere ? gmTime : gmPositions.current[currentFile.path] ?? 0)} /{" "}
-                    {formatDuration(playingHere ? gmDuration : 0)}
+                    {formatDuration((playingHere && gmDuration) || currentFile.durationSecs || 0)}
                   </span>
                   <span className="shrink-0 text-muted-foreground">
                     Genre: <span className="font-medium text-foreground">{tags[currentFile.path]?.genre || "—"}</span>
@@ -1975,7 +2127,8 @@ export function TrackTable({
               );
             })()}
             <span className="ml-auto shrink-0 text-muted-foreground">
-              ↑↓ move · Enter play / tag · ←→ seek {GM_SEEK_SECONDS}s · 1–9 quick-tag · Space play/pause · Esc exit
+              ↑↓ move · Enter play / tag · ←→ seek {GM_SEEK_SECONDS}s · click waveform to drop the needle · 1–9
+              quick-tag · Space play/pause · Del delete · Esc exit
             </span>
             <Button variant="ghost" size="sm" onClick={toggleGenreMode}>
               Exit
@@ -1985,11 +2138,13 @@ export function TrackTable({
             const currentPath = anchorPath ?? rows[0]?.path ?? null;
             if (!currentPath) return null;
             const playingHere = gmPlayingPath === currentPath;
-            const progress =
-              playingHere && gmDuration > 0
-                ? gmTime / gmDuration
-                : undefined;
             const currentFile = rows.find((f) => f.path === currentPath);
+            // Keep the playhead drawn while paused too, so a needle drop that
+            // lands on a stopped track still shows where it landed. The tag's
+            // own duration stands in until the <audio> element reports one.
+            const dur = (playingHere && gmDuration) || currentFile?.durationSecs || 0;
+            const pos = playingHere ? gmTime : gmPositions.current[currentPath] ?? 0;
+            const progress = dur > 0 ? Math.min(1, pos / dur) : undefined;
             return (
               <Waveform
                 path={currentPath}
@@ -1998,6 +2153,7 @@ export function TrackTable({
                 className="mt-1.5"
                 cues={gmCues}
                 durationSecs={currentFile?.durationSecs}
+                onSeek={(f) => gmSeekTo(currentPath, f)}
               />
             );
           })()}

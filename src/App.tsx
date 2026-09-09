@@ -1000,12 +1000,17 @@ export default function App() {
     }
   };
 
-  const deleteFile = async (file: AudioFile) => {
+  const deleteFile = async (file: AudioFile, opts?: { onConfirmed?: () => void }) => {
     const ok = await confirm(
       `Delete "${file.filename}"? It will be moved to the Recycle Bin.`,
       { title: "Delete File", kind: "warning" },
     );
     if (!ok) return;
+    // Runs only once the user has said yes, and before the file actually
+    // moves: Genre Mode uses it to hand playback to the next track, so the
+    // <audio> element isn't still holding the file being deleted — and a
+    // cancelled delete leaves the current track playing untouched.
+    opts?.onConfirmed?.();
     try {
       await invoke("delete_file", { path: file.path });
       invalidateCovers([file.path]);
@@ -1632,7 +1637,10 @@ export default function App() {
               onEditRawField={editRawField}
               onEditRating={editRating}
               onInspect={inspect}
-              onDeleteFile={withTrack1("deleteFile", deleteFile)}
+              onDeleteFile={(f, opts) => {
+                analytics.track("deleteFile");
+                return deleteFile(f, opts);
+              }}
               onRenameFile={renameSingleFile}
               imageInfo={imageInfoApi.info}
               onFetchImageInfo={imageInfoApi.fetchOne}

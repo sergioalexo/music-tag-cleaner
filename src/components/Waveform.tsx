@@ -39,11 +39,16 @@ export function Waveform({
   className,
   cues,
   durationSecs,
+  onSeek,
 }: {
   path: string;
   height?: number;
   progress?: number;
   className?: string;
+  /** Needle drop: press anywhere on the waveform (and drag to scrub) to jump
+   * playback there. Receives the position as a 0-1 fraction of the track.
+   * Omitted, the waveform stays a passive display. */
+  onSeek?: (fraction: number) => void;
   /** Rekordbox cues/loops for this track (see `get_cues_for_path`), drawn as
    * an overlay on top of the waveform. Requires `durationSecs` to position
    * them — without it, cues are silently skipped. */
@@ -94,12 +99,47 @@ export function Waveform({
   }
 
   const n = peaks.length;
+
+  // Pointer x -> 0-1 position. Pointer capture (rather than window listeners)
+  // keeps the scrub alive when the cursor leaves the 28px-tall strip, which it
+  // does almost immediately on any real drag.
+  const seekFrom = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!onSeek) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    if (r.width <= 0) return;
+    onSeek(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)));
+  };
+
   return (
     <svg
       viewBox={`0 0 ${n} 100`}
       preserveAspectRatio="none"
-      className={cn("block w-full", className)}
-      style={{ height }}
+      className={cn("block w-full", onSeek && "cursor-pointer", className)}
+      style={{ height, touchAction: onSeek ? "none" : undefined }}
+      onPointerDown={
+        onSeek
+          ? (e) => {
+              if (e.button !== 0) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              seekFrom(e);
+            }
+          : undefined
+      }
+      onPointerMove={
+        onSeek
+          ? (e) => {
+              if (e.currentTarget.hasPointerCapture(e.pointerId)) seekFrom(e);
+            }
+          : undefined
+      }
+      onPointerUp={
+        onSeek
+          ? (e) => {
+              if (e.currentTarget.hasPointerCapture(e.pointerId))
+                e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+          : undefined
+      }
     >
       {peaks.map((p, i) => {
         const barHeight = Math.max(2, p * 98);
@@ -158,7 +198,16 @@ export function Waveform({
         </>
       )}
       {progress !== undefined && progress >= 0 && progress <= 1 && (
-        <rect x={progress * n} y={0} width={Math.max(0.6, n * 0.003)} height={100} className="fill-primary" />
+        <g className="fill-primary">
+          <rect x={progress * n} y={0} width={Math.max(0.6, n * 0.003)} height={100} />
+          <rect
+            x={progress * n - Math.max(1.2, n * 0.006)}
+            y={0}
+            width={Math.max(3, n * 0.015)}
+            height={8}
+            rx={Math.max(0.6, n * 0.003)}
+          />
+        </g>
       )}
     </svg>
   );

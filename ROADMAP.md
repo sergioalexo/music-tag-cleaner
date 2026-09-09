@@ -1182,6 +1182,95 @@ over accented Latin, punctuation, lowercase tags, `AC/DC`, Russian (Ляпис,
 Відоплясова), Japanese and empty input — with an explicit check that й and ё
 survive as themselves.
 
+### 42. Column reordering off HTML5 drag; horizontal wheel, Space, needle drop, Del — v0.11.3
+
+**Column drag-reorder never worked in the packaged app.** Item 40 fixed the
+three HTML5 drag bugs in the header (`setData`, `dragenter`'s
+`preventDefault()`, `dropEffect`) and reordering still did nothing, because the
+remaining obstacle was not in the page at all: `dragDropEnabled` defaults on,
+so Tauri installs its own OS drop target on the window — which is what delivers
+dropped file *paths* for import — and while that is installed WebView2 never
+delivers `drop` to the page. The `<th>` could be picked up and never let go, no
+matter what `dragstart`/`dragover` replied. The two features are mutually
+exclusive as long as reordering goes through HTML5 drag-and-drop.
+
+**Fix:** reordering now runs on plain mouse events (`mousedown` on the header,
+`mousemove`/`mouseup` on `window`), which never touch the OS drag machinery, so
+Tauri keeps its file-drop target. A 4px threshold before the drag counts keeps
+a plain click sorting; `columnDraggedRef` swallows the click that follows a real
+drag the same way `resizingRef` does for a resize. The drop position is an
+*edge*, not a column — `dropTargetAt` picks the nearest header and which half
+the pointer is on — so a column can be placed after the last one, and a blue
+line shows exactly where it will land. Dragging within 48px of either edge pans
+the table, so a column can be moved somewhere currently scrolled off-screen.
+`internalDrag` is kept and still set during the drag: harmless now, and the
+flag is what stops the file-drop overlay if the OS drag path is ever back.
+
+**Horizontal wheel did nothing.** The old handler was React's `onWheel` and only
+looked at `shiftKey` + `deltaY` — a tilt wheel or trackpad swipe (`deltaX`) was
+ignored entirely. It is now a native listener registered with
+`{ passive: false }`: React attaches `wheel` at the root as passive, where
+`preventDefault` is silently dropped, and without `preventDefault` a Shift+wheel
+scrolls twice — once from the handler, once from Chromium's own
+shift-to-horizontal mapping. `deltaMode` is scaled to pixels (some mice report
+lines, not pixels).
+
+Worth remembering if a tilt wheel ever looks dead again, because it cost three
+diagnostic rounds: a tilt over an *unfocused* webview still fires `wheel` in
+the page, but with `deltaX`, `deltaY`, `deltaZ` **and** the legacy
+`wheelDeltaX/Y` all exactly 0 — a real, `isTrusted` event carrying no
+direction at all, which looks identical to a broken handler. Windows delivers
+`WM_MOUSEHWHEEL` to the focused window, and Chromium synthesises the
+directionless event when that isn't the webview. Click into the page first and
+the same tilt arrives as `deltaX: ±100` (`wheelDeltaX: ∓120`). The Rust-side
+fix this seemed to call for — subclassing the window to read the delta out of
+`wParam`, or reading it from raw input — turned out not to be needed.
+
+**Space scrolled the table instead of ticking rows.** Two holes in one guard.
+`e.target === document.body` was too narrow — anything focused inside the table
+lost the key — and the handler returned *before* `preventDefault()` when there
+was nothing to tick, so with no row highlighted Space fell through to the
+browser and paged the table down. `ownsSpace()` now claims the key for the
+table whenever the target is the body or inside the table's own scroller and is
+not an input/textarea/select/button/link/contenteditable, and `preventDefault()`
+runs first, so Space never reaches the browser's scroll.
+
+**Genre Mode: needle drop.** Pressing anywhere on the Genre Mode waveform now
+jumps playback there and plays from that point, and holding scrubs — pointer
+*capture* rather than window listeners, since the cursor leaves the 28px strip
+almost immediately on any real drag. Cue markers are part of the same surface,
+so pressing a hot cue starts there. `gmSeekTo` handles the track that isn't
+loaded yet by writing the position into `gmPositions` and letting `gmPlay`'s
+existing `loadedmetadata` seek apply it, once there is a duration to seek
+within. The playhead is drawn while paused too (falling back to the tag's own
+duration before `<audio>` reports one), so a needle drop on a stopped track
+still shows where it landed, and it grew a small head so it reads as a needle
+rather than another cue line.
+
+**Genre Mode: Del deletes.** `Del` on the Genre Mode strip offers to move the
+current track to the Recycle Bin and, on a yes, moves playback to the next one
+before the file goes. Ordering is the whole point: a deleted track must not
+keep playing, and the `<audio>` element has to let go of the file first. So
+`onDeleteFile` grew an `onConfirmed` callback that fires between the user
+saying yes and the file actually moving — a cancelled delete leaves the track
+playing exactly where it was. It deliberately isn't `gmAdvance`: deleting the
+*last* row has to fall back to the row above, since `gmAdvance` would stop and
+leave the anchor pointing at a path about to stop existing, which the strip
+then renders as "No track selected". A `gmDeletingRef` guard stops a held key
+stacking confirmations behind the dialog.
+
+**Verification:** `moveColumn` run over first→end, last→start, both neighbour
+swaps, onto-itself and drop-on-own-adjacent-edge (the classic off-by-one, which
+must be a no-op) — all correct. `tsc --noEmit` and `npm run build` clean.
+
+All five then confirmed by hand in the running Tauri app (`tauri dev`), which
+is the only place the WebView2-specific half of this is real: column
+drag-reorder, horizontal tilt-wheel panning, Space with nothing highlighted,
+Genre Mode needle drop, and `Del`. Note the frontend alone can't be smoke-
+tested in a plain browser at `localhost:1420` — the app needs the Tauri IPC
+bridge and dies at the first `invoke`, so every check has to go through the
+real window.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
