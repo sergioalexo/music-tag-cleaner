@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner"
-version = "0.11.4"
+version = "0.12.0"
 description = "Clean up messy audio tags, with a local AI or by hand"
 edition = "2021"
 
@@ -30,6 +30,19 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 blake3 = "1.8.7"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 quick-xml = "0.42.0"
+fatfs = "0.3.6"
+
+# Windows-only: raw volume access for the FAT32 formatter. Pinned to the same
+# major as the copy Tauri already pulls in, so the tree carries one `windows`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_UI_Shell",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+] }
 
 [profile.release]
 strip = true

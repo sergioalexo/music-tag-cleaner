@@ -1332,6 +1332,68 @@ only the APE tag knows the album, sweeps it, and asserts ID3v2 is the sole
 survivor with title, artist *and* that album still on it — then sweeps again
 and asserts it reports no change. Full suite 42 passed.
 
+### 44. FAT32 USB formatter for CDJs — v0.12.0
+
+Components page: pick a removable drive, type its label back, and it is
+rewritten as FAT32 at any size — including sticks over 32 GB, which Windows'
+own `format.com` and `Format-Volume` refuse outright ("volume too big"). That
+refusal is the whole reason this exists: a DJ's 64 GB stick cannot be prepared
+for CDJs with the tools Windows ships.
+
+**Why not shell out to fat32format.** It is what guiformat and every DJ guide
+uses, and it was the first choice — until it turned out Ridgecrop serves no
+HTTPS at all. Downloading it means fetching an unsigned executable over plain
+HTTP and then handing it raw disk devices; anyone able to intercept that
+request chooses what code formats the user's drives. The `fatfs` crate does the
+same job with its integrity pinned by `Cargo.lock` and compiled into the
+already-signed binary, so that is what this uses.
+
+**Safety.** Only `DriveType == Removable` volumes are ever enumerated, the
+system drive is dropped even if it claims to be removable, and the chosen drive
+is re-resolved against a *fresh* enumeration at format time — a letter is not
+identity, since pulling one stick and pushing in another reuses it.
+Confirmation is by typing the drive's current label rather than clicking OK,
+so the user has to read what is actually on the thing they are erasing. Raw
+volume writes need Administrator, so a second copy of the exe runs via `runas`
+and exits; that is handled at the very top of `main`, before the
+single-instance plugin exists, because that plugin forwards arguments to the
+running UI and exits — which would have silently formatted nothing.
+
+**Three bugs, none of which the image tests could have caught.** Worth
+recording, because the lesson generalises: a `Cursor<Vec<u8>>` is a far more
+forgiving device than a real volume.
+
+1. The device path must be `\\.\D:` and shipped one backslash short, as
+   `\.\D:`. Windows reports that
+   as ERROR_INVALID_NAME — "volume label syntax is incorrect" — which reads
+   like a bad *drive*, not a bad string. `device_path` is now a tested function.
+2. A raw volume handle **rejects `SeekFrom::End`** with ERROR_INVALID_PARAMETER.
+   The aligner learned the device size by seeking to the end, which a file
+   answers happily. Size now comes from `IOCTL_DISK_GET_LENGTH_INFO`, and
+   `seek(End)` is answered from that — it matters because `fatfs` seeks to the
+   end itself to decide how many sectors to lay out.
+3. Formatting appeared to hang. `fatfs::write_zeros` clears the FAT with a
+   **512-byte** buffer in a loop — ~14 MB of FAT on a 57 GB volume, so ~28,000
+   iterations — and each went to the device as its own seek plus a 512-byte
+   unbuffered USB write. Writes now coalesce into 1 MiB, turning ~28,000 device
+   round-trips into about fourteen. Reads flush the pending buffer first,
+   because fatfs writes the FAT then reads it back to allocate the root
+   cluster; without that it would read stale bytes and build a subtly broken
+   filesystem.
+
+Windows raw-volume I/O is only legal on whole sectors, so `SectorAligned` sits
+between fatfs and the device doing read-modify-write for anything partial —
+without it every format fails on the first unaligned write.
+
+**Verification:** 12 tests. Formatting runs end to end against a file-backed
+image — format, mount, assert FAT32 rather than FAT16, check the label, create
+a file in the root — plus a write straddling a sector boundary, label
+sanitising, the `with_len` path, and a counting device proving 8,192 separate
+512-byte writes reach it in 8 or fewer with the bytes still exact. The guards
+are covered for junk input, the raw device path form, the system drive by
+letter and with a colon, and a fixed disk that lies and reports `Removable`.
+Then confirmed by formatting a real USB stick.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

@@ -9,4 +9,5 @@ pub mod duplicates;
 pub mod ffmpeg;
 pub mod files;
 pub mod rekordbox_import;
+pub mod usb;
 pub mod ytmusic;

@@ -42,6 +42,14 @@ fn take_opened_files(state: tauri::State<PendingOpen>) -> Vec<String> {
 }
 
 fn main() {
+    // Elevated helper mode: a second copy of this exe, launched with `runas`,
+    // formats one drive and exits. Handled before anything else so the
+    // single-instance plugin never sees it — that plugin forwards arguments to
+    // the already-running UI and exits, which would silently format nothing.
+    if let Some(code) = commands::usb::run_format_helper_if_requested() {
+        std::process::exit(code);
+    }
+
     let initial = openable_paths(std::env::args().skip(1));
 
     tauri::Builder::default()
@@ -79,6 +87,8 @@ fn main() {
             commands::files::read_tags_batch,
             commands::files::write_tags,
             commands::files::standardize_tag_containers,
+            commands::usb::list_removable_drives,
+            commands::usb::format_drive_fat32,
             commands::files::write_tags_batch,
             commands::files::write_raw_field,
             commands::files::write_raw_fields_batch,

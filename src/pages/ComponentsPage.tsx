@@ -6,6 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { UsbFormatCard } from "../components/UsbFormatCard";
 import {
   Boxes,
   CheckCircle2,
@@ -320,6 +321,8 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
           Refresh
         </Button>
       </div>
+
+      <UsbFormatCard notify={notify} />
 
       {/* Music Tag Cleaner itself */}
       <Card className="p-5">
