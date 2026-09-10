@@ -12,8 +12,8 @@ use walkdir::WalkDir;
 
 use crate::commands::backup::{find_backup_in_file, make_backup_string, BACKUP_KEY};
 use crate::models::{
-    AudioFile, CoverThumbnail, ImageInfo, ImageInfoResult, TagData, TagReadResult,
-    WriteProgress, WriteRawFieldItem, WriteResult, WriteTagsItem,
+    AudioFile, ContainerSweepResult, CoverThumbnail, ImageInfo, ImageInfoResult, TagData,
+    TagReadResult, WriteProgress, WriteRawFieldItem, WriteResult, WriteTagsItem,
 };
 
 pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
@@ -1196,6 +1196,118 @@ fn rename_file_blocking(path: &str, new_stem: &str) -> Result<String, String> {
     Ok(target.to_string_lossy().to_string())
 }
 
+/// Rewrites one file's tags into the single container its format calls
+/// canonical, dropping every other container it carries.
+///
+/// The point is a library where the same information always lives in the same
+/// place: an mp3 that has picked up an ID3v1 block and an APE tag alongside its
+/// ID3v2 ends up with ID3v2 alone. Values are never edited — only moved.
+///
+/// It is deliberately *not* "delete the secondaries". A secondary container can
+/// hold a field the primary lacks, and deleting it outright would silently lose
+/// that, so the primary is copied into the new tag first and anything the
+/// secondaries hold for keys the primary doesn't have is folded in behind it.
+/// Pictures come from the primary, or from a secondary if the primary has none.
+///
+/// Returns whether the file actually needed rewriting, so the caller can report
+/// how much of the library was already standard.
+fn standardize_container_blocking(path: &str) -> Result<bool, String> {
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let target = tagged.file_type().primary_tag_type();
+    let present: Vec<TagType> = tagged.tags().iter().map(|t| t.tag_type()).collect();
+
+    // Nothing to unify: no tags at all, or exactly the canonical one already.
+    if present.is_empty() || (present.len() == 1 && present[0] == target) {
+        return Ok(false);
+    }
+
+    let primary = tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .cloned();
+    let mut new_tag = Tag::new(target);
+    if let Some(ref old) = primary {
+        // `insert_unchecked` rather than `insert`, so keys the target format
+        // has no standard mapping for — the app's own backup JSON among them —
+        // survive the move instead of being quietly dropped.
+        for item in old.items() {
+            new_tag.insert_unchecked(item.clone());
+        }
+        for pic in old.pictures() {
+            new_tag.push_picture(pic.clone());
+        }
+    }
+
+    // Fold in anything only a secondary container knows about.
+    let primary_type = primary.as_ref().map(|t| t.tag_type());
+    for tag in tagged.tags() {
+        if Some(tag.tag_type()) == primary_type {
+            continue;
+        }
+        for item in tag.items() {
+            if new_tag.get(item.key()).is_none() {
+                new_tag.insert_unchecked(item.clone());
+            }
+        }
+        if new_tag.pictures().is_empty() {
+            for pic in tag.pictures() {
+                new_tag.push_picture(pic.clone());
+            }
+        }
+    }
+
+    let others: Vec<TagType> = present.into_iter().filter(|t| *t != target).collect();
+    drop(tagged);
+    for tt in others {
+        Tag::new(tt)
+            .remove_from_path(path)
+            .map_err(|e| e.to_string())?;
+    }
+    new_tag
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Runs `standardize_container_blocking` across `paths` on `par_map`'s threads,
+/// reporting progress on the same `write-progress` event the batch writer uses.
+#[tauri::command]
+pub async fn standardize_tag_containers(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<ContainerSweepResult, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = paths.len();
+    tauri::async_runtime::spawn_blocking(move || {
+        let done = AtomicUsize::new(0);
+        let step = (total / 50).max(1);
+        let results = par_map(&paths, |path| {
+            let outcome = standardize_container_blocking(path);
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % step == 0 || n == total {
+                let _ = app.emit("write-progress", WriteProgress { done: n, total });
+            }
+            (path.clone(), outcome)
+        });
+        let mut out = ContainerSweepResult {
+            converted: 0,
+            already: 0,
+            failed: Vec::new(),
+        };
+        for (path, outcome) in results {
+            match outcome {
+                Ok(true) => out.converted += 1,
+                Ok(false) => out.already += 1,
+                Err(e) => out.failed.push(format!("{path}: {e}")),
+            }
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Sends the file to the OS Recycle Bin / Trash rather than deleting it
 /// permanently, so a mistaken delete from the app can still be recovered.
 #[tauri::command]
@@ -1316,6 +1428,66 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // The sweep deletes tag containers, so the thing that must never regress is
+    // that it moves what they held first. An mp3 carrying ID3v2 + APE + ID3v1,
+    // where only the APE tag knows the album, has to come out as ID3v2 alone
+    // with the album still on it.
+    #[test]
+    fn standardize_container_folds_secondaries_into_the_primary() {
+        let dir = scratch("container");
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let mut v2 = Tag::new(TagType::Id3v2);
+            v2.insert_text(ItemKey::TrackTitle, "Kerala".to_string());
+            v2.insert_text(ItemKey::TrackArtist, "Bonobo".to_string());
+            v2.save_to_path(&path_str, WriteOptions::default()).unwrap();
+
+            // Only the APE tag knows the album — deleting it naively loses this.
+            let mut ape = Tag::new(TagType::Ape);
+            ape.insert_text(ItemKey::AlbumTitle, "Migration".to_string());
+            ape.save_to_path(&path_str, WriteOptions::default()).unwrap();
+
+            let mut v1 = Tag::new(TagType::Id3v1);
+            v1.insert_text(ItemKey::TrackTitle, "Kerala".to_string());
+            v1.save_to_path(&path_str, WriteOptions::default()).unwrap();
+        }
+
+        let before = lofty::read_from_path(&path_str).unwrap();
+        assert!(
+            before.tags().len() > 1,
+            "fixture should start with several containers, got {}",
+            before.tags().len()
+        );
+        drop(before);
+
+        let changed = standardize_container_blocking(&path_str)
+            .expect("standardize_container_blocking should succeed");
+        assert!(changed, "a multi-container file should report as rewritten");
+
+        let after = lofty::read_from_path(&path_str).unwrap();
+        let types: Vec<TagType> = after.tags().iter().map(|t| t.tag_type()).collect();
+        assert_eq!(types, vec![TagType::Id3v2], "only ID3v2 should remain");
+
+        let tag = after.primary_tag().expect("ID3v2 tag should exist");
+        assert_eq!(tag.title().as_deref(), Some("Kerala"));
+        assert_eq!(tag.artist().as_deref(), Some("Bonobo"));
+        assert_eq!(
+            get_text(tag, &ItemKey::AlbumTitle).as_deref(),
+            Some("Migration"),
+            "the album only the APE tag held must survive the sweep"
+        );
+        drop(after);
+
+        // Idempotent: a file already standard is left alone and reports so.
+        let again = standardize_container_blocking(&path_str).unwrap();
+        assert!(!again, "a standard file should report no change");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

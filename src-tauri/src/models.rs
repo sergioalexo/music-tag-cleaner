@@ -173,6 +173,18 @@ pub struct WriteResult {
     pub error: Option<String>,
 }
 
+/// Outcome of a `standardize_tag_containers` sweep.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSweepResult {
+    /// Files whose tags were moved into the format's canonical container.
+    pub converted: usize,
+    /// Files already carrying only that container — left untouched.
+    pub already: usize,
+    /// "path: error" for each file that could not be rewritten.
+    pub failed: Vec<String>,
+}
+
 /// Progress payload for the `write-progress` event.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -22,6 +22,7 @@ import {
   Type,
   Undo2,
   Wand2,
+  Layers,
 } from "lucide-react";
 import type {
   AudioFile,
@@ -93,6 +94,8 @@ interface Props {
   onConvert: () => void;
   onConvertFile: (file: AudioFile) => void;
   onStandardizeArt: () => void;
+  /** Moves every selected track's tags into its format's canonical container. */
+  onStandardizeContainers: () => void;
   onRename: () => void;
   onClearFields: (fields: string[]) => void;
   onAddGenre: (genre: string) => void;
@@ -155,6 +158,7 @@ export function LibraryPage({
   onConvert,
   onConvertFile,
   onStandardizeArt,
+  onStandardizeContainers,
   onRename,
   onClearFields,
   onAddGenre,
@@ -554,6 +558,16 @@ export function LibraryPage({
           >
             <ImageDown />
             Standardize Art
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onStandardizeContainers}
+            disabled={noSel}
+            title="Move each track's tags into the one container its format calls standard — ID3v2 for mp3/wav/aiff, Vorbis Comments for flac/ogg, MP4 atoms for m4a/aac — and drop the leftovers (ID3v1, APE). Values are moved, not changed."
+          >
+            <Layers />
+            Standardize Tag Format
           </Button>
           <Button variant="secondary" size="sm" onClick={onRename} disabled={noSel}>
             <Type />

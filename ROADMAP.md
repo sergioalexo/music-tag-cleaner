@@ -1271,7 +1271,7 @@ tested in a plain browser at `localhost:1420` — the app needs the Tauri IPC
 bridge and dies at the first `invoke`, so every check has to go through the
 real window.
 
-### 43. Horizontal wheel rebound to window capture; auto-update on launch — v0.11.4
+### 43. Wheel rebound to window capture; auto-update; tag-format sweep — v0.11.4
 
 **The horizontal wheel fix from item 42 shipped in v0.11.3 and still didn't
 work.** The handler was in the tag and `dist` is gitignored, so the release
@@ -1304,6 +1304,33 @@ the time the check returns it stands down and points at the Components page
 instead. A failed check is swallowed to the console: offline, GitHub down and a
 signature mismatch all land there, and none of them should be in the way on
 launch.
+
+**Standardize Tag Format.** A bulk sweep that moves every selected track's
+tags into the one container its format calls canonical — ID3v2 for
+mp3/wav/aiff, Vorbis Comments for flac/ogg, MP4 atoms for m4a/aac — and drops
+the others a file has collected (ID3v1, APE). Values are moved, never edited.
+`write_tags` has always done this as a side effect of any edit; this makes it
+something you can run across a library without editing anything.
+
+The part that matters is that it is *not* "delete the secondaries". A secondary
+container can hold a field the primary lacks — an APE tag that is the only
+place an album title lives — so the primary is copied into the new tag first
+and anything the secondaries hold for keys the primary doesn't have is folded
+in behind it. Pictures come from the primary, or from a secondary when the
+primary has none. Items move with `insert_unchecked`, so keys the target format
+has no standard mapping for (the app's own backup JSON among them) survive
+rather than being silently dropped — the same trap item 40 hit.
+
+It deliberately skips the pending/preview flow: values don't change, so there
+is no before/after to show per field, and for the same reason it isn't undoable
+from history. The confirmation says so. Files already carrying only their
+canonical container are left untouched and counted separately, so running it
+twice is a no-op.
+
+**Verification:** a Rust test builds an mp3 carrying ID3v2 + APE + ID3v1 where
+only the APE tag knows the album, sweeps it, and asserts ID3v2 is the sole
+survivor with title, artist *and* that album still on it — then sweeps again
+and asserts it reports no change. Full suite 42 passed.
 
 ## Roadmap — v1.0
 

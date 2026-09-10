@@ -78,6 +78,7 @@ fn main() {
             commands::files::read_tags,
             commands::files::read_tags_batch,
             commands::files::write_tags,
+            commands::files::standardize_tag_containers,
             commands::files::write_tags_batch,
             commands::files::write_raw_field,
             commands::files::write_raw_fields_batch,

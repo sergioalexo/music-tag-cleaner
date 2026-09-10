@@ -1268,6 +1268,60 @@ export default function App() {
     }
   };
 
+  /**
+   * Moves every selected track's tags into the one container its format calls
+   * canonical — ID3v2 for mp3/wav/aiff, Vorbis Comments for flac/ogg, MP4
+   * atoms for m4a/aac — and drops the others it has collected (ID3v1, APE).
+   *
+   * Values are only moved, never edited, so this deliberately does not go
+   * through the pending/preview flow the way Standardize does: there is no
+   * before/after to show per field. It also can't be undone from history for
+   * the same reason — the confirmation says so, and the sweep is a no-op on
+   * anything already standard.
+   */
+  const standardizeContainers = async () => {
+    const paths = filesApi.selectedPaths;
+    if (!paths.length) return notify("No files selected", "info");
+    const ok = await confirm(
+      `Move tags in ${paths.length} file${paths.length === 1 ? "" : "s"} into the standard ` +
+        `container for each format, and drop any others (ID3v1, APE)?
+
+` +
+        `Values are moved, not changed. Anything a secondary tag holds that the main one ` +
+        `doesn't is kept. This isn't undoable from history.`,
+      { title: "Standardize Tag Format", kind: "warning" },
+    );
+    if (!ok) return;
+    setBusy(true);
+    setProgress({ done: 0, total: paths.length, label: "Standardizing tag format…" });
+    try {
+      const res = await invoke<{ converted: number; already: number; failed: string[] }>(
+        "standardize_tag_containers",
+        { paths },
+      );
+      for (const f of res.failed.slice(0, 5)) notify(f, "error");
+      if (res.failed.length > 5) {
+        notify(`…and ${res.failed.length - 5} more failed`, "error");
+      }
+      if (res.converted) {
+        dropLibraryTags(paths);
+        await filesApi.refreshPaths(paths);
+      }
+      notify(
+        res.converted
+          ? `Standardized ${res.converted} file${res.converted === 1 ? "" : "s"}` +
+              (res.already ? ` — ${res.already} already were` : "")
+          : "Every selected file already uses its standard tag format",
+        res.converted ? "success" : "info",
+      );
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setProgress(null);
+      setBusy(false);
+    }
+  };
+
   const renameSingleFile = async (path: string, newStem: string) => {
     setBusy(true);
     try {
@@ -1674,6 +1728,7 @@ export default function App() {
               onConvert={withTrack("convert", () => openConvert())}
               onConvertFile={withTrack1("convertFile", (f: AudioFile) => openConvert(f))}
               onStandardizeArt={withTrack("standardizeArt", standardizeArtwork)}
+              onStandardizeContainers={withTrack("standardizeContainers", standardizeContainers)}
               onRename={withTrack("renameToStandard", renameToStandard)}
               onClearFields={withTrack1("clearFields", runClearFields)}
               onAddGenre={addGenreToPreset}
