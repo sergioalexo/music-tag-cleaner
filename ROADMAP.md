@@ -1271,6 +1271,40 @@ tested in a plain browser at `localhost:1420` — the app needs the Tauri IPC
 bridge and dies at the first `invoke`, so every check has to go through the
 real window.
 
+### 43. Horizontal wheel rebound to window capture; auto-update on launch — v0.11.4
+
+**The horizontal wheel fix from item 42 shipped in v0.11.3 and still didn't
+work.** The handler was in the tag and `dist` is gitignored, so the release
+genuinely built it — the binding was the problem. It was attached to
+`scrollRef.current` once at mount and relied on the wheel event bubbling up to
+that element, so it could be missed both by anything between the cursor and the
+scroller that stopped propagation, and by the element going stale if the table
+ever remounted under a listener installed once. It is now bound on `window` in
+the *capture* phase and reads `scrollRef.current` when the event fires rather
+than when the listener was installed, so neither can happen.
+
+Diagnosing it needed instrumentation on the real scroller, and the first
+reading was a trap worth recording: with no tracks loaded the table isn't
+rendered at all, only the empty-state div, so `scrollWidth === clientWidth` and
+`max=0` — "nothing to scroll" looks exactly like "the handler is broken". Any
+future wheel diagnostic has to state its row count before its geometry means
+anything. Note the layout itself is fine: TrackTable's wrapper is
+`overflow-hidden`, which zeroes the `min-width: auto` a flex item would
+otherwise take from its content, so the classic flexbox "no overflow ever
+appears" trap does not apply here.
+
+**Auto-update on launch.** `settings.autoUpdate` (default on, toggle in
+Settings) checks for a new release a few seconds after start and installs it
+without asking, then relaunches. The gate is the interesting part: it only
+installs while the library is still empty and nothing is pending. On Windows
+the updater hands off to the NSIS/MSI installer and the running app exits, so
+installing mid-session would take the app out from under work in progress —
+launch is the one moment there is nothing to lose. If files have been loaded by
+the time the check returns it stands down and points at the Components page
+instead. A failed check is swallowed to the console: offline, GitHub down and a
+signature mismatch all land there, and none of them should be in the way on
+launch.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

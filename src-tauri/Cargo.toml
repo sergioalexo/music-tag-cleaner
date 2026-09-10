@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner"
-version = "0.11.3"
+version = "0.11.4"
 description = "Clean up messy audio tags, with a local AI or by hand"
 edition = "2021"
 

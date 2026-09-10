@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS: Settings = {
   batchSize: 50,
   backupBeforeChanges: true,
   preserveCoverArt: true,
+  autoUpdate: true,
   artworkMaxDim: 600,
   artworkJpegQuality: 85,
   recursive: true,

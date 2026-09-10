@@ -32,6 +32,8 @@ import {
 import { activePreset, detectGenreGroups } from "./lib/genres";
 import { matchesShortcut } from "./lib/shortcuts";
 import { internalDrag } from "./lib/internalDrag";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   basename,
   FIELD_LABELS,
@@ -301,6 +303,52 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filesApi.files]);
+
+  /**
+   * Auto-update on launch. Checks once, a few seconds in (so it never competes
+   * with the first paint or the initial library scan), and installs silently
+   * when `settings.autoUpdate` is on.
+   *
+   * The install is gated on the library still being empty. On Windows the
+   * updater hands off to the NSIS/MSI installer and the running app exits, so
+   * installing while tracks are loaded — or while there are pending changes —
+   * would take the app out from under work in progress. At launch there is
+   * nothing to lose, which is exactly why this runs here and not on a timer.
+   * If the user has already loaded something by the time the check returns,
+   * it stands down and leaves it to the Components page button.
+   */
+  // Read when the update check *resolves*, not when the effect ran, so the
+  // "is the user mid-work?" gate sees the real state a few seconds later.
+  const filesRef = useRef(filesApi.files);
+  filesRef.current = filesApi.files;
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
+  const autoUpdateRanRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || !settings.autoUpdate || autoUpdateRanRef.current) return;
+    autoUpdateRanRef.current = true;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const found = await check();
+          if (!found) return;
+          if (filesRef.current.length > 0 || pendingRef.current) {
+            notify(`Version ${found.version} is available — install it from Components`, "info");
+            return;
+          }
+          notify(`Installing update ${found.version}…`, "info");
+          await found.downloadAndInstall();
+          notify(`Version ${found.version} installed — restarting`, "success");
+          await relaunch();
+        } catch (e) {
+          // A failed update check must never be in the user's way on launch:
+          // offline, GitHub down, or a signature mismatch all land here.
+          console.error("Auto-update failed:", e);
+        }
+      })();
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [loaded, settings.autoUpdate, notify]);
 
   // Native drag-and-drop of files/folders onto the window.
   const importPathsRef = useRef(filesApi.importPaths);

@@ -1084,10 +1084,19 @@ export function TrackTable({
   // attaches wheel at the root as a *passive* listener, where preventDefault
   // is ignored — and without preventDefault a Shift+wheel gets applied twice,
   // once here and once by Chromium's own shift-to-horizontal mapping.
+  //
+  // Bound on `window` in the capture phase, not on the scroller itself, and it
+  // reads `scrollRef.current` when the event fires rather than when the
+  // listener was installed. Both matter: capture-on-window can't be missed
+  // because something between the cursor and the scroller stopped propagation
+  // or retargeted the event, and reading the ref late can't go stale if the
+  // table remounts under a listener installed once at mount.
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      const el = scrollRef.current;
+      if (!el) return;
+      const target = e.target;
+      if (!(target instanceof Node) || !el.contains(target)) return;
       // deltaMode 1 is lines, 2 is pages; both need scaling to pixels.
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientWidth : 1;
       const raw = e.deltaX !== 0 ? e.deltaX : e.shiftKey ? e.deltaY : 0;
@@ -1099,8 +1108,8 @@ export function TrackTable({
       el.scrollLeft = next;
       e.preventDefault();
     };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
+    window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    return () => window.removeEventListener("wheel", onWheel, true);
   }, []);
 
   // Resizing ends in a mouseup on the header, which would otherwise also fire a

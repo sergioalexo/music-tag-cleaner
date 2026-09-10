@@ -639,6 +639,12 @@ export function SettingsPage({
             />
           </Row>
           <Row
+            label="Install updates automatically"
+            hint="Checks for a new version a few seconds after launch and installs it, then restarts. Only ever runs while no tracks are loaded, so it can't interrupt work — otherwise it just tells you an update is waiting on the Components page."
+          >
+            <Toggle checked={settings.autoUpdate} onChange={(v) => set("autoUpdate", v)} />
+          </Row>
+          <Row
             label="Standardize Art — max size"
             hint="Longest side the Standardize Art button scales cover art down to (never up)"
           >

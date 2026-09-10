@@ -234,6 +234,10 @@ export interface Settings {
   batchSize: number;
   backupBeforeChanges: boolean;
   preserveCoverArt: boolean;
+  /** Check for a new release on launch and install it without asking. The
+   * check only ever installs while the library is still empty — see App's
+   * startup effect — so an update can't interrupt work in progress. */
+  autoUpdate: boolean;
   /** "Standardize Art" downscales the longest side of embedded cover art to this many px. */
   artworkMaxDim: number;
   /** JPEG quality (1-100) "Standardize Art" re-encodes cover art at. */
