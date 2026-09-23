@@ -1107,10 +1107,20 @@ export function TrackTable({
       if (raw === 0) return;
       const max = el.scrollWidth - el.clientWidth;
       if (max <= 0) return;
+
+      // Claim the gesture *before* deciding whether it actually moves
+      // anything. Letting even one event of a burst fall through to the
+      // browser is enough to start Chromium's own smooth-scroll animation
+      // on the same element, which then fights the position set here — the
+      // scroll appears to move and is immediately dragged back. That is
+      // invisible with a plain tilt wheel, which sends one event at a time,
+      // and very visible with anything that sends a burst: a trackpad, or a
+      // mouse driver doing smooth/emulated horizontal scrolling.
+      e.preventDefault();
+
       const next = Math.max(0, Math.min(max, el.scrollLeft + raw * unit));
       if (next === el.scrollLeft) return;
       el.scrollLeft = next;
-      e.preventDefault();
     };
     window.addEventListener("wheel", onWheel, { passive: false, capture: true });
     return () => window.removeEventListener("wheel", onWheel, true);
