@@ -2,11 +2,26 @@ import type { AudioFile, PlaylistEntry, TagData } from "../types";
 
 /**
  * Matches a fetched YouTube Music playlist (see `fetch_ytmusic_playlist`)
- * against the loaded collection. yt-dlp's flat-playlist fetch only reliably
- * gives a title, a duration and a video id — not separate artist/track/album
- * fields, even for videos on an artist's own channel (confirmed empirically
- * against real playlists before writing this) — so matching works from the
- * title text and duration alone, the same way a person would eyeball it.
+ * against the collection. yt-dlp's flat-playlist fetch only reliably gives a
+ * title, a duration and a video id — not separate artist/track/album fields,
+ * even for videos on an artist's own channel (confirmed empirically against
+ * real playlists before writing this) — so matching works from the title
+ * text and duration alone, the same way a person would eyeball it.
+ *
+ * Three things make this better than a plain "best fuzzy score wins":
+ *
+ * 1. **Every identity a file has is compared, not just its tags.** A track
+ *    whose tags were never cleaned still has a filename, and one that *was*
+ *    cleaned still carries its pre-clean "stem | | artist | | title | | year"
+ *    searchable backup (see `build_searchable_backup` in files.rs) — often
+ *    the only place the original YouTube-ish spelling survives.
+ * 2. **Mix/version awareness.** "Song (Artist Remix)" and "Song" are
+ *    different recordings; edit distance barely notices, so the distinctive
+ *    part of a version qualifier is scored separately and can veto a match.
+ * 3. **Global one-to-one assignment.** Each library file can back at most one
+ *    playlist entry, so two near-identical entries can't both claim it — the
+ *    stronger pairing wins and the weaker one falls through to its own next
+ *    best candidate.
  */
 
 /** Strips the trailing " - Topic" YouTube appends to auto-generated-audio
@@ -38,15 +53,20 @@ function stripTitleNoise(title: string): string {
   return cleaned.replace(/\s+/g, " ").trim();
 }
 
-/** Folds a string down for comparison: diacritics stripped (NFKD, same
- * same NFKD approach the filename sanitizers use), lowercased,
- * punctuation collapsed to spaces, whitespace normalized. */
+/** Folds a string down for comparison: diacritics stripped (the same NFKD
+ * approach the filename sanitizers use), lowercased, punctuation collapsed
+ * to spaces, whitespace normalized. */
 export function normalizeForMatch(value: string): string {
   const folded = value.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase();
   return folded
     .replace(/\bfeat\.?\b|\bft\.?\b/g, " ")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+}
+
+function tokens(value: string): string[] {
+  const n = normalizeForMatch(value);
+  return n ? n.split(" ") : [];
 }
 
 /** Splits a video title on the first "Artist - Title"-style separator.
@@ -90,12 +110,201 @@ export function stringSimilarity(a: string, b: string): number {
   return 1 - levenshtein(na, nb) / maxLen;
 }
 
-function durationScore(a: number | null | undefined, b: number | null | undefined): number {
-  if (a == null || b == null || a <= 0 || b <= 0) return 0.5; // unknown — neutral, don't punish
-  const diff = Math.abs(a - b);
-  if (diff <= 2) return 1;
-  if (diff >= 15) return 0;
-  return 1 - (diff - 2) / 13;
+/**
+ * Order-insensitive, length-weighted token overlap (an F1 of how much of
+ * each side the other covers). Longer tokens count for more, so "Rihanna"
+ * agreeing matters far more than "the" agreeing — which is exactly what
+ * edit distance gets wrong on "Artist - Title" vs "Title - Artist" and on
+ * titles carrying an extra featured artist.
+ */
+export function tokenSimilarity(a: string, b: string): number {
+  const A = tokens(a);
+  const B = tokens(b);
+  if (!A.length && !B.length) return 1;
+  if (!A.length || !B.length) return 0;
+  const weight = (t: string) => Math.max(1, t.length);
+  const countsB = new Map<string, number>();
+  for (const t of B) countsB.set(t, (countsB.get(t) ?? 0) + 1);
+  const countsA = new Map<string, number>();
+  for (const t of A) countsA.set(t, (countsA.get(t) ?? 0) + 1);
+
+  let interWeight = 0;
+  for (const [t, ca] of countsA) {
+    const shared = Math.min(ca, countsB.get(t) ?? 0);
+    if (shared) interWeight += shared * weight(t);
+  }
+  const totalA = A.reduce((s, t) => s + weight(t), 0);
+  const totalB = B.reduce((s, t) => s + weight(t), 0);
+  const coverA = interWeight / totalA;
+  const coverB = interWeight / totalB;
+  if (!coverA || !coverB) return 0;
+  return (2 * coverA * coverB) / (coverA + coverB);
+}
+
+/** Best of edit-distance and token-overlap similarity — they fail on
+ * opposite kinds of difference, so taking the better of the two is more
+ * stable than either alone or than averaging them. */
+export function textSimilarity(a: string, b: string): number {
+  return Math.max(stringSimilarity(a, b), tokenSimilarity(a, b));
+}
+
+/** Words that mark a parenthetical as a *version* qualifier rather than part
+ * of the track name ("(Tale Of Us Remix)", "(Extended Mix)"). */
+const VERSION_WORDS = new Set([
+  "remix", "mix", "edit", "extended", "radio", "club", "dub", "instrumental",
+  "vip", "bootleg", "live", "acoustic", "remaster", "remastered", "version",
+  "original", "rework", "flip", "mashup", "reprise", "cover", "demo", "rmx",
+  "cut", "bonus", "unplugged", "intro", "outro",
+]);
+
+/** Version words so common they say nothing about *which* version this is —
+ * "(Original Mix)" and a bare title are the same recording, so these never
+ * make two titles look like different mixes on their own. */
+const GENERIC_VERSION_WORDS = new Set([
+  "original", "mix", "version", "audio", "edit", "radio", "single", "album",
+  "master", "remaster", "remastered", "hd", "hq", "full", "official",
+]);
+
+/**
+ * The distinctive part of a title's version qualifier — the remixer's name
+ * out of "(Tale Of Us Remix)", "extended" out of "(Extended Mix)" — with
+ * generic filler dropped. An empty set means "no particular version stated",
+ * which is compatible with anything.
+ */
+export function versionSignature(text: string): Set<string> {
+  const out = new Set<string>();
+  const groups: string[] = [];
+  for (const m of text.matchAll(/[([]([^)\]]{1,60})[)\]]/g)) groups.push(m[1]);
+  // "Artist - Title - Someone Remix" states the version after a second dash.
+  const tail = text.match(/\s[-–—]\s([^-–—]{1,60})$/);
+  if (tail) groups.push(tail[1]);
+  for (const g of groups) {
+    const words = tokens(g);
+    if (!words.some((w) => VERSION_WORDS.has(w))) continue;
+    for (const w of words) if (!GENERIC_VERSION_WORDS.has(w)) out.add(w);
+  }
+  return out;
+}
+
+/**
+ * Multiplier applied to a text score once both sides' version qualifiers are
+ * taken into account. Two different remixes of the same song score ~1.0 on
+ * text alone, so this is what actually keeps them apart.
+ */
+function versionFactor(want: Set<string>, have: Set<string>): number {
+  if (!want.size && !have.size) return 1;
+  if (!want.size || !have.size) return 0.82; // one names a remix, the other doesn't
+  let shared = 0;
+  for (const w of want) if (have.has(w)) shared++;
+  if (shared === want.size && shared === have.size) return 1;
+  if (!shared) return 0.6; // two *different* named versions — almost certainly not the same file
+  return 0.6 + 0.4 * (shared / Math.max(want.size, have.size));
+}
+
+/** How a candidate's text was obtained — surfaced in the match log so a bad
+ * auto-match can be traced back to the field that caused it. */
+export type MatchVia = "tags" | "filename" | "backup";
+
+/**
+ * Parses the searchable backup string the app writes before its first
+ * change — "stem | | artist | | title | | year" (see
+ * `build_searchable_backup` in files.rs). Returns null for anything that
+ * isn't in that shape, so a real Composer/Comment value is never mistaken
+ * for a backup.
+ */
+export function parseSearchableBackup(
+  value: string | undefined | null,
+): { stem: string; artist: string; title: string; year: string } | null {
+  if (!value || !value.includes(" | | ")) return null;
+  const parts = value.split(" | | ").map((s) => s.trim());
+  if (parts.length < 2) return null;
+  const [stem = "", artist = "", title = "", year = ""] = parts;
+  if (!stem && !artist && !title) return null;
+  return { stem, artist, title, year };
+}
+
+/** Every field the searchable backup could have been written into (the
+ * `BackupField` union) — scanned regardless of the current setting, because
+ * a file may have been backed up under an earlier choice. */
+const BACKUP_FIELDS: (keyof TagData)[] = [
+  "originalArtist",
+  "comment",
+  "composer",
+  "album",
+  "albumArtist",
+  "genre",
+];
+
+function fileStem(path: string): string {
+  const base = path.split(/[\\/]/).pop() ?? path;
+  return base.replace(/\.[^.]+$/, "").replace(/_+/g, " ").trim();
+}
+
+/** One library file reduced to everything worth comparing a playlist entry against. */
+export interface TrackIdentity {
+  path: string;
+  artist: string;
+  title: string;
+  durationSecs?: number;
+  /** Whole "artist title" strings to compare against, best signal first. */
+  texts: { text: string; via: MatchVia }[];
+  version: Set<string>;
+}
+
+export function buildIdentity(file: AudioFile, tag: TagData | undefined): TrackIdentity {
+  const artist = tag?.artist?.trim() ?? "";
+  const title = tag?.title?.trim() ?? "";
+  const stem = fileStem(file.path);
+  const texts: { text: string; via: MatchVia }[] = [];
+  const seen = new Set<string>();
+  const push = (text: string, via: MatchVia) => {
+    const key = normalizeForMatch(text);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    texts.push({ text, via });
+  };
+
+  if (artist || title) push(`${artist} ${title}`.trim(), "tags");
+  push(stem, "filename");
+
+  const versionSources = [title, stem];
+  for (const field of BACKUP_FIELDS) {
+    const parsed = parseSearchableBackup(tag?.[field] as string | undefined);
+    if (!parsed) continue;
+    if (parsed.artist || parsed.title) push(`${parsed.artist} ${parsed.title}`.trim(), "backup");
+    if (parsed.stem) push(parsed.stem.replace(/_+/g, " "), "backup");
+    versionSources.push(parsed.title, parsed.stem);
+  }
+
+  const version = new Set<string>();
+  for (const src of versionSources) {
+    if (!src) continue;
+    for (const v of versionSignature(src)) version.add(v);
+  }
+
+  return { path: file.path, artist, title, durationSecs: file.durationSecs, texts, version };
+}
+
+/** A playlist entry reduced to the same shape, so both sides are comparable. */
+export interface WantedEntry {
+  artist: string | null;
+  title: string;
+  /** The whole cleaned video title, used when the artist/title split misfired. */
+  raw: string;
+  durationSecs?: number | null;
+  version: Set<string>;
+}
+
+export function buildWanted(entry: PlaylistEntry): WantedEntry {
+  const split = splitArtistTitle(entry.title);
+  const artist = split.artist ?? (entry.uploader ? stripTopicSuffix(entry.uploader) : null);
+  return {
+    artist,
+    title: split.title,
+    raw: stripTitleNoise(entry.title),
+    durationSecs: entry.durationSecs,
+    version: versionSignature(entry.title),
+  };
 }
 
 export interface MatchCandidate {
@@ -103,6 +312,10 @@ export interface MatchCandidate {
   score: number;
   titleScore: number;
   artistScore: number;
+  /** Seconds between the video and the file, or null when either is unknown. */
+  durationDelta: number | null;
+  /** Which of the file's identities produced the winning score. */
+  via: MatchVia;
 }
 
 export type MatchStatus = "matched" | "ambiguous" | "missing";
@@ -117,76 +330,124 @@ export interface EntryMatch {
 /** A confident match auto-accepts; an ambiguous one is surfaced for the user
  * to confirm or override — the roadmap's "an 80% match asks, it never
  * silently accepts" (see ROADMAP.md's F4 section). */
-const CONFIDENT_THRESHOLD = 0.9;
-const AMBIGUOUS_THRESHOLD = 0.55;
-/** Only the top few candidates are worth showing for manual confirmation. */
-const MAX_CANDIDATES = 3;
+export const CONFIDENT_THRESHOLD = 0.87;
+export const AMBIGUOUS_THRESHOLD = 0.52;
+/** Below this a candidate isn't worth offering even as a manual choice. */
+const FLOOR_THRESHOLD = 0.3;
+/** Enough alternates to step through when several mixes of a track exist. */
+const MAX_CANDIDATES = 8;
 
-function scoreCandidate(
-  wantArtist: string | null,
-  wantTitle: string,
-  wantDuration: number | null | undefined,
-  path: string,
-  rawTitle: string,
-  tag: TagData | undefined,
-  file: AudioFile | undefined,
-): MatchCandidate {
-  const durScore = durationScore(wantDuration, file?.durationSecs);
-  const tagTitle = tag?.title || file?.filename || "";
-  const tagArtist = tag?.artist || "";
+/**
+ * Duration agreement. A YouTube upload commonly carries a second or two of
+ * extra silence, so small gaps are free; a gap bigger than a verse means
+ * it's a different edit no matter how well the titles read.
+ */
+function applyDuration(score: number, delta: number | null): number {
+  if (delta === null) return score; // unknown — stay neutral rather than punish
+  if (delta <= 3) return Math.min(1, score + 0.05);
+  if (delta <= 10) return score;
+  if (delta <= 25) return score * 0.93;
+  return Math.min(score, 0.5) * 0.9;
+}
 
-  // Strategy A: the split-out artist/title compared to their own tag
-  // fields. Precise when the title actually had an "Artist - Title"
-  // separator to split on.
-  const splitTitleScore = stringSimilarity(wantTitle, tagTitle);
-  const splitArtistScore = wantArtist && tagArtist ? stringSimilarity(wantArtist, tagArtist) : 0.5;
-  const splitScore = splitTitleScore * 0.55 + splitArtistScore * 0.3 + durScore * 0.15;
+function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
+  const wantCombined = want.artist ? `${want.artist} ${want.title}` : want.raw;
 
-  // Strategy B: the whole (unsplit) cleaned title compared against
-  // "artist title" combined — covers video titles with no separator at
-  // all, where splitting would otherwise compare the full string (artist
-  // name included) against just the tag's title and unfairly tank the
-  // score. Takes whichever strategy actually fits this entry better.
-  const combinedTagText = `${tagArtist} ${tagTitle}`.trim();
-  const wholeScore = stringSimilarity(rawTitle, combinedTagText) * 0.85 + durScore * 0.15;
-
-  if (wholeScore > splitScore) {
-    return { path, score: wholeScore, titleScore: wholeScore, artistScore: 0.5 };
+  let best = 0;
+  let bestVia: MatchVia = "tags";
+  for (const { text, via } of id.texts) {
+    // Compare both the reassembled "artist title" and the untouched video
+    // title: whichever fits better decides, so a title that had no
+    // separator to split on isn't penalised for the split having failed.
+    const s = Math.max(textSimilarity(wantCombined, text), textSimilarity(want.raw, text));
+    if (s > best) {
+      best = s;
+      bestVia = via;
+    }
   }
-  return { path, score: splitScore, titleScore: splitTitleScore, artistScore: splitArtistScore };
+
+  // When both sides actually have structured artist/title, score those
+  // fields against each other too — far more precise than one flat string.
+  const titleScore = id.title ? textSimilarity(want.title, id.title) : 0;
+  const artistScore = want.artist && id.artist ? textSimilarity(want.artist, id.artist) : 0;
+  if (want.artist && id.artist && id.title) {
+    const structured = titleScore * 0.62 + artistScore * 0.38;
+    if (structured > best) {
+      best = structured;
+      bestVia = "tags";
+    }
+  }
+
+  const delta =
+    want.durationSecs && id.durationSecs && want.durationSecs > 0 && id.durationSecs > 0
+      ? Math.abs(want.durationSecs - id.durationSecs)
+      : null;
+
+  const score = applyDuration(best * versionFactor(want.version, id.version), delta);
+
+  return {
+    path: id.path,
+    score: Math.max(0, Math.min(1, score)),
+    titleScore,
+    artistScore,
+    durationDelta: delta,
+    via: bestVia,
+  };
 }
 
 /**
- * Matches every entry in a fetched playlist against the loaded collection.
- * Each entry's title is split into a candidate artist/title (falling back to
- * the uploading channel, minus a trailing " - Topic", as an extra artist
- * signal when the split found none) and scored against every loaded track's
- * tags plus duration; the best score decides matched/ambiguous/missing.
+ * Matches every entry in a fetched playlist against the collection.
+ *
+ * Scoring is per-pair, but *acceptance* is global: every (entry, file) pair
+ * above the ambiguous floor is considered in descending score order and the
+ * strongest ones claim their file first, so no file backs two entries. An
+ * entry whose best candidate was already claimed falls through to its own
+ * next best rather than silently duplicating a match.
  */
 export function matchPlaylist(
   entries: PlaylistEntry[],
   files: AudioFile[],
   tags: Record<string, TagData>,
 ): EntryMatch[] {
-  return entries.map((entry) => {
-    const split = splitArtistTitle(entry.title);
-    const artist = split.artist ?? (entry.uploader ? stripTopicSuffix(entry.uploader) : null);
-    const rawTitle = stripTitleNoise(entry.title);
-    const candidates = files
-      .map((f) =>
-        scoreCandidate(artist, split.title, entry.durationSecs, f.path, rawTitle, tags[f.path], f),
-      )
+  const identities = files.map((f) => buildIdentity(f, tags[f.path]));
+
+  const perEntry = entries.map((entry) => {
+    const want = buildWanted(entry);
+    const candidates = identities
+      .map((id) => scoreIdentity(want, id))
+      .filter((c) => c.score >= FLOOR_THRESHOLD)
       .sort((a, b) => b.score - a.score)
       .slice(0, MAX_CANDIDATES);
+    return { entry, candidates };
+  });
 
-    const best = candidates[0];
-    const status: MatchStatus =
-      !best || best.score < AMBIGUOUS_THRESHOLD
-        ? "missing"
-        : best.score >= CONFIDENT_THRESHOLD
-          ? "matched"
-          : "ambiguous";
+  // Greedy global assignment — one file backs at most one entry.
+  const pairs: { e: number; c: MatchCandidate }[] = [];
+  perEntry.forEach((p, e) => {
+    for (const c of p.candidates) if (c.score >= AMBIGUOUS_THRESHOLD) pairs.push({ e, c });
+  });
+  pairs.sort((a, b) => b.c.score - a.c.score);
 
-    return { entry, status, candidates: best ? candidates : [] };
+  const assigned = new Map<number, MatchCandidate>();
+  const claimed = new Set<string>();
+  for (const { e, c } of pairs) {
+    if (assigned.has(e) || claimed.has(c.path)) continue;
+    assigned.set(e, c);
+    claimed.add(c.path);
+  }
+
+  return perEntry.map(({ entry, candidates }, e) => {
+    const winner = assigned.get(e);
+    // Show the assigned candidate first, then the rest as alternates to
+    // step through — the user's "different mixes" case.
+    const ordered = winner
+      ? [winner, ...candidates.filter((c) => c.path !== winner.path)]
+      : candidates;
+    const status: MatchStatus = !winner
+      ? "missing"
+      : winner.score >= CONFIDENT_THRESHOLD
+        ? "matched"
+        : "ambiguous";
+    return { entry, status, candidates: ordered };
   });
 }

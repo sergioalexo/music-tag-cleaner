@@ -1,0 +1,181 @@
+import type { AudioFile, TagData } from "../types";
+import { parseSearchableBackup } from "./ytMatch";
+
+/**
+ * One search implementation for every place the app looks a track up: the
+ * track table's find bar, the YouTube-import search panel, and (later) the
+ * library index.
+ *
+ * The rule it exists to enforce: **searching always looks at the tags, not
+ * just at whatever columns happen to be visible.** The table's old find bar
+ * scanned rendered cells, so hiding the Artist column silently stopped
+ * artist search from working — which reads as "search is broken" rather
+ * than "search is scoped", because nothing on screen says so.
+ */
+
+/** Fields a `field:value` term can target, mapped to their `TagData` keys. */
+const FIELD_ALIASES: Record<string, keyof TagData | "filename" | "path"> = {
+  artist: "artist",
+  a: "artist",
+  title: "title",
+  t: "title",
+  album: "album",
+  albumartist: "albumArtist",
+  genre: "genre",
+  g: "genre",
+  year: "year",
+  y: "year",
+  comment: "comment",
+  composer: "composer",
+  originalartist: "originalArtist",
+  track: "trackNumber",
+  id: "trackId",
+  file: "filename",
+  filename: "filename",
+  f: "filename",
+  path: "path",
+};
+
+/** Lowercased, diacritic-folded — so "Bjork" finds "Björk". */
+export function fold(value: string): string {
+  return value.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase();
+}
+
+function stemOf(path: string): string {
+  const base = path.split(/[\\/]/).pop() ?? path;
+  return base.replace(/\.[^.]+$/, "");
+}
+
+/**
+ * Every piece of text a track can be found by, as one folded blob: tags,
+ * filename, and the pre-clean identity stored in the searchable backup. The
+ * backup matters more than it looks — after a Standardize/AI Clean pass it
+ * is often the only place the track's *original* spelling still exists, so
+ * searching for the name you remember still finds the file.
+ */
+export function trackSearchText(file: AudioFile, tag: TagData | undefined): string {
+  const parts: string[] = [stemOf(file.path), file.path];
+  if (tag) {
+    for (const key of [
+      "title",
+      "artist",
+      "album",
+      "albumArtist",
+      "genre",
+      "year",
+      "comment",
+      "composer",
+      "originalArtist",
+      "trackNumber",
+      "trackId",
+    ] as const) {
+      const v = tag[key];
+      if (typeof v === "string" && v.trim()) parts.push(v);
+    }
+    // A backup value is already included verbatim above, but its " | | "
+    // separators would otherwise glue words together for substring search.
+    for (const key of ["originalArtist", "comment", "composer", "album", "albumArtist"] as const) {
+      const parsed = parseSearchableBackup(tag[key]);
+      if (parsed) parts.push(parsed.stem, parsed.artist, parsed.title, parsed.year);
+    }
+  }
+  return fold(parts.filter(Boolean).join(" \u0001 "));
+}
+
+interface Term {
+  /** A specific field to look in, or null for "anywhere". */
+  field: (keyof TagData | "filename" | "path") | null;
+  text: string;
+  negated: boolean;
+}
+
+/**
+ * Parses a query into terms. Supports `artist:brejcha` field scoping,
+ * `-word` to exclude, and `"two words"` to keep a phrase together. Plain
+ * words search everywhere. Every term must match (AND), which is what
+ * people expect when they type two words.
+ */
+export function parseQuery(query: string): Term[] {
+  const terms: Term[] = [];
+  const re = /(-)?(?:(\w+):)?(?:"([^"]*)"|(\S+))/g;
+  for (const m of query.matchAll(re)) {
+    const [, neg, rawField, quoted, bare] = m;
+    const text = fold((quoted ?? bare ?? "").trim());
+    if (!text) continue;
+    const field = rawField ? (FIELD_ALIASES[rawField.toLowerCase()] ?? null) : null;
+    // An unknown prefix ("foo:bar") is not a field — search it literally.
+    const literal = rawField && !field ? fold(`${rawField}:${text}`) : text;
+    terms.push({ field, text: literal, negated: !!neg });
+  }
+  return terms;
+}
+
+function fieldText(file: AudioFile, tag: TagData | undefined, field: Term["field"]): string {
+  if (field === "filename") return fold(stemOf(file.path));
+  if (field === "path") return fold(file.path);
+  const v = field && tag ? tag[field] : undefined;
+  return typeof v === "string" ? fold(v) : "";
+}
+
+/** Whether a track satisfies every term of an already-parsed query. */
+export function matchesTerms(
+  file: AudioFile,
+  tag: TagData | undefined,
+  terms: Term[],
+  haystack?: string,
+): boolean {
+  if (!terms.length) return true;
+  const all = haystack ?? trackSearchText(file, tag);
+  for (const term of terms) {
+    const target = term.field ? fieldText(file, tag, term.field) : all;
+    const hit = target.includes(term.text);
+    if (hit === term.negated) return false;
+  }
+  return true;
+}
+
+export interface SearchHit {
+  file: AudioFile;
+  /** Higher is better — a title/artist hit outranks a buried comment hit. */
+  score: number;
+}
+
+/**
+ * Ranked search over a collection. Ranking is deliberately simple and
+ * explainable: an exact or prefix hit on artist/title beats a hit anywhere
+ * else, so typing "gravity" puts the track *called* Gravity above one that
+ * merely mentions it in a comment.
+ */
+export function searchTracks(
+  files: AudioFile[],
+  tags: Record<string, TagData>,
+  query: string,
+  limit = 200,
+): SearchHit[] {
+  const terms = parseQuery(query);
+  if (!terms.length) return [];
+  const needle = terms.find((t) => !t.negated && !t.field)?.text ?? "";
+  const hits: SearchHit[] = [];
+
+  for (const file of files) {
+    const tag = tags[file.path];
+    const haystack = trackSearchText(file, tag);
+    if (!matchesTerms(file, tag, terms, haystack)) continue;
+
+    let score = 1;
+    if (needle) {
+      const title = fold(tag?.title ?? "");
+      const artist = fold(tag?.artist ?? "");
+      const stem = fold(stemOf(file.path));
+      if (title === needle || artist === needle) score += 4;
+      else if (title.startsWith(needle) || artist.startsWith(needle)) score += 3;
+      else if (title.includes(needle) || artist.includes(needle)) score += 2;
+      else if (stem.includes(needle)) score += 1;
+    }
+    hits.push({ file, score });
+  }
+
+  return hits
+    .sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path))
+    .slice(0, limit);
+}

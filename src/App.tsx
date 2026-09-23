@@ -220,8 +220,20 @@ export default function App() {
     });
 
   // Theme class on <html> (dark is the default, set in index.html).
+  // "system" — the default since v0.13 — follows the OS setting live, so
+  // flipping Windows to light mode retints the app without a restart. There
+  // is no in-app switcher any more; the subscription is the whole feature.
   useEffect(() => {
-    document.documentElement.classList.toggle("dark", settings.theme === "dark");
+    const apply = (dark: boolean) => document.documentElement.classList.toggle("dark", dark);
+    if (settings.theme !== "system") {
+      apply(settings.theme === "dark");
+      return;
+    }
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    apply(mq.matches);
+    const onChange = (e: MediaQueryListEvent) => apply(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
   }, [settings.theme]);
 
   // Warm the code-split chunks once the first paint is done, so switching
@@ -458,17 +470,6 @@ export default function App() {
       setBusy(false);
     }
   };
-
-  const runStandardizeRules = () =>
-    runStandardize(
-      "standardize",
-      (value) =>
-        applyCapitalization(
-          applyReplacements(value, settingsRef.current.replacements),
-          settingsRef.current.capitalization,
-        ),
-      "Nothing to standardize with the current rules",
-    );
 
   const runRemoveChars = () =>
     runStandardize(
@@ -1681,8 +1682,6 @@ export default function App() {
         <Sidebar
           page={page}
           setPage={setPage}
-          theme={settings.theme}
-          onToggleTheme={() => save({ ...settings, theme: settings.theme === "dark" ? "light" : "dark" })}
           fileCount={filesApi.files.length}
           errorLogCount={logs.filter((l) => l.kind === "error").length}
         />
@@ -1718,7 +1717,6 @@ export default function App() {
               onCancelPending={() => setPending(null)}
               onAIClean={withTrack("aiClean", runAIClean)}
               onStopAI={ai.stop}
-              onStandardize={withTrack("standardize", runStandardizeRules)}
               onCapitalization={withTrack1<Capitalization>("capitalization", runCapitalizationOnly)}
               onCharacterRules={withTrack("characterRules", runCharacterRules)}
               onRemoveChars={withTrack("removeChars", runRemoveChars)}

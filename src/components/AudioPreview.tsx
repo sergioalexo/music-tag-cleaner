@@ -32,8 +32,15 @@ export function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** Inline prelisten: play/pause plus a scrub bar to rewind through the track. */
-export function AudioPreview({ path }: { path: string }) {
+/**
+ * Inline prelisten: play/pause plus a scrub bar to rewind through the track.
+ *
+ * `compact` drops the scrub bar and the duration readout, leaving just the
+ * round play button — for lists (the YouTube-import matcher, the library
+ * search panel) where the row is already dense and the only question being
+ * asked is "is this the right track?".
+ */
+export function AudioPreview({ path, compact = false }: { path: string; compact?: boolean }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -111,6 +118,8 @@ export function AudioPreview({ path }: { path: string }) {
       >
         {playing ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
       </button>
+      {compact ? null : (
+        <>
       <input
         type="range"
         min={0}
@@ -126,6 +135,8 @@ export function AudioPreview({ path }: { path: string }) {
       <span className="w-9 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
         {formatDuration(duration)}
       </span>
+        </>
+      )}
     </div>
   );
 }

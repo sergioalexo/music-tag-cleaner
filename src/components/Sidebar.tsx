@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { Copy, Disc3, ListMusic, Moon, Music, Package, Settings, Sun, Terminal } from "lucide-react";
+import { Copy, Disc3, ListMusic, Music, Package, Settings, Terminal } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "./ui";
+import logoBlack from "../assets/logo-sergioalexo-black.svg";
+import logoWhite from "../assets/logo-sergioalexo-white.svg";
 
 export type Page = "library" | "duplicates" | "ytmusic" | "components" | "settings" | "logs";
 
@@ -17,20 +20,11 @@ const NAV: { page: Page; label: string; icon: typeof Music }[] = [
 interface Props {
   page: Page;
   setPage: (page: Page) => void;
-  theme: "dark" | "light";
-  onToggleTheme: () => void;
   fileCount: number;
   errorLogCount: number;
 }
 
-export function Sidebar({
-  page,
-  setPage,
-  theme,
-  onToggleTheme,
-  fileCount,
-  errorLogCount,
-}: Props) {
+export function Sidebar({ page, setPage, fileCount, errorLogCount }: Props) {
   // getVersion() reads the real app version at runtime (package.json /
   // tauri.conf.json / Cargo.toml all stay in sync via `npm version`) instead
   // of a hardcoded string that silently goes stale across releases.
@@ -46,6 +40,24 @@ export function Sidebar({
           <Music className="h-5 w-5 text-primary-foreground" />
         </div>
         <div className="min-w-0">
+          <button
+            onClick={() => void openUrl("https://sergioalexo.com")}
+            title="sergioalexo.com"
+            className="block opacity-100 transition-opacity hover:opacity-70"
+          >
+            <img
+              src={logoBlack}
+              alt="SERGIO ALEXO"
+              draggable={false}
+              className="mb-1 h-2.5 w-auto select-none dark:hidden"
+            />
+            <img
+              src={logoWhite}
+              alt="SERGIO ALEXO"
+              draggable={false}
+              className="mb-1 hidden h-2.5 w-auto select-none dark:block"
+            />
+          </button>
           <div className="text-sm font-bold leading-tight">
             <span className="text-muted-foreground">/ </span>MusicTagCleaner
           </div>
@@ -85,16 +97,6 @@ export function Sidebar({
           );
         })}
       </nav>
-
-      <div className="border-t p-3">
-        <button
-          onClick={onToggleTheme}
-          className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        >
-          {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-          <span className="font-medium">{theme === "dark" ? "Light theme" : "Dark theme"}</span>
-        </button>
-      </div>
     </aside>
   );
 }

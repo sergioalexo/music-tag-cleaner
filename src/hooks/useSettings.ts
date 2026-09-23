@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-export const CURRENT_SETTINGS_VERSION = 6;
+export const CURRENT_SETTINGS_VERSION = 7;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -21,7 +21,7 @@ export const DEFAULT_SETTINGS: Settings = {
   backupField: "Composer",
   djApp: { primary: "other", secondary: "other" },
   lastFolder: "",
-  theme: "dark",
+  theme: "system",
   visibleColumns: [
     "preview",
     "filename",
@@ -73,6 +73,7 @@ const STORE_FILE = "settings.json";
  * both already filled in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge, so
  * this bump only records that the shape grew. v6 retires "Strip to common
  * tags only" along with the Clean Tags action, and lowers the artwork target.
+ * v7 retires the manual theme toggle: the app follows the OS theme.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -104,6 +105,13 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     // Lower the artwork target to the new 600px default, but only for users
     // still on the old default — a deliberately chosen size is left alone.
     if (next.artworkMaxDim === 1000) next.artworkMaxDim = DEFAULT_SETTINGS.artworkMaxDim;
+  }
+  if (savedVersion < 7) {
+    // The in-app theme toggle is gone; the app follows the OS instead.
+    // Everyone moves to "system" — the old stored value was the default
+    // "dark" for all but a deliberate toggle, and there is no longer any
+    // UI that would let someone restore a pinned choice.
+    next.theme = "system";
   }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;

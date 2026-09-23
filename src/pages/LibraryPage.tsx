@@ -21,7 +21,6 @@ import {
   Trash2,
   Type,
   Undo2,
-  Wand2,
   Layers,
 } from "lucide-react";
 import type {
@@ -84,7 +83,6 @@ interface Props {
   onCancelPending: () => void;
   onAIClean: () => void;
   onStopAI: () => void;
-  onStandardize: () => void;
   onCapitalization: (mode: Capitalization) => void;
   onCharacterRules: () => void;
   onRemoveChars: () => void;
@@ -148,7 +146,6 @@ export function LibraryPage({
   onCancelPending,
   onAIClean,
   onStopAI,
-  onStandardize,
   onCapitalization,
   onCharacterRules,
   onRemoveChars,
@@ -480,16 +477,6 @@ export function LibraryPage({
           >
             <Braces />
             Characters
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={onStandardize}
-            disabled={noSel}
-            title="Runs both Capitalization and Characters together, in one pass"
-          >
-            <Wand2 />
-            Standardize
           </Button>
           <Button
             variant="secondary"

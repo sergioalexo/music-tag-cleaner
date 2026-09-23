@@ -1394,6 +1394,98 @@ are covered for junk input, the raw device path form, the system drive by
 letter and with a colon, and a fixed disk that lies and reports `Removable`.
 Then confirmed by formatting a real USB stick.
 
+### 45. YouTube Music import overhaul — v0.13.0
+
+The import screen matched well enough to demo and badly enough to be annoying
+in real use. Seven separate problems, one pass.
+
+**Matching** (`src/lib/ytMatch.ts`, rewritten). The old scorer compared a
+video title against each file's tags, took the best score per entry
+independently, and stopped there. Now:
+
+- **Every identity a file has is compared**, not just its tags: the tag pair,
+  the filename stem, *and* the pre-clean identity in the searchable backup
+  (`stem | | artist | | title | | year`, see `build_searchable_backup`). After
+  an AI Clean the backup is frequently the only place the original
+  YouTube-ish spelling still exists, so this is what makes a cleaned library
+  match at all. The winning source is reported as `via: tags | filename |
+  backup`.
+- **Mix/version awareness.** `versionSignature()` pulls the distinctive part
+  of a version qualifier out of a title — the remixer's name from
+  "(Tale Of Us Remix)" — and drops generic filler, so "(Original Mix)" reads
+  as "no version stated". Two *different* named versions multiply the score
+  by 0.6, which is what actually keeps separate mixes of one track apart;
+  edit distance alone scores them ~1.0.
+- **Token similarity alongside edit distance.** `tokenSimilarity()` is a
+  length-weighted, order-insensitive overlap; the final text score is the
+  better of the two. Edit distance collapses on a swapped "Title - Artist"
+  or an extra featured artist, which token overlap handles, and vice versa.
+- **Global one-to-one assignment.** Pairs are considered in descending score
+  order and each file can back at most one entry, so two near-identical
+  entries can't both claim the same file — the stronger pairing wins and the
+  weaker falls through to its own next best candidate.
+- Duration is a proportionate gate, not a flat weight: ≤3s is a small bonus,
+  >25s caps the score at 0.5 no matter how well the titles read.
+
+**UI** (`src/pages/YtMusicImportPage.tsx`, rewritten):
+
+- The video's **artist** is shown on its own line under the title (parsed via
+  `buildWanted`, falling back to the uploader minus " - Topic").
+- **Deny button** (the thing that was missing): rejects the suggestion on
+  screen and promotes the next candidate; denying the last one leaves the
+  entry Missing. Separate ⊘ marks an entry missing outright.
+- **Candidate carousel** `‹ 2/5 ›` steps through the alternates, for when a
+  track exists as several mixes. Stepping is a choice, so it still needs
+  confirming.
+- **Prelisten** on any matched or candidate library track — `AudioPreview`
+  gained a `compact` mode (button only, no scrub bar, no duration readout).
+- Both sides of the row are now equal-width two-line blocks, so a long
+  "Artist - Title" is readable instead of clipped into a 14rem column.
+- The per-row duration readout is gone.
+- **"Still to get"** card lists every unmatched entry with its link, plus
+  **Copy All Links** and Copy Titles.
+- **Library search dock** at the bottom (`LibrarySearchPanel`): search the
+  collection and drag a result onto a playlist row to match it by hand.
+  The drag runs on plain mouse events, not HTML5 drag-and-drop — same reason
+  as column reordering (see `lib/internalDrag.ts`): Tauri's OS drop target
+  swallows `drop` on Windows, so an HTML5 drag looks like it works and
+  quietly does nothing. The drag ghost is `pointer-events-none` because the
+  drop target is found with `elementFromPoint`.
+
+**Match log** (`src/lib/ytMatchLog.ts`). Copy or save a full record of a run —
+what the matcher proposed, what the human did, every losing candidate with
+its score, and a `disagreementRate` — as JSON to feed back into an AI, or as
+Markdown to read. It deliberately logs the *losing* candidates too: an
+accepted match and one the user had to correct look identical if you only
+record the final answer.
+
+**Search** (`src/lib/trackSearch.ts`, new). One implementation for every
+lookup in the app. The rule it enforces: searching looks at the **tags**, not
+at whichever columns happen to be visible — the table's old find bar scanned
+rendered cells, so hiding the Artist column silently stopped artist search
+from working, which reads as "search is broken". Supports `artist:brejcha`
+field scoping, `-word` exclusion, `"quoted phrases"`, diacritic folding
+(`bjork` finds `Björk`) and searches the searchable backup, so the name you
+remember finds the file even after a clean.
+
+**Also in this release:**
+
+- **Standardize button removed.** It ran `applyCapitalization(applyReplacements(…))`
+  — exactly Characters followed by Capitalization, both of which are their own
+  buttons. One less thing on a crowded toolbar.
+- **Theme follows the OS.** The sidebar's light/dark toggle is gone;
+  `settings.theme` gains `"system"` (the new default, settings v7) and App
+  subscribes to `prefers-color-scheme` so flipping Windows retints the app
+  live.
+- **Sergio Alexo wordmark** in the sidebar, linking to sergioalexo.com — same
+  treatment as Media Fetch (black/white SVG swapped on `dark:`).
+
+**Verification:** Vitest added (`npm test`). 26 tests — 16 for the matcher
+(remix separation, one-to-one assignment, backup-only and filename-only
+matches, a true negative staying missing) and 10 for search (field scoping,
+negation, diacritic folding, ranking a title hit above a comment hit).
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
