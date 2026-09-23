@@ -9,11 +9,11 @@ import { cn } from "./ui";
  * A dock at the bottom of the YouTube-import screen for finding a track by
  * hand when the matcher couldn't.
  *
- * Results are dragged onto a playlist row to set the match. The drag runs on
- * plain mouse events rather than HTML5 drag-and-drop, for the same reason
- * column reordering does (see `lib/internalDrag.ts`): on Windows, Tauri's
- * own OS drop target swallows the `drop` event, so an HTML5 drag would look
- * like it worked and then quietly do nothing.
+ * Results are dragged onto a playlist row to set the match. The drag is built
+ * on captured pointer events — not HTML5 drag-and-drop, whose `drop` Tauri's
+ * own OS drop target swallows on Windows, and not window-level mouse events,
+ * which start the drag fine but lose the release. See `beginDrag` in
+ * `YtMusicImportPage` for what each approach actually did.
  */
 export function LibrarySearchPanel({
   files,
@@ -36,7 +36,7 @@ export function LibrarySearchPanel({
   draggingPath: string | null;
   onHeightChange: (height: number) => void;
   onCollapsedChange: (collapsed: boolean) => void;
-  onBeginDrag: (path: string, e: React.MouseEvent) => void;
+  onBeginDrag: (path: string, e: React.PointerEvent) => void;
   /** Double-click shortcut — assigns to whichever row is focused. */
   onPick: (path: string) => void;
 }) {
@@ -120,15 +120,25 @@ export function LibrarySearchPanel({
                 return (
                   <div
                     key={file.path}
-                    onMouseDown={(e) => {
+                    onPointerDown={(e) => {
                       if (e.button !== 0) return;
                       if ((e.target as HTMLElement).closest("button,input")) return;
                       onBeginDrag(file.path, e);
                     }}
+                    // The row is full of text, and a webview will happily turn
+                    // a press-and-move on text into its own native drag. That
+                    // hands the mouse to an OS-level drag loop which owns it
+                    // until *it* decides the gesture ended — and Tauri's own
+                    // drop target is on the other end of it. Refusing the
+                    // native drag outright is the only reliable way to keep
+                    // the gesture ours.
+                    draggable={false}
+                    onDragStart={(e) => e.preventDefault()}
                     onDoubleClick={() => onPick(file.path)}
                     title={`${file.path}\n\nDrag onto a playlist row to match, or double-click to use for the highlighted row`}
                     className={cn(
-                      "flex cursor-grab items-center gap-2 rounded-md px-2 py-1 hover:bg-accent/50",
+                      "flex cursor-grab select-none items-center gap-2 rounded-md px-2 py-1 hover:bg-accent/50",
+                      "touch-none",
                       lifted && "opacity-40",
                     )}
                   >

@@ -444,18 +444,74 @@ export function YtMusicImportPage({
     (candIndex[videoId] ?? 0) !== 0;
 
   // --- Drag from the search dock onto a playlist row ------------------------
-  const beginDrag = (path: string, e: React.MouseEvent) => {
-    e.preventDefault();
+  /**
+   * Drag-to-match, driven by **captured pointer events**.
+   *
+   * Two earlier approaches both failed here, in ways that look fine until you
+   * actually drag something:
+   *
+   * - HTML5 drag-and-drop never fires `drop` at all, because Tauri's own OS
+   *   drop target swallows it on Windows (the same reason column reordering
+   *   moved off it — see `lib/internalDrag.ts`).
+   * - Plain `mousedown` plus window-level `mousemove`/`mouseup` starts
+   *   correctly but never *ends*: the release goes somewhere else, so the
+   *   ghost, the drop outline and the lifted row all stay stuck on screen
+   *   forever. Observed on a real drag before this was rewritten.
+   *
+   * `setPointerCapture` is the fix rather than a workaround: it guarantees
+   * every subsequent move and the release are delivered to the element that
+   * captured them, whatever else the webview thinks it is doing. `pointerup`
+   * and `pointercancel` share one teardown so the drag cannot get stuck even
+   * if the gesture is aborted by the OS.
+   */
+  const beginDrag = (path: string, e: React.PointerEvent) => {
+    if (dragPath) return; // a drag is already in flight
+    const el = e.currentTarget as HTMLElement;
+    const pointerId = e.pointerId;
     const startX = e.clientX;
     const startY = e.clientY;
     let moved = false;
 
+    e.preventDefault();
+    try {
+      el.setPointerCapture(pointerId);
+    } catch {
+      // Capture is best-effort; the listeners below still work without it.
+    }
+
     const entryAt = (x: number, y: number): string | null => {
-      const el = document.elementFromPoint(x, y) as HTMLElement | null;
-      return el?.closest("[data-yt-entry]")?.getAttribute("data-yt-entry") ?? null;
+      const hit = document.elementFromPoint(x, y) as HTMLElement | null;
+      return hit?.closest("[data-yt-entry]")?.getAttribute("data-yt-entry") ?? null;
     };
 
-    const onMove = (ev: MouseEvent) => {
+    // Belt and braces against the webview starting its *own* drag from any
+    // element under the pointer. An OS drag loop takes the mouse and blocks
+    // the renderer until it decides the gesture is over — timers stop, input
+    // stops, and the window just sits there looking fine. Refuse every
+    // `dragstart` for the duration of our gesture, at the document level and
+    // in the capture phase, so no child element can slip one past.
+    const refuseNativeDrag = (ev: Event) => ev.preventDefault();
+    document.addEventListener("dragstart", refuseNativeDrag, true);
+    document.addEventListener("selectstart", refuseNativeDrag, true);
+
+    const finish = () => {
+      document.removeEventListener("dragstart", refuseNativeDrag, true);
+      document.removeEventListener("selectstart", refuseNativeDrag, true);
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerup", onUp);
+      el.removeEventListener("pointercancel", onCancel);
+      try {
+        el.releasePointerCapture(pointerId);
+      } catch {
+        // Already released, or never captured.
+      }
+      internalDrag.active = false;
+      setDragPath(null);
+      setDragPos(null);
+      setDropTargetId(null);
+    };
+
+    const onMove = (ev: PointerEvent) => {
       if (!moved) {
         if (Math.abs(ev.clientX - startX) < 4 && Math.abs(ev.clientY - startY) < 4) return;
         moved = true;
@@ -466,22 +522,20 @@ export function YtMusicImportPage({
       setDropTargetId(entryAt(ev.clientX, ev.clientY));
     };
 
-    const onUp = (ev: MouseEvent) => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      internalDrag.active = false;
+    const onUp = (ev: PointerEvent) => {
       const target = moved ? entryAt(ev.clientX, ev.clientY) : null;
-      setDragPath(null);
-      setDragPos(null);
-      setDropTargetId(null);
+      finish();
       if (target) {
         assignFromSearch(target, path);
         notify(`Matched to ${flatLabel(path)}`, "success");
       }
     };
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    const onCancel = () => finish();
+
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerup", onUp);
+    el.addEventListener("pointercancel", onCancel);
   };
 
   // --- Session persistence --------------------------------------------------
