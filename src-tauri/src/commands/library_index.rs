@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use walkdir::WalkDir;
 
-use crate::commands::files::{par_map, read_tags_impl, AUDIO_EXTENSIONS};
+use crate::commands::files::{par_map, read_for_index, read_tags_impl, AUDIO_EXTENSIONS};
 use crate::models::WriteResult;
 
 /// Canonical tag keys that survive a write as typed fields, so they must not
@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS library_root (
     path TEXT PRIMARY KEY,
     added_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS import_session (
     key TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -91,6 +95,30 @@ CREATE TABLE IF NOT EXISTS import_session (
     payload TEXT NOT NULL
 );
 ";
+
+/// What the indexer extracts per file. Bump this whenever a row gains a
+/// column, or an existing column starts being filled in differently.
+///
+/// Indexing is incremental — a file whose size and modified time still match
+/// is skipped without being opened — which is exactly wrong when it is *our*
+/// idea of a row that changed rather than the file. Without this, v1 rows
+/// kept their empty `duration_secs` forever and duration silently stopped
+/// contributing to playlist matching for anyone who had already indexed.
+/// A mismatch forces one full re-read, after which the stamp is updated.
+///
+/// v2: `duration_secs` and `has_backup` are populated (they were always NULL/0).
+const INDEX_VERSION: i64 = 2;
+
+fn stored_index_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT value FROM index_meta WHERE key = 'index_version'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(0)
+}
 
 pub(crate) fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -119,6 +147,24 @@ fn is_audio(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Folder name the Stems action writes into, which sits *inside* the track's
+/// own folder by default — i.e. usually inside an indexed root.
+///
+/// Demucs writes four files per track, so indexing them would quietly triple
+/// or quadruple the collection with things that are not tracks: they would
+/// become playlist-match candidates, show up in search, and their (empty)
+/// genre would count. Skipped by name, which also covers the
+/// `stems/<model>/<track>/` tree beneath it.
+const STEMS_DIR: &str = "stems";
+
+fn is_stems_dir(e: &walkdir::DirEntry) -> bool {
+    e.file_type().is_dir()
+        && e.file_name()
+            .to_str()
+            .map(|n| n.eq_ignore_ascii_case(STEMS_DIR))
+            .unwrap_or(false)
 }
 
 fn file_stat(path: &Path) -> Option<(i64, i64)> {
@@ -290,6 +336,10 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
             return Err("No library folders chosen yet — add one first".to_string());
         }
 
+        // A stale stamp means the rows are the right files but the wrong
+        // shape, so the mtime/size shortcut would happily keep them.
+        let rescan_all = rescan_all || stored_index_version(&conn) != INDEX_VERSION;
+
         emit_progress(&app, "walking", 0, 0, "");
         let mut found: Vec<PathBuf> = Vec::new();
         for root in &roots {
@@ -297,7 +347,13 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
             if !rp.is_dir() {
                 continue;
             }
-            for e in WalkDir::new(rp).into_iter().filter_map(|e| e.ok()) {
+            for e in WalkDir::new(rp)
+                // depth 0 is the root itself: if someone deliberately adds a
+                // folder called "stems" as a library root, index it.
+                .into_iter()
+                .filter_entry(|e| e.depth() == 0 || !is_stems_dir(e))
+                .filter_map(|e| e.ok())
+            {
                 if e.file_type().is_file() && is_audio(e.path()) {
                     found.push(e.into_path());
                 }
@@ -346,8 +402,8 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
         let parsed = par_map(&to_read, |p| {
             let path = p.to_string_lossy().to_string();
             let (mtime, size) = file_stat(p).unwrap_or((0, 0));
-            let tags = read_tags_impl(&path);
-            (path, mtime, size, tags)
+            let row = read_for_index(&path);
+            (path, mtime, size, row)
         });
 
         let mut summary = IndexSummary {
@@ -358,17 +414,18 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
 
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let now = now_secs();
-        for (i, (path, mtime, size, tags)) in parsed.into_iter().enumerate() {
+        for (i, (path, mtime, size, row)) in parsed.into_iter().enumerate() {
             if i % 64 == 0 {
                 emit_progress(&app, "reading", i, to_read.len(), &path);
             }
-            let tags = match tags {
-                Ok(t) => t,
+            let row = match row {
+                Ok(r) => r,
                 Err(e) => {
                     summary.errors.push(format!("{path}: {e}"));
                     continue;
                 }
             };
+            let tags = row.tags;
             let p = Path::new(&path);
             let existed = known.contains_key(&path);
             tx.execute(
@@ -382,8 +439,8 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
                     mtime,
                     size,
                     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase(),
-                    Option::<f64>::None,
-                    0i64,
+                    row.duration_secs,
+                    row.has_backup as i64,
                     tags.has_cover_art as i64,
                     tags.title,
                     tags.artist,
@@ -422,6 +479,11 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
                 .map_err(|e| e.to_string())?;
         }
         summary.removed = stale.len();
+        tx.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('index_version', ?1)",
+            params![INDEX_VERSION.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
 
         emit_progress(&app, "done", total, total, "");
@@ -675,13 +737,14 @@ pub(crate) fn reindex_paths(app: &AppHandle, paths: &[String]) -> Result<(), Str
     let parsed = par_map(paths, |path| {
         let p = Path::new(path);
         let (mtime, size) = file_stat(p).unwrap_or((0, 0));
-        (path.clone(), mtime, size, read_tags_impl(path))
+        (path.clone(), mtime, size, read_for_index(path))
     });
     let mut conn = open_db(app)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = now_secs();
-    for (path, mtime, size, tags) in parsed {
-        let Ok(tags) = tags else { continue };
+    for (path, mtime, size, row) in parsed {
+        let Ok(row) = row else { continue };
+        let tags = row.tags;
         let p = Path::new(&path);
         tx.execute(
             "INSERT OR REPLACE INTO library_track (
@@ -694,8 +757,8 @@ pub(crate) fn reindex_paths(app: &AppHandle, paths: &[String]) -> Result<(), Str
                 mtime,
                 size,
                 p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase(),
-                Option::<f64>::None,
-                0i64,
+                row.duration_secs,
+                row.has_backup as i64,
                 tags.has_cover_art as i64,
                 tags.title,
                 tags.artist,
@@ -814,6 +877,44 @@ mod tests {
         // A Windows separator is escaped too, so it stays a literal backslash
         // under LIKE ... ESCAPE '\'.
         assert_eq!(escape_like("C:\\Music"), "C:\\\\Music");
+    }
+
+    /// The Stems action writes four files per track into a `stems` folder
+    /// *inside* the track's own folder, which is normally inside a library
+    /// root. Indexing those would quietly multiply the collection with things
+    /// that are not tracks — they would become playlist-match candidates and
+    /// show up in search — so the walk prunes that subtree.
+    #[test]
+    fn the_walk_skips_stem_output_but_not_a_root_called_stems() {
+        let dir = std::env::temp_dir().join(format!("mtc-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let deep = dir.join("stems").join("htdemucs").join("Some Track");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(dir.join("Album")).unwrap();
+        std::fs::write(dir.join("Album").join("real.mp3"), b"x").unwrap();
+        std::fs::write(deep.join("vocals.wav"), b"x").unwrap();
+        std::fs::write(deep.join("drums.wav"), b"x").unwrap();
+
+        let walk = |root: &Path| -> Vec<String> {
+            WalkDir::new(root)
+                .into_iter()
+                .filter_entry(|e| e.depth() == 0 || !is_stems_dir(e))
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file() && is_audio(e.path()))
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        };
+
+        // Scanning the library: the real track, none of the stems.
+        assert_eq!(walk(&dir), vec!["real.mp3".to_string()]);
+
+        // But a folder someone deliberately added *as a root* is still indexed,
+        // even if it happens to be called "stems".
+        let mut from_stems_root = walk(&dir.join("stems"));
+        from_stems_root.sort();
+        assert_eq!(from_stems_root, vec!["drums.wav".to_string(), "vocals.wav".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

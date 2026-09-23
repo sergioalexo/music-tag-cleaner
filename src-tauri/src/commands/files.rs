@@ -223,9 +223,32 @@ pub async fn import_paths(paths: Vec<String>, recursive: bool) -> Vec<AudioFile>
 
 pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
     let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    Ok(tag_data_of(&tagged))
+}
+
+/// Everything the library index stores about one file, from a single parse.
+///
+/// The index needs the tags *and* the duration *and* whether a backup
+/// snapshot is present. Reading the file once for each would triple the cost
+/// of indexing a collection, so they come out together.
+pub(crate) struct IndexRow {
+    pub tags: TagData,
+    pub duration_secs: Option<f64>,
+    pub has_backup: bool,
+}
+
+pub(crate) fn read_for_index(path: &str) -> Result<IndexRow, String> {
+    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let duration_secs = Some(tagged.properties().duration().as_secs_f64()).filter(|d| *d > 0.0);
+    let has_backup = find_backup_in_file(&tagged).is_some();
+    Ok(IndexRow { tags: tag_data_of(&tagged), duration_secs, has_backup })
+}
+
+/// Pulls the curated fields out of an already-parsed file.
+pub(crate) fn tag_data_of(tagged: &lofty::file::TaggedFile) -> TagData {
     let mut data = TagData::default();
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-        return Ok(data);
+        return data;
     };
 
     data.title = tag.title().map(|c| c.to_string());
@@ -273,7 +296,7 @@ pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
     if data.track_id.is_none() {
         data.track_id = data.all_fields.get(TRACK_ID_FIELD).cloned();
     }
-    Ok(data)
+    data
 }
 
 fn join_total(num: Option<String>, total: Option<String>) -> Option<String> {

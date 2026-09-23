@@ -1747,6 +1747,47 @@ is worthless:
   score unchanged.
 
 
+### 50. Index durations, and keeping stem output out of the library — v0.13.0
+
+Two defects found by actually using the features, not by reading the code.
+
+**The index stored no durations.** `index_library` wrote a literal `None` into
+`duration_secs` (and `0` into `has_backup`), so `0 of 4,149` indexed tracks had
+one. Nothing broke loudly — `applyDuration` treats an unknown duration as
+neutral — but the duration gate documented as keeping different edits of a
+track apart was simply not running for any track that wasn't open in the
+session, which is most of them. `read_for_index()` now answers tags, duration
+and backup presence from a **single** parse; reading the file once per field
+would have tripled the cost of indexing a collection.
+
+**A stale index needs to know it is stale.** Indexing is incremental: a file
+whose size and modified time still match is skipped without being opened. That
+is exactly wrong when it is *our* idea of a row that changed rather than the
+file, so those empty durations would have survived every future re-index.
+`INDEX_VERSION` is now stamped in an `index_meta` table and a mismatch forces
+one full re-read. Verified by pressing plain **Index Library** — not "Re-read
+Everything" — on an existing v1 index and watching it re-read all 4,149 files
+and come back with `4149 / 4149` durations and `index_version = 2`.
+
+**Stem output no longer pollutes the library.** Separate Stems writes into a
+`stems` folder beside each track by default, which is normally *inside* a
+library root — so the next index would have pulled in four files per separated
+track as if they were part of the collection, making them playlist-match
+candidates and search results. The walk now prunes any directory named
+`stems`, except at depth 0, so a folder someone deliberately adds as a root is
+still indexed. Checked both ways: a unit test over a temp tree, and for real by
+planting `Collection/stems/htdemucs/<track>/{vocals,drums}.mp3` in the user's
+actual library and confirming the count stayed at 4,149 with zero rows under a
+stems path.
+
+**Also verified in this pass:** stem separation end to end. Rihanna –
+Disturbia (3:21) separated in 139s on CPU via `python -m demucs -n htdemucs`,
+with demucs' own progress streaming into the dialog. The output is a real
+separation, not four copies: spectral centroids land where they should (bass
+386 Hz, other 2,138 Hz, vocals 3,870 Hz, drums 6,028 Hz) and every
+cross-correlation between stems is near zero (+0.01 to +0.11).
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
