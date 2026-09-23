@@ -42,6 +42,7 @@ import {
   type AudioFile,
   type Capitalization,
   type ConvertOutcome,
+  type DemucsInfo,
   type DuplicateGroup,
   type FfmpegInfo,
   type PendingChange,
@@ -74,6 +75,9 @@ const ManualAIDialog = lazy(() =>
 const ConvertDialog = lazy(() =>
   import("./components/ConvertDialog").then((m) => ({ default: m.ConvertDialog })),
 );
+const StemsDialog = lazy(() =>
+  import("./components/StemsDialog").then((m) => ({ default: m.StemsDialog })),
+);
 const UnifyDialog = lazy(() =>
   import("./components/UnifyDialog").then((m) => ({ default: m.UnifyDialog })),
 );
@@ -86,6 +90,7 @@ function prefetchSecondaryChunks() {
   void import("./pages/YtMusicImportPage");
   void import("./components/ManualAIDialog");
   void import("./components/ConvertDialog");
+  void import("./components/StemsDialog");
   void import("./components/UnifyDialog");
 }
 
@@ -220,6 +225,9 @@ export default function App() {
   // FFmpeg-backed conversion (v0.10). `ffmpegInfo` gates the Convert dialog.
   const [ffmpegInfo, setFfmpegInfo] = useState<FfmpegInfo | null>(null);
   const [convertOpen, setConvertOpen] = useState(false);
+  /** Paths queued for stem separation; non-null means the dialog is open. */
+  const [stemsPaths, setStemsPaths] = useState<string[] | null>(null);
+  const [demucsInfo, setDemucsInfo] = useState<DemucsInfo | null>(null);
   /** A right-clicked file to convert on its own (vs. the whole selection). */
   const [convertSeedFile, setConvertSeedFile] = useState<AudioFile | null>(null);
   /** Preview state for "Unify Track IDs" — null when the dialog is closed. */
@@ -805,6 +813,38 @@ export default function App() {
     setConvertSeedFile(file ?? null);
     setConvertOpen(true);
     void refreshFfmpeg(); // pick up an install done since last check
+  };
+
+  /**
+   * Opens the Stems dialog for the selection, after checking Demucs is
+   * actually there. The check runs on open rather than being cached at
+   * launch: probing Python costs a process spawn, and the answer changes
+   * exactly when the user installs it from the Components page.
+   */
+  const openStems = async (file?: AudioFile) => {
+    const paths = file
+      ? [file.path]
+      : filesApi.files.filter((f) => filesApi.selected.has(f.path)).map((f) => f.path);
+    if (!paths.length) return notify("No files selected", "info");
+
+    let info = demucsInfo;
+    try {
+      info = await invoke<DemucsInfo>("demucs_info");
+      setDemucsInfo(info);
+    } catch (e) {
+      return notify(String(e), "error");
+    }
+    if (!info?.pythonFound) {
+      notify("Python isn't installed — see the Components page to set Demucs up", "error");
+      setPage("components");
+      return;
+    }
+    if (!info.installed) {
+      notify("Demucs isn't installed yet — install it on the Components page", "info");
+      setPage("components");
+      return;
+    }
+    setStemsPaths(paths);
   };
 
   const runConvert = async (opts: ConvertOptions) => {
@@ -1783,6 +1823,7 @@ This rewrites the genre tag on ${
               onGenerateIds={withTrack("generateIds", generateIds)}
               onUnifyIds={withTrack("unifyIds", () => void startUnify())}
               onConvert={withTrack("convert", () => openConvert())}
+              onSeparateStems={withTrack("stems", () => void openStems())}
               onConvertFile={withTrack1("convertFile", (f: AudioFile) => openConvert(f))}
               onStandardizeArt={withTrack("standardizeArt", standardizeArtwork)}
               onStandardizeContainers={withTrack("standardizeContainers", standardizeContainers)}
@@ -1926,6 +1967,17 @@ This rewrites the genre tag on ${
             setConvertSeedFile(null);
             setPage("components");
           }}
+        />
+      )}
+
+      {stemsPaths && demucsInfo && (
+        <StemsDialog
+          paths={stemsPaths}
+          info={demucsInfo}
+          options={settings.stemOptions}
+          onSaveOptions={(stemOptions) => void save({ ...settingsRef.current, stemOptions })}
+          onClose={() => setStemsPaths(null)}
+          notify={notify}
         />
       )}
 

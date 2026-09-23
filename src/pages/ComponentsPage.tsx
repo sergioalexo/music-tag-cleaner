@@ -13,6 +13,7 @@ import {
   Download,
   ExternalLink,
   FileAudio,
+  Layers,
   Loader2,
   Play,
   RefreshCw,
@@ -24,6 +25,7 @@ import {
 } from "lucide-react";
 import type {
   ComponentProgress,
+  DemucsInfo,
   FfmpegInfo,
   FfmpegInstallProgress,
   OllamaInfo,
@@ -91,6 +93,9 @@ function InfoTile({ label, value }: { label: string; value: string }) {
 
 export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegChanged }: Props) {
   const [info, setInfo] = useState<OllamaInfo | null>(null);
+  const [demucs, setDemucs] = useState<DemucsInfo | null>(null);
+  const [demucsInstalling, setDemucsInstalling] = useState(false);
+  const [demucsLog, setDemucsLog] = useState("");
   const [ffmpeg, setFfmpeg] = useState<FfmpegInfo | null>(null);
   const [ffmpegInstalling, setFfmpegInstalling] = useState(false);
   const [ffmpegProgress, setFfmpegProgress] = useState<FfmpegInstallProgress | null>(null);
@@ -179,6 +184,28 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
     }
   }, [ollamaUrl, notify, onOllamaChanged]);
 
+  const refreshDemucs = useCallback(async () => {
+    try {
+      setDemucs(await invoke<DemucsInfo>("demucs_info"));
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  }, [notify]);
+
+  const installDemucs = async () => {
+    setDemucsInstalling(true);
+    setDemucsLog("");
+    try {
+      await invoke("install_demucs");
+      notify("Demucs installed", "success");
+      await refreshDemucs();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setDemucsInstalling(false);
+    }
+  };
+
   const refreshFfmpeg = useCallback(async () => {
     try {
       setFfmpeg(await invoke<FfmpegInfo>("ffmpeg_info"));
@@ -206,14 +233,23 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
   useEffect(() => {
     refresh();
     refreshFfmpeg();
+    refreshDemucs();
     const unlisten = listen<ComponentProgress>("component-progress", (e) => {
       setProgress(e.payload);
     });
+    const unlistenDemucs = listen<{ phase: string; line: string }>(
+      "demucs-install-progress",
+      (e) => {
+        const text = String(e.payload.line ?? "").split("\r").pop()?.trim() ?? "";
+        if (text) setDemucsLog(text);
+      },
+    );
     const unlistenFfmpeg = listen<FfmpegInstallProgress>("ffmpeg-install-progress", (e) => {
       setFfmpegProgress(e.payload);
     });
     return () => {
       unlisten.then((fn) => fn());
+      unlistenDemucs.then((fn) => fn());
       unlistenFfmpeg.then((fn) => fn());
       if (pollTimer.current) window.clearTimeout(pollTimer.current);
     };
@@ -305,7 +341,7 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
         <div>
           <h1 className="text-xl font-bold">Components</h1>
           <p className="text-sm text-muted-foreground">
-            Optional tools — Ollama powers AI Clean, FFmpeg powers Convert
+            Optional tools — Ollama powers AI Clean, FFmpeg powers Convert, Demucs powers Stems
           </p>
         </div>
         <Button
@@ -558,6 +594,107 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
                       ? ` / ${formatBytes(ffmpegProgress.total)}`
                       : ""
                   }`}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* Demucs — used by Separate Stems */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">
+              <Layers className="h-5 w-5 text-muted-foreground" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">Demucs</span>
+                {demucs === null ? (
+                  <Badge>…</Badge>
+                ) : demucs.installed ? (
+                  <Badge className="gap-1 bg-primary/15 text-primary">
+                    <CheckCircle2 className="h-3 w-3" /> Installed
+                  </Badge>
+                ) : demucs.pythonFound ? (
+                  <Badge className="gap-1 bg-amber-500/15 text-amber-600 dark:text-amber-400">
+                    <XCircle className="h-3 w-3" /> Not installed
+                  </Badge>
+                ) : (
+                  <Badge className="gap-1 bg-destructive/15 text-destructive">
+                    <XCircle className="h-3 w-3" /> No Python
+                  </Badge>
+                )}
+                {demucs?.installed && demucs.device === "cuda" && (
+                  <Badge className="bg-secondary">GPU</Badge>
+                )}
+              </div>
+              <button
+                onClick={() => void openUrl("https://github.com/adefossez/demucs")}
+                className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"
+              >
+                adefossez/demucs <ExternalLink className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 gap-2">
+            <Button variant="ghost" size="sm" onClick={refreshDemucs} disabled={demucsInstalling}>
+              <RefreshCw />
+            </Button>
+            {demucs && !demucs.installed && demucs.pythonFound && (
+              <Button size="sm" onClick={installDemucs} disabled={demucsInstalling}>
+                {demucsInstalling ? <Loader2 className="animate-spin" /> : <Download />}
+                {demucsInstalling ? "Installing…" : "Install"}
+              </Button>
+            )}
+            {demucs && !demucs.pythonFound && (
+              <Button size="sm" onClick={() => void openUrl("https://www.python.org/downloads/")}>
+                <ExternalLink />
+                Get Python
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <p className="mt-3 text-xs text-muted-foreground">
+          Powers <span className="font-medium">Separate Stems</span> — splits a track into drums,
+          bass, vocals and everything else, for acapellas, instrumentals and edits. Not needed for
+          tag editing.
+          {demucs && !demucs.pythonFound && (
+            <>
+              {" "}
+              Demucs is a Python package (it pulls in PyTorch), so it needs Python 3.9+ installed
+              first. On Windows, tick <span className="font-mono">Add python.exe to PATH</span> in
+              the installer.
+            </>
+          )}
+          {demucs?.installed && demucs.device !== "cuda" && (
+            <>
+              {" "}
+              Running on CPU — separation works but takes minutes per track. A CUDA GPU with a
+              matching PyTorch build is roughly ten times faster.
+            </>
+          )}
+        </p>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <InfoTile label="Demucs" value={demucs?.demucsVersion ?? "—"} />
+          <InfoTile label="PyTorch" value={demucs?.torchVersion ?? "—"} />
+          <InfoTile
+            label="Python"
+            value={demucs?.pythonVersion ? `${demucs.pythonVersion} (${demucs.pythonPath})` : "—"}
+          />
+          <InfoTile
+            label="Device"
+            value={demucs?.device === "cuda" ? (demucs.gpuName ?? "CUDA GPU") : (demucs?.device ?? "—")}
+          />
+        </div>
+
+        {demucsInstalling && (
+          <div className="mt-3">
+            <ProgressBar value={null} />
+            <div className="mt-1 truncate text-xs text-muted-foreground" title={demucsLog}>
+              {demucsLog || "Starting pip…"}
             </div>
           </div>
         )}

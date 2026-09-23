@@ -297,6 +297,8 @@ export interface Settings {
   convertPreset: ConvertPreset;
   /** Where Convert writes output: next to each source, or a `converted/` subfolder. */
   convertOutput: "alongside" | "subfolder";
+  /** Last-used Demucs settings, so a repeat run needs no re-picking. */
+  stemOptions: StemOptions;
 }
 
 /** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */
@@ -550,6 +552,81 @@ export function indexedToTags(t: IndexedTrack): TagData {
     allFields: {},
   };
 }
+
+// v0.13 — Demucs stem separation. Matches `src-tauri/src/commands/demucs.rs`.
+
+export interface DemucsInfo {
+  pythonFound: boolean;
+  pythonPath?: string | null;
+  pythonVersion?: string | null;
+  installed: boolean;
+  demucsVersion?: string | null;
+  torchVersion?: string | null;
+  /** "cuda" when torch reports a working GPU, else "cpu". */
+  device?: string | null;
+  gpuName?: string | null;
+}
+
+/** Pretrained models worth offering. Verified against `demucs --list-models`. */
+export const DEMUCS_MODELS: { value: string; label: string; hint: string }[] = [
+  { value: "htdemucs", label: "htdemucs", hint: "Default — best all-round quality/speed" },
+  { value: "htdemucs_ft", label: "htdemucs_ft", hint: "Fine-tuned: better, ~4x slower" },
+  { value: "htdemucs_6s", label: "htdemucs_6s", hint: "6 stems — adds piano and guitar" },
+  { value: "hdemucs_mmi", label: "hdemucs_mmi", hint: "Hybrid v3, trained on more data" },
+  { value: "mdx_extra", label: "mdx_extra", hint: "MDX challenge winner; strong on vocals" },
+  { value: "mdx_extra_q", label: "mdx_extra_q", hint: "Quantized mdx_extra — smaller, slightly worse" },
+];
+
+/** Two-stem targets. Empty string means "all stems". */
+export const DEMUCS_TWO_STEMS: { value: string; label: string }[] = [
+  { value: "", label: "All stems (drums / bass / vocals / other)" },
+  { value: "vocals", label: "Acapella + instrumental (vocals / no vocals)" },
+  { value: "drums", label: "Drums / no drums" },
+  { value: "bass", label: "Bass / no bass" },
+  { value: "other", label: "Other / no other" },
+];
+
+export interface StemOptions {
+  model: string;
+  /** null or "" for all stems. */
+  twoStems: string | null;
+  format: "wav" | "mp3" | "flac";
+  mp3Bitrate: number;
+  shifts: number;
+  overlap: number;
+  device: string;
+  jobs: number;
+  /** Empty means a `stems` folder beside each source file. */
+  outputDir: string;
+}
+
+export interface StemOutcome {
+  source: string;
+  ok: boolean;
+  outputDir?: string | null;
+  error?: string | null;
+}
+
+export interface StemProgress {
+  done: number;
+  total: number;
+  file?: string | null;
+  phase: "separating" | "done";
+  /** A line of demucs/pip output, when the event carries one. */
+  line?: string;
+}
+
+export const DEFAULT_STEM_OPTIONS: StemOptions = {
+  model: "htdemucs",
+  twoStems: "",
+  format: "wav",
+  mp3Bitrate: 320,
+  shifts: 0,
+  overlap: 0.25,
+  device: "cpu",
+  jobs: 1,
+  outputDir: "",
+};
 
 export function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;

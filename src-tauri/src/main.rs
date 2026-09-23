@@ -148,6 +148,9 @@ fn main() {
             commands::library_index::library_genres,
             commands::library_index::library_paths_with_genre,
             commands::library_index::retag_field,
+            commands::demucs::demucs_info,
+            commands::demucs::install_demucs,
+            commands::demucs::separate_stems,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");

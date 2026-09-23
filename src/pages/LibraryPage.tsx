@@ -89,6 +89,8 @@ interface Props {
   onGenerateIds: () => void;
   onUnifyIds: () => void;
   onConvert: () => void;
+  /** Opens the Demucs stem-separation dialog for the selection. */
+  onSeparateStems: () => void;
   onConvertFile: (file: AudioFile) => void;
   onStandardizeArt: () => void;
   /** Moves every selected track's tags into its format's canonical container. */
@@ -154,6 +156,7 @@ export function LibraryPage({
   onGenerateIds,
   onUnifyIds,
   onConvert,
+  onSeparateStems,
   onConvertFile,
   onStandardizeArt,
   onStandardizeContainers,
@@ -536,6 +539,16 @@ export function LibraryPage({
           >
             <Repeat />
             Convert
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onSeparateStems}
+            disabled={noSel}
+            title="Split the selected tracks into stems (drums, bass, vocals, other) with Demucs"
+          >
+            <Layers />
+            Stems
           </Button>
           <Button
             variant="secondary"

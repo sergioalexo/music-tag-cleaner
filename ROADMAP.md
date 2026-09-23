@@ -1565,6 +1565,72 @@ in one but not the other is either dropped on write or duplicated as a raw
 frame, and neither shows up until someone's tags are already damaged.
 
 
+### 47. Demucs stem separation — v0.13.0
+
+Splits a track into drums / bass / vocals / other — the acapella and
+instrumental a DJ actually wants for edits and mashups.
+
+**Why it is installed differently from every other component.** FFmpeg and
+yt-dlp are single binaries we can fetch and drop in `app_data_dir()/bin`.
+Demucs is a Python package that pulls in PyTorch: multi-gigabyte, and
+platform- and CUDA-specific. Shipping our own Python runtime to hide that is
+a large amount of machinery that breaks in a new way on every machine, so
+this follows the same *shape* as the others instead — detect, then offer to
+install into the Python you already have:
+
+- find an interpreter (`python`, `python3`, and `py -3` on Windows, which is
+  the only reliable way to reach a store/installer Python that never made it
+  onto `PATH`),
+- ask it, in one short-lived process, whether `demucs` imports and what torch
+  says about CUDA — four separate launches would each pay interpreter
+  startup, and a torch import is not cheap,
+- prefer an interpreter that *already* has demucs: a machine can easily have
+  three Pythons, and installing into the first one found when a later one is
+  set up would be both slow and baffling,
+- one-click `pip install -U demucs`, streaming pip's output live.
+
+Every invocation is `python -m demucs`, never a `demucs` console script: the
+script is only on `PATH` if the install put it there (frequently not on
+Windows, never for `--user`), while `-m` works whenever the package imports
+at all.
+
+**Parameters** (`StemsDialog`): model (htdemucs, htdemucs_ft, htdemucs_6s,
+hdemucs_mmi, mdx_extra, mdx_extra_q), all-stems vs a two-stem split
+(acapella + instrumental, or drums/bass/other), output format (WAV / FLAC /
+MP3 with bitrate), quality passes (`--shifts`), window overlap, CPU/GPU, and
+parallel jobs. Defaults match demucs' own, so an untouched dialog behaves
+exactly like a bare `demucs file.mp3`. Last-used settings persist
+(`settings.stemOptions`, settings v9).
+
+Details that matter:
+
+- **`-j` never reaches a CUDA run.** Parallel jobs multiply VRAM use and
+  reliably OOM consumer cards, so the flag is dropped on GPU whatever the
+  dialog says. Covered by a test.
+- **Output is streamed, not buffered.** Separation takes minutes per track on
+  CPU; buffering until exit would leave the UI frozen with no output, which
+  for a long run is indistinguishable from a hang. demucs redraws its
+  progress bar with carriage returns, so only the last `\r` chunk is kept for
+  the status line.
+- **A failure doesn't stop the batch.** One corrupt track in thirty shouldn't
+  cost the other twenty-nine. Files are separated sequentially on purpose:
+  demucs already saturates the GPU (or every core with `-j`), so two at once
+  makes both slower and tends to exhaust VRAM.
+- The dialog gives a deliberately rough time estimate — enough to stop
+  someone queueing 200 tracks at `shifts=10` on a CPU and expecting it by
+  lunch.
+- The error surfaced on failure is the last meaningful stderr line, not the
+  exit code, which on its own tells the user nothing.
+
+**Verification:** 7 Rust tests over argument construction and the output-path
+layout, plus a real end-to-end run: `python -m demucs -n htdemucs -o ./out
+--two-stems=vocals --mp3 --mp3-bitrate 320 -d cpu clip.wav` on a generated
+5-second clip produced `out/htdemucs/clip/vocals.mp3` and
+`out/htdemucs/clip/no_vocals.mp3` — exactly the path
+`expected_output_dir()` predicts. Every flag the dialog can emit was also
+checked against the real CLI's argument parser.
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
