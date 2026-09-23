@@ -209,12 +209,23 @@ export function useAI() {
     for (let start = 0; start < inputs.length; start += batchSize) {
       if (stopRef.current) break;
       const batch = inputs.slice(start, start + batchSize);
-      const results = await invoke<CleanedTrack[]>("ai_clean_batch", {
-        url: settings.ollamaUrl,
-        model,
-        tracks: batch,
-        transliterateScripts: settings.transliterateScripts,
-      });
+      // Which backend runs the batch is the only difference between them:
+      // batching, progress and Stop are identical either way, and both
+      // commands build the prompt and parse the answer with the same shared
+      // Rust helpers, so a track cleans the same whichever is selected.
+      const results =
+        settings.aiBackend === "claude"
+          ? await invoke<CleanedTrack[]>("claude_clean_batch", {
+              tracks: batch,
+              transliterateScripts: settings.transliterateScripts,
+              model: settings.claudeModel || null,
+            })
+          : await invoke<CleanedTrack[]>("ai_clean_batch", {
+              url: settings.ollamaUrl,
+              model,
+              tracks: batch,
+              transliterateScripts: settings.transliterateScripts,
+            });
       // Discard a batch that finished after the user asked to stop.
       if (stopRef.current) break;
       for (const r of results) cleanedByIndex.set(r.index, r);
@@ -244,12 +255,19 @@ export function useAI() {
     for (let start = 0; start < inputs.length; start += batchSize) {
       if (stopRef.current) break;
       const batch = inputs.slice(start, start + batchSize);
-      const results = await invoke<GenreResult[]>("ai_map_genre_batch", {
-        url: settings.ollamaUrl,
-        model,
-        tracks: batch,
-        genres,
-      });
+      const results =
+        settings.aiBackend === "claude"
+          ? await invoke<GenreResult[]>("claude_genre_batch", {
+              tracks: batch,
+              genres,
+              model: settings.claudeModel || null,
+            })
+          : await invoke<GenreResult[]>("ai_map_genre_batch", {
+              url: settings.ollamaUrl,
+              model,
+              tracks: batch,
+              genres,
+            });
       if (stopRef.current) break;
       for (const r of results) if (r.genre) byIndex.set(r.index, r.genre);
       onProgress(Math.min(start + batch.length, valid.length), valid.length);

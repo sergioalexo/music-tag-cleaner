@@ -461,7 +461,12 @@ export function LibraryPage({
               }
             >
               <Sparkles />
-              AI Clean{settings.aiBackend === "manual" ? " (manual)" : ""}
+              AI Clean
+              {settings.aiBackend === "manual"
+                ? " (manual)"
+                : settings.aiBackend === "claude"
+                  ? " (Claude)"
+                  : ""}
             </Button>
           )}
 

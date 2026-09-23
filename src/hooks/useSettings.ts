@@ -8,6 +8,7 @@ export const CURRENT_SETTINGS_VERSION = 9;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
+  claudeModel: "",
   ollamaUrl: "http://localhost:11434",
   ollamaModel: "",
   batchSize: 50,
@@ -90,7 +91,12 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     }
     next.visibleColumns = cols;
   }
-  if (savedVersion < 3 && next.aiBackend !== "ollama" && next.aiBackend !== "manual") {
+  if (
+    savedVersion < 3 &&
+    next.aiBackend !== "ollama" &&
+    next.aiBackend !== "manual" &&
+    next.aiBackend !== "claude"
+  ) {
     next.aiBackend = "ollama";
   }
   if (savedVersion < 4 && !next.visibleColumns.includes("trackId")) {

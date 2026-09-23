@@ -220,10 +220,14 @@ export interface PlanInfo {
 
 export interface Settings {
   /**
-   * "ollama" runs the local model; "manual" hands you the prompt to paste into
-   * any AI (ChatGPT, Claude, Gemini…) and takes its answer back by paste.
+   * "ollama" runs the local model; "claude" drives the Claude Code CLI that
+   * is already installed and signed in on this machine (no API key, no
+   * separate bill); "manual" hands you the prompt to paste into any AI and
+   * takes its answer back by paste.
    */
-  aiBackend: "ollama" | "manual";
+  aiBackend: "ollama" | "manual" | "claude";
+  /** Model passed to the Claude CLI; empty means whatever it defaults to. */
+  claudeModel: string;
   ollamaUrl: string;
   ollamaModel: string;
   batchSize: number;
@@ -627,6 +631,17 @@ export const DEFAULT_STEM_OPTIONS: StemOptions = {
   jobs: 1,
   outputDir: "",
 };
+
+// v0.13 — the Claude Code CLI as an AI backend.
+// Matches `ClaudeCliInfo` in `src-tauri/src/commands/claude_cli.rs`.
+export interface ClaudeCliInfo {
+  found: boolean;
+  path?: string | null;
+  version?: string | null;
+  /** Answered a real prompt. `found && !loggedIn` means it needs `/login`. */
+  loggedIn: boolean;
+  error?: string | null;
+}
 
 export function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;

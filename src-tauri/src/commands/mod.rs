@@ -2,6 +2,7 @@ pub mod ai;
 #[cfg(test)]
 mod ai_tests;
 pub mod backup;
+pub mod claude_cli;
 pub mod backup_archive;
 pub mod components;
 pub mod convert;

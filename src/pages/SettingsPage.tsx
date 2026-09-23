@@ -15,7 +15,14 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import type { CharReplacement, DjApp, ImportResult, OllamaStatus, Settings } from "../types";
+import type {
+  CharReplacement,
+  ClaudeCliInfo,
+  DjApp,
+  ImportResult,
+  OllamaStatus,
+  Settings,
+} from "../types";
 import { CONVERT_PRESETS } from "../types";
 import {
   CAP_OPTIONS,
@@ -367,6 +374,8 @@ export function SettingsPage({
   notify,
 }: Props) {
   const [status, setStatus] = useState<OllamaStatus | null>(null);
+  const [claudeCli, setClaudeCli] = useState<ClaudeCliInfo | null>(null);
+  const [checkingClaude, setCheckingClaude] = useState(false);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
   const [promptOpen, setPromptOpen] = useState(false);
@@ -494,6 +503,29 @@ export function SettingsPage({
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     onSave({ ...settings, [key]: value });
 
+  /**
+   * Probes the Claude CLI. This costs a real (tiny) round trip because
+   * "installed" and "usable" are different things — the copy bundled with
+   * the Claude desktop app is installed but not signed in for standalone
+   * use — so it only runs when the backend is actually selected, or on
+   * demand.
+   */
+  const checkClaude = async () => {
+    setCheckingClaude(true);
+    try {
+      setClaudeCli(await invoke<ClaudeCliInfo>("claude_cli_info"));
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setCheckingClaude(false);
+    }
+  };
+
+  useEffect(() => {
+    if (settings.aiBackend === "claude" && !claudeCli && !checkingClaude) void checkClaude();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.aiBackend]);
+
   const test = async (u: string) => {
     setTesting(true);
     const result = await checkOllama(u);
@@ -529,6 +561,75 @@ export function SettingsPage({
               onChange={() => set("aiBackend", "ollama")}
             />
           </Row>
+          <Row
+            label="Claude (already on this computer)"
+            hint="Drives the Claude Code CLI you're already signed into — no API key, no separate bill"
+          >
+            <input
+              type="radio"
+              name="backend"
+              className="accent-[var(--primary)]"
+              checked={settings.aiBackend === "claude"}
+              onChange={() => set("aiBackend", "claude")}
+            />
+          </Row>
+          {settings.aiBackend === "claude" && (
+            <>
+              <p className="pb-2 text-xs text-muted-foreground">
+                AI Clean and Genre run through <span className="font-mono">claude --print</span>,
+                its documented non-interactive mode, on the Claude subscription this machine is
+                already signed into. Same prompt and same parsing as the other backends, so the
+                preview, diffs and Undo behave identically — it just doesn't need you in the loop.
+              </p>
+              <div className="mb-2 rounded-lg border bg-secondary/20 p-3 text-xs">
+                {checkingClaude ? (
+                  <span className="flex items-center gap-2 text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" /> Checking the Claude CLI…
+                  </span>
+                ) : !claudeCli ? (
+                  <span className="text-muted-foreground">Not checked yet.</span>
+                ) : claudeCli.loggedIn ? (
+                  <span className="flex items-center gap-2">
+                    <Badge className="gap-1 bg-primary/15 text-primary">Ready</Badge>
+                    <span className="min-w-0 truncate text-muted-foreground" title={claudeCli.path ?? ""}>
+                      {claudeCli.version ?? "claude"} · {claudeCli.path}
+                    </span>
+                  </span>
+                ) : (
+                  <div className="space-y-1">
+                    <span className="flex items-center gap-2">
+                      <Badge className="gap-1 bg-destructive/15 text-destructive">
+                        {claudeCli.found ? "Not signed in" : "Not found"}
+                      </Badge>
+                    </span>
+                    <p className="text-muted-foreground">{claudeCli.error}</p>
+                    {!claudeCli.found && (
+                      <p className="text-muted-foreground">
+                        Install it with{" "}
+                        <span className="font-mono">npm i -g @anthropic-ai/claude-code</span>, then
+                        run <span className="font-mono">claude</span> once to log in.
+                      </p>
+                    )}
+                  </div>
+                )}
+                <Button variant="ghost" size="sm" className="mt-2" onClick={checkClaude} disabled={checkingClaude}>
+                  <PlugZap />
+                  Re-check
+                </Button>
+              </div>
+              <Row
+                label="Model"
+                hint="Leave empty to use whatever the CLI defaults to (e.g. sonnet, opus, haiku)"
+              >
+                <input
+                  className={cn(inputClass, "w-44")}
+                  value={settings.claudeModel}
+                  placeholder="default"
+                  onChange={(e) => set("claudeModel", e.target.value)}
+                />
+              </Row>
+            </>
+          )}
           <Row
             label="Manual — use any AI"
             hint="Copy the prompt into ChatGPT, Claude, Gemini… then paste the answer back"
@@ -573,7 +674,11 @@ export function SettingsPage({
       <Card>
         <CardHeader
           title="Ollama"
-          hint={settings.aiBackend === "manual" ? "Unused while the manual backend is selected" : undefined}
+          hint={
+            settings.aiBackend === "ollama"
+              ? undefined
+              : `Unused while the ${settings.aiBackend} backend is selected`
+          }
         />
         <div className="px-5 py-3">
           <Row label="URL">

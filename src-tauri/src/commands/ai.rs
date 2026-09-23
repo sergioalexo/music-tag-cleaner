@@ -100,7 +100,7 @@ pub fn ai_preview_prompt(transliterate_scripts: Vec<String>) -> String {
 
 /// The complete prompt — the rules above plus the track list — that
 /// `ai_clean_batch` posts to Ollama.
-fn build_clean_prompt(tracks: &[TrackInput], transliterate: &[String]) -> Result<String, String> {
+pub(crate) fn build_clean_prompt(tracks: &[TrackInput], transliterate: &[String]) -> Result<String, String> {
     let track_list = serde_json::to_string_pretty(tracks).map_err(|e| e.to_string())?;
     let system_prompt = build_system_prompt(transliterate);
     Ok(format!("{system_prompt}\n\nTrack list to clean:\n{track_list}"))
@@ -243,7 +243,7 @@ pub async fn ai_clean_batch(
 
 /// The complete genre-matching prompt, shared by the Ollama path and manual
 /// mode so both ask for exactly the same thing.
-fn build_genre_prompt(tracks: &[GenreInput], genres: &[String]) -> Result<String, String> {
+pub(crate) fn build_genre_prompt(tracks: &[GenreInput], genres: &[String]) -> Result<String, String> {
     let track_list = serde_json::to_string_pretty(tracks).map_err(|e| e.to_string())?;
     let allowed = genres.join(", ");
     Ok(format!(
@@ -303,7 +303,7 @@ pub async fn ai_map_genre_batch(
     parse_genres(text, &genres)
 }
 
-fn parse_genres(text: &str, allowed: &[String]) -> Result<Vec<GenreResult>, String> {
+pub(crate) fn parse_genres(text: &str, allowed: &[String]) -> Result<Vec<GenreResult>, String> {
     let text = strip_reasoning(text);
     let value: Value = serde_json::from_str(text.trim())
         .or_else(|_| {
@@ -341,7 +341,7 @@ fn parse_genres(text: &str, allowed: &[String]) -> Result<Vec<GenreResult>, Stri
     Ok(results)
 }
 
-fn parse_cleaned(text: &str) -> Result<Vec<CleanedTrack>, String> {
+pub(crate) fn parse_cleaned(text: &str) -> Result<Vec<CleanedTrack>, String> {
     let text = strip_reasoning(text);
     if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
         if let Some(tracks) = tracks_from_value(&v) {

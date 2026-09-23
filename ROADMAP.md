@@ -1631,6 +1631,56 @@ layout, plus a real end-to-end run: `python -m demucs -n htdemucs -o ./out
 checked against the real CLI's argument parser.
 
 
+### 48. The Claude CLI as a third AI backend — v0.13.0
+
+AI Clean had two backends: Ollama (local, free, weaker) and manual (paste the
+prompt into whatever you like, paste the answer back). This adds a third that
+is neither — drive the `claude` CLI already installed and already signed in
+on the machine, so cleaning a few hundred tracks needs no copy/paste *and* no
+API key or separate bill. It runs on the Claude subscription that is already
+there.
+
+The whole integration is `claude --print` with `--output-format json`, its
+documented non-interactive mode. Both commands reuse the existing prompt
+builders and response parsers verbatim (`ai::build_clean_prompt`,
+`ai::parse_cleaned`, `ai::build_genre_prompt`, `ai::parse_genres`, made
+`pub(crate)` for this) — a second copy of the rules would drift, and "the AI
+answers differently depending on which backend you picked" is a miserable bug
+to chase. Batching, progress and Stop are shared too: `useAI` picks the
+command and nothing else changes.
+
+Two findings from testing against the real CLI that the code is shaped
+around:
+
+1. **Installed is not the same as usable.** The copy bundled inside the
+   Claude desktop app (`%APPDATA%\Claude\claude-code\<version>\claude.exe`)
+   authenticates through the app's session, so invoking it standalone returns
+   a perfectly valid envelope saying `Not logged in · Please run /login`. So
+   detection probes *login*, not presence, and a real CLI install on `PATH`
+   is always preferred over the bundled one. The Settings panel distinguishes
+   "Not found" (install it) from "Not signed in" (run `claude` once).
+2. **Failure is reported in the body, not the exit code.** A refusal, a rate
+   limit and a login problem all come back as valid JSON with
+   `is_error: true`, and the only useful message is in `result`. The parser
+   reads the body first and treats the exit code as a fallback.
+
+The CLI is invoked with `--allowedTools ""`: tag work is pure text
+transformation, so denying the tools outright means a prompt built from
+someone's tag data can never talk the CLI into touching the disk. Token usage
+is emitted on the same `ai-usage` event as Ollama, so the usage dashboard
+counts every backend instead of quietly under-reporting this one.
+
+**Verification:** 6 Rust tests over envelope interpretation — including the
+real not-logged-in envelope captured from an actual run, because guessing
+that shape is how you ship a backend that reports "unexpected output" for the
+one failure every new user hits first — plus a test that the shared parser
+accepts the fenced JSON a chat-tuned model tends to return. The CLI's flags
+(`--print`, `--output-format`, `--model`, `--append-system-prompt`) and the
+envelope shape were checked against the real binary (2.1.280). The
+signed-in path could not be exercised on the development machine, which has
+only the desktop app's bundled copy.
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

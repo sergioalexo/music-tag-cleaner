@@ -41,6 +41,7 @@ import {
   formatBytes,
   type AudioFile,
   type Capitalization,
+  type ClaudeCliInfo,
   type ConvertOutcome,
   type DemucsInfo,
   type DuplicateGroup,
@@ -585,6 +586,50 @@ export default function App() {
     setManual(null);
   };
 
+  /**
+   * Resolves which model string the selected backend should run with, or
+   * null if it isn't usable — having already told the user why.
+   *
+   * Ollama needs a running server and a pulled model; the Claude CLI needs
+   * to be installed *and signed in*, which are different failures with
+   * different fixes (the copy bundled inside the Claude desktop app is
+   * installed but not separately logged in, and would otherwise fail with
+   * something cryptic mid-run).
+   */
+  const resolveAiModel = async (): Promise<string | null> => {
+    if (settingsRef.current.aiBackend === "claude") {
+      const info = await invoke<ClaudeCliInfo>("claude_cli_info");
+      if (!info.found) {
+        notify(
+          "No Claude CLI found. Install it with: npm i -g @anthropic-ai/claude-code",
+          "error",
+        );
+        return null;
+      }
+      if (!info.loggedIn) {
+        notify(info.error ?? "The Claude CLI is not signed in — run `claude` once and log in", "error");
+        return null;
+      }
+      // The CLI picks its own default when none is set.
+      return settingsRef.current.claudeModel || "";
+    }
+
+    const status = await ai.check(settingsRef.current.ollamaUrl);
+    if (!status.running) {
+      notify(
+        "Ollama not detected. Make sure Ollama is running locally. Download at ollama.com",
+        "error",
+      );
+      return null;
+    }
+    const model = settingsRef.current.ollamaModel || status.models[0];
+    if (!model) {
+      notify("No Ollama models installed. Pull one first, e.g.: ollama pull llama3.1", "error");
+      return null;
+    }
+    return model;
+  };
+
   const runGenre = async () => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
@@ -599,19 +644,8 @@ export default function App() {
 
     if (settings.aiBackend === "manual") return openManual("genre", genreOptions);
 
-    const status = await ai.check(settings.ollamaUrl);
-    if (!status.running) {
-      notify(
-        "Ollama not detected. Make sure Ollama is running locally. Download at ollama.com",
-        "error",
-      );
-      return;
-    }
-    const model = settings.ollamaModel || status.models[0];
-    if (!model) {
-      notify("No Ollama models installed. Pull one first, e.g.: ollama pull llama3.1", "error");
-      return;
-    }
+    const model = await resolveAiModel();
+    if (model === null) return;
 
     setBusy(true);
     setAiRunning(true);
@@ -655,19 +689,8 @@ export default function App() {
 
     if (settings.aiBackend === "manual") return openManual("clean");
 
-    const status = await ai.check(settings.ollamaUrl);
-    if (!status.running) {
-      notify(
-        "Ollama not detected. Make sure Ollama is running locally. Download at ollama.com",
-        "error",
-      );
-      return;
-    }
-    const model = settings.ollamaModel || status.models[0];
-    if (!model) {
-      notify("No Ollama models installed. Pull one first, e.g.: ollama pull llama3.1", "error");
-      return;
-    }
+    const model = await resolveAiModel();
+    if (model === null) return;
 
     setBusy(true);
     setAiRunning(true);
