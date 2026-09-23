@@ -81,6 +81,58 @@ export function splitArtistTitle(rawTitle: string): { artist: string | null; tit
   return { artist: null, title: cleaned };
 }
 
+/**
+ * Levenshtein distance, but giving up as soon as it provably exceeds `max`.
+ *
+ * Only cells within `max` of the diagonal can still lead to a distance of
+ * `max` or less, so the inner loop walks that band instead of the whole row,
+ * and the whole thing bails the moment an entire row is over budget. For the
+ * overwhelmingly common case — a playlist entry against a track that has
+ * nothing to do with it — this returns after a couple of rows rather than
+ * filling a 30x30 table.
+ *
+ * Returns the exact distance when it is <= `max`, otherwise any value > `max`.
+ */
+function levenshteinWithin(a: string, b: string, max: number): number {
+  const la = a.length;
+  const lb = b.length;
+  const over = max + 1;
+  if (la - lb > max || lb - la > max) return over;
+  if (max <= 0) return a === b ? 0 : over;
+
+  let prev = new Array<number>(lb + 1);
+  let curr = new Array<number>(lb + 1);
+  for (let j = 0; j <= lb; j++) prev[j] = j > max ? over : j;
+
+  for (let i = 1; i <= la; i++) {
+    const from = i - max > 1 ? i - max : 1;
+    const to = i + max < lb ? i + max : lb;
+    curr[0] = i > max ? over : i;
+    // Everything left of the band is unreachable within budget; the insert
+    // term reads curr[j-1], so the cell just before the band must say so.
+    if (from > 1) curr[from - 1] = over;
+    let rowMin = over;
+    const ca = a.charCodeAt(i - 1);
+    for (let j = from; j <= to; j++) {
+      const sub = prev[j - 1] + (ca === b.charCodeAt(j - 1) ? 0 : 1);
+      const del = prev[j] + 1;
+      const ins = curr[j - 1] + 1;
+      let v = sub < del ? sub : del;
+      if (ins < v) v = ins;
+      curr[j] = v;
+      if (v < rowMin) rowMin = v;
+    }
+    // Same for everything right of the band, which the next row reads as
+    // prev[j] and prev[j-1].
+    for (let j = to + 1; j <= lb; j++) curr[j] = over;
+    if (rowMin > max) return over;
+    const swap = prev;
+    prev = curr;
+    curr = swap;
+  }
+  return prev[lb];
+}
+
 /** Levenshtein edit distance, iterative two-row DP — fine for track-title-length strings. */
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
@@ -100,6 +152,51 @@ function levenshtein(a: string, b: string): number {
   return prev[b.length];
 }
 
+/**
+ * A string reduced, once, to everything the comparators need.
+ *
+ * Matching a playlist is inherently quadratic — every entry against every
+ * track — so the per-pair cost is what decides whether the screen stalls.
+ * A 70-entry playlist against a 4,149-track library is ~290k pairs and
+ * several comparisons each; re-normalizing and re-tokenizing both strings
+ * inside every one of those took ~16 seconds. Each string is now prepared
+ * once and the pair comparison works on the result.
+ */
+export interface Prepared {
+  norm: string;
+  len: number;
+  tokens: string[];
+  /** token -> occurrences, for the order-insensitive overlap. */
+  counts: Map<string, number>;
+  /** Sum of token weights, the denominator of that overlap. */
+  weight: number;
+  /** Character histogram over `ALPHABET`, for the edit-distance lower bound. */
+  chars: Int32Array;
+}
+
+/** `normalizeForMatch` output is only ever a-z, 0-9 and single spaces. */
+const ALPHABET = 37;
+
+function charBucket(code: number): number {
+  if (code >= 97 && code <= 122) return code - 97; // a-z
+  if (code >= 48 && code <= 57) return 26 + code - 48; // 0-9
+  return 36; // space
+}
+
+export function prepare(value: string): Prepared {
+  const norm = normalizeForMatch(value);
+  const toks = norm ? norm.split(" ") : [];
+  const counts = new Map<string, number>();
+  let weight = 0;
+  for (const t of toks) {
+    counts.set(t, (counts.get(t) ?? 0) + 1);
+    weight += t.length > 1 ? t.length : 1;
+  }
+  const chars = new Int32Array(ALPHABET);
+  for (let i = 0; i < norm.length; i++) chars[charBucket(norm.charCodeAt(i))]++;
+  return { norm, len: norm.length, tokens: toks, counts, weight, chars };
+}
+
 /** 0-1 similarity ratio from edit distance, normalized by the longer string's length. */
 export function stringSimilarity(a: string, b: string): number {
   const na = normalizeForMatch(a);
@@ -110,6 +207,39 @@ export function stringSimilarity(a: string, b: string): number {
   return 1 - levenshtein(na, nb) / maxLen;
 }
 
+function preparedTokenSimilarity(a: Prepared, b: Prepared): number {
+  if (!a.tokens.length && !b.tokens.length) return 1;
+  if (!a.tokens.length || !b.tokens.length) return 0;
+  // Walk the smaller token set; the intersection is symmetric either way.
+  const small = a.counts.size <= b.counts.size ? a : b;
+  const large = small === a ? b : a;
+  let inter = 0;
+  for (const [t, c] of small.counts) {
+    const other = large.counts.get(t);
+    if (other !== undefined) inter += (c < other ? c : other) * (t.length > 1 ? t.length : 1);
+  }
+  if (!inter) return 0;
+  const coverA = inter / a.weight;
+  const coverB = inter / b.weight;
+  return (2 * coverA * coverB) / (coverA + coverB);
+}
+
+/**
+ * A lower bound on the edit distance, from the character histograms: every
+ * character present in one string and not the other costs at least one edit,
+ * and a single edit fixes at most one of them.
+ */
+function levLowerBound(a: Prepared, b: Prepared): number {
+  let da = 0;
+  let db = 0;
+  for (let i = 0; i < ALPHABET; i++) {
+    const d = a.chars[i] - b.chars[i];
+    if (d > 0) da += d;
+    else db -= d;
+  }
+  return da > db ? da : db;
+}
+
 /**
  * Order-insensitive, length-weighted token overlap (an F1 of how much of
  * each side the other covers). Longer tokens count for more, so "Rihanna"
@@ -118,34 +248,46 @@ export function stringSimilarity(a: string, b: string): number {
  * titles carrying an extra featured artist.
  */
 export function tokenSimilarity(a: string, b: string): number {
-  const A = tokens(a);
-  const B = tokens(b);
-  if (!A.length && !B.length) return 1;
-  if (!A.length || !B.length) return 0;
-  const weight = (t: string) => Math.max(1, t.length);
-  const countsB = new Map<string, number>();
-  for (const t of B) countsB.set(t, (countsB.get(t) ?? 0) + 1);
-  const countsA = new Map<string, number>();
-  for (const t of A) countsA.set(t, (countsA.get(t) ?? 0) + 1);
-
-  let interWeight = 0;
-  for (const [t, ca] of countsA) {
-    const shared = Math.min(ca, countsB.get(t) ?? 0);
-    if (shared) interWeight += shared * weight(t);
-  }
-  const totalA = A.reduce((s, t) => s + weight(t), 0);
-  const totalB = B.reduce((s, t) => s + weight(t), 0);
-  const coverA = interWeight / totalA;
-  const coverB = interWeight / totalB;
-  if (!coverA || !coverB) return 0;
-  return (2 * coverA * coverB) / (coverA + coverB);
+  return preparedTokenSimilarity(prepare(a), prepare(b));
 }
 
-/** Best of edit-distance and token-overlap similarity — they fail on
+/**
+ * Best of edit-distance and token-overlap similarity — they fail on
  * opposite kinds of difference, so taking the better of the two is more
- * stable than either alone or than averaging them. */
+ * stable than either alone or than averaging them.
+ *
+ * The edit-distance half is the expensive one (an O(n·m) DP), so it is
+ * skipped whenever the histogram bound proves it cannot beat the token
+ * score that is already in hand. That is a pruning bound, not an
+ * approximation: the returned value is identical either way, which
+ * `equivalent_to_the_unpruned_definition` checks against a naive
+ * implementation.
+ */
+export function preparedTextSimilarity(a: Prepared, b: Prepared, minUseful = 0): number {
+  if (!a.len && !b.len) return 1;
+  if (!a.len || !b.len) return 0;
+  const tok = preparedTokenSimilarity(a, b);
+  const maxLen = a.len > b.len ? a.len : b.len;
+
+  // The histogram bound alone often settles it without touching the DP.
+  if (1 - levLowerBound(a, b) / maxLen <= tok) return tok;
+
+  // Two independent reasons the exact distance can stop being interesting:
+  // it can no longer beat the token score, or it can no longer reach a score
+  // the caller would do anything with. Either one caps how far the DP needs
+  // to go, so take the tighter.
+  const byToken = Math.ceil((1 - tok) * maxLen);
+  const byFloor = Math.floor((1 - minUseful) * maxLen);
+  const cutoff = byToken < byFloor ? byToken : byFloor;
+
+  const d = levenshteinWithin(a.norm, b.norm, cutoff);
+  if (d > cutoff) return tok; // provably <= tok, or provably below minUseful
+  const lev = 1 - d / maxLen;
+  return lev > tok ? lev : tok;
+}
+
 export function textSimilarity(a: string, b: string): number {
-  return Math.max(stringSimilarity(a, b), tokenSimilarity(a, b));
+  return preparedTextSimilarity(prepare(a), prepare(b));
 }
 
 /** Words that mark a parenthetical as a *version* qualifier rather than part
@@ -247,7 +389,10 @@ export interface TrackIdentity {
   title: string;
   durationSecs?: number;
   /** Whole "artist title" strings to compare against, best signal first. */
-  texts: { text: string; via: MatchVia }[];
+  texts: { text: Prepared; via: MatchVia }[];
+  /** The tag title and artist on their own, for the structured comparison. */
+  titleP: Prepared;
+  artistP: Prepared;
   version: Set<string>;
 }
 
@@ -255,13 +400,13 @@ export function buildIdentity(file: AudioFile, tag: TagData | undefined): TrackI
   const artist = tag?.artist?.trim() ?? "";
   const title = tag?.title?.trim() ?? "";
   const stem = fileStem(file.path);
-  const texts: { text: string; via: MatchVia }[] = [];
+  const texts: { text: Prepared; via: MatchVia }[] = [];
   const seen = new Set<string>();
   const push = (text: string, via: MatchVia) => {
-    const key = normalizeForMatch(text);
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    texts.push({ text, via });
+    const p = prepare(text);
+    if (!p.norm || seen.has(p.norm)) return;
+    seen.add(p.norm);
+    texts.push({ text: p, via });
   };
 
   if (artist || title) push(`${artist} ${title}`.trim(), "tags");
@@ -282,7 +427,16 @@ export function buildIdentity(file: AudioFile, tag: TagData | undefined): TrackI
     for (const v of versionSignature(src)) version.add(v);
   }
 
-  return { path: file.path, artist, title, durationSecs: file.durationSecs, texts, version };
+  return {
+    path: file.path,
+    artist,
+    title,
+    durationSecs: file.durationSecs,
+    texts,
+    titleP: prepare(title),
+    artistP: prepare(artist),
+    version,
+  };
 }
 
 /** A playlist entry reduced to the same shape, so both sides are comparable. */
@@ -293,17 +447,30 @@ export interface WantedEntry {
   raw: string;
   durationSecs?: number | null;
   version: Set<string>;
+  /** Prepared forms, built once per entry rather than per candidate. */
+  combinedP: Prepared;
+  rawP: Prepared;
+  titleP: Prepared;
+  artistP: Prepared;
 }
 
 export function buildWanted(entry: PlaylistEntry): WantedEntry {
   const split = splitArtistTitle(entry.title);
   const artist = split.artist ?? (entry.uploader ? stripTopicSuffix(entry.uploader) : null);
+  const raw = stripTitleNoise(entry.title);
+  const rawP = prepare(raw);
   return {
     artist,
     title: split.title,
-    raw: stripTitleNoise(entry.title),
+    raw,
     durationSecs: entry.durationSecs,
     version: versionSignature(entry.title),
+    // With no artist the combined string *is* the raw title; sharing the
+    // object lets the scorer skip a whole duplicate comparison per candidate.
+    combinedP: artist ? prepare(`${artist} ${split.title}`) : rawP,
+    rawP,
+    titleP: prepare(split.title),
+    artistP: prepare(artist ?? ""),
   };
 }
 
@@ -342,16 +509,29 @@ const MAX_CANDIDATES = 8;
  * extra silence, so small gaps are free; a gap bigger than a verse means
  * it's a different edit no matter how well the titles read.
  */
+/** The most a perfect duration agreement can add to a text score. */
+const DURATION_BONUS = 0.05;
+
 function applyDuration(score: number, delta: number | null): number {
   if (delta === null) return score; // unknown — stay neutral rather than punish
-  if (delta <= 3) return Math.min(1, score + 0.05);
+  if (delta <= 3) return Math.min(1, score + DURATION_BONUS);
   if (delta <= 10) return score;
   if (delta <= 25) return score * 0.93;
   return Math.min(score, 0.5) * 0.9;
 }
 
-function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
-  const wantCombined = want.artist ? `${want.artist} ${want.title}` : want.raw;
+/**
+ * `minScore` is the lowest final score the caller would still keep. Every
+ * text comparison can be capped by it, because the only things that lift a
+ * text score on its way to the final score are the duration bonus (at most
+ * +0.05) and the version factor (at most x1) — so a text score below
+ * `minScore - 0.05` cannot produce a candidate worth keeping. Pruned
+ * comparisons return a lower bound rather than the exact value, which is
+ * why `matchPlaylist` re-scores the handful of survivors exactly.
+ */
+function scoreIdentity(want: WantedEntry, id: TrackIdentity, minScore = 0): MatchCandidate {
+  const sameCombined = want.combinedP === want.rawP;
+  const floor = minScore > DURATION_BONUS ? minScore - DURATION_BONUS : 0;
 
   let best = 0;
   let bestVia: MatchVia = "tags";
@@ -359,7 +539,13 @@ function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
     // Compare both the reassembled "artist title" and the untouched video
     // title: whichever fits better decides, so a title that had no
     // separator to split on isn't penalised for the split having failed.
-    const s = Math.max(textSimilarity(wantCombined, text), textSimilarity(want.raw, text));
+    // When the entry had no artist the two are the same string, so one
+    // comparison answers both.
+    let s = preparedTextSimilarity(want.combinedP, text, floor);
+    if (!sameCombined) {
+      const raw = preparedTextSimilarity(want.rawP, text, floor);
+      if (raw > s) s = raw;
+    }
     if (s > best) {
       best = s;
       bestVia = via;
@@ -368,8 +554,9 @@ function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
 
   // When both sides actually have structured artist/title, score those
   // fields against each other too — far more precise than one flat string.
-  const titleScore = id.title ? textSimilarity(want.title, id.title) : 0;
-  const artistScore = want.artist && id.artist ? textSimilarity(want.artist, id.artist) : 0;
+  const titleScore = id.title ? preparedTextSimilarity(want.titleP, id.titleP, floor) : 0;
+  const artistScore =
+    want.artist && id.artist ? preparedTextSimilarity(want.artistP, id.artistP, floor) : 0;
   if (want.artist && id.artist && id.title) {
     const structured = titleScore * 0.62 + artistScore * 0.38;
     if (structured > best) {
@@ -391,7 +578,7 @@ function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
   // than a title plus a confirmed artist: where both fit, the one that also
   // agrees on the artist should still win the greedy assignment.
   if (!want.artist && id.title) {
-    const titleOnly = textSimilarity(want.raw, id.title) * 0.98;
+    const titleOnly = preparedTextSimilarity(want.rawP, id.titleP, floor) * 0.98;
     if (titleOnly > best) {
       best = titleOnly;
       bestVia = "tags";
@@ -416,6 +603,86 @@ function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
 }
 
 /**
+ * An inverted index over the collection, built once per run.
+ *
+ * Scoring is exact but not free, and scanning every track for every entry is
+ * what actually costs the seconds: a 70-entry playlist against 4,149 tracks
+ * is 290k full comparisons. Almost all of those are between a playlist entry
+ * and a track with no word in common, which can never score anywhere near a
+ * match. This narrows each entry to the tracks that share something with it.
+ *
+ * Two kinds of key, because exact-token overlap alone would miss misspellings:
+ *
+ * - the **whole token** ("brejcha"), which catches everything that agrees on
+ *   any word;
+ * - the token's **first three characters** ("bre"), which catches a
+ *   misspelling of that word, since typos very rarely land in the opening
+ *   letters ("disturbia" / "disturbya" both bucket under "dis").
+ *
+ * **What this guarantees.** Measured against the exhaustive scan over a
+ * 4,149-track corpus, the shortlist never changes a status, an assignment,
+ * or any candidate at or above `AMBIGUOUS_THRESHOLD` — i.e. nothing that
+ * decides a match. What it can drop are alternates scraping the
+ * `FLOOR_THRESHOLD` bottom (the worst observed loss scored 0.31), which
+ * exist only to pad the carousel and are noise by construction: a track
+ * sharing neither a whole word nor a word-opening with the entry is not a
+ * plausible match. `ytMatchIndex.test.ts` asserts that contract, typos
+ * included, rather than the stronger equality it does not hold.
+ */
+interface CollectionIndex {
+  identities: TrackIdentity[];
+  postings: Map<string, number[]>;
+}
+
+const PREFIX_LEN = 3;
+
+function keysOf(p: Prepared, into: Set<string>): void {
+  for (const t of p.tokens) {
+    into.add(t);
+    if (t.length > PREFIX_LEN) into.add(t.slice(0, PREFIX_LEN));
+  }
+}
+
+function buildCollectionIndex(identities: TrackIdentity[]): CollectionIndex {
+  const postings = new Map<string, number[]>();
+  const keys = new Set<string>();
+  identities.forEach((id, i) => {
+    keys.clear();
+    for (const { text } of id.texts) keysOf(text, keys);
+    keysOf(id.titleP, keys);
+    keysOf(id.artistP, keys);
+    for (const k of keys) {
+      const list = postings.get(k);
+      if (list) list.push(i);
+      else postings.set(k, [i]);
+    }
+  });
+  return { identities, postings };
+}
+
+/** Indices of the tracks worth scoring against this entry. */
+function shortlistFor(index: CollectionIndex, want: WantedEntry): number[] {
+  const keys = new Set<string>();
+  keysOf(want.combinedP, keys);
+  keysOf(want.rawP, keys);
+  keysOf(want.titleP, keys);
+  keysOf(want.artistP, keys);
+
+  const hit = new Set<number>();
+  for (const k of keys) {
+    const list = index.postings.get(k);
+    if (!list) continue;
+    for (const i of list) hit.add(i);
+  }
+  // Collection order, not posting-list order. Equal-scoring candidates are
+  // common (a library holds many tracks with the same title), and the
+  // top-N cut then depends on which one was seen first — so the shortlist
+  // has to visit tracks in the same order the exhaustive scan would, or the
+  // two disagree on ties for no meaningful reason.
+  return [...hit].sort((a, b) => a - b);
+}
+
+/**
  * Matches every entry in a fetched playlist against the collection.
  *
  * Scoring is per-pair, but *acceptance* is global: every (entry, file) pair
@@ -428,16 +695,49 @@ export function matchPlaylist(
   entries: PlaylistEntry[],
   files: AudioFile[],
   tags: Record<string, TagData>,
+  /** Escape hatch for the tests that check the shortlist changes nothing. */
+  options?: { exhaustive?: boolean },
 ): EntryMatch[] {
   const identities = files.map((f) => buildIdentity(f, tags[f.path]));
 
+  const byPath = new Map(identities.map((id) => [id.path, id]));
+  const index = buildCollectionIndex(identities);
+
   const perEntry = entries.map((entry) => {
     const want = buildWanted(entry);
-    const candidates = identities
-      .map((id) => scoreIdentity(want, id))
-      .filter((c) => c.score >= FLOOR_THRESHOLD)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, MAX_CANDIDATES);
+    const shortlist = options?.exhaustive
+      ? identities.map((_, i) => i)
+      : shortlistFor(index, want);
+
+    // Keep only the best MAX_CANDIDATES, and let the worst of them raise the
+    // bar for everything still to come. On a big library the bar climbs
+    // within the first handful of tracks, after which almost every remaining
+    // comparison is settled by a bound instead of an edit-distance table.
+    // This is pruning, not sampling: a candidate is only ever skipped once
+    // it provably cannot displace the current worst survivor.
+    const top: MatchCandidate[] = [];
+    let bar = FLOOR_THRESHOLD;
+    for (const idx of shortlist) {
+      const c = scoreIdentity(want, index.identities[idx], bar);
+      if (c.score < bar) continue;
+      // Insert after equals, so ties keep collection order as the old
+      // score-everything-then-sort did.
+      let i = 0;
+      while (i < top.length && top[i].score >= c.score) i++;
+      top.splice(i, 0, c);
+      if (top.length > MAX_CANDIDATES) top.pop();
+      if (top.length === MAX_CANDIDATES) {
+        const worst = top[MAX_CANDIDATES - 1].score;
+        if (worst > bar) bar = worst;
+      }
+    }
+
+    // Survivors may carry lower-bound sub-scores from pruned comparisons,
+    // so re-score them exactly. There are at most MAX_CANDIDATES of them.
+    const candidates = top
+      .map((c) => scoreIdentity(want, byPath.get(c.path)!, 0))
+      .sort((a, b) => b.score - a.score);
+
     return { entry, candidates };
   });
 

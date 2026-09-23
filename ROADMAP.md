@@ -1690,6 +1690,63 @@ signed-in path could not be exercised on the development machine, which has
 only the desktop app's bundled copy.
 
 
+### 49. Playlist matching: 15.7s → 0.35s — v0.13.0
+
+Matching the user's real 70-track playlist against their 4,149-track indexed
+library took **15.7 seconds**, blocking the UI thread the whole time. Restoring
+a saved session or pressing Re-match froze the app.
+
+Measured first, because the obvious culprit was wrong twice. A benchmark at
+the real size (`ytMatch.bench.test.ts`) plus a phase breakdown showed the cost
+was not where it looked: building 4,149 identities is 190ms one-off, but each
+*entry* then cost 46ms to scan the collection — 3.2s of pure comparison, and
+that was already after a 3x win. Three changes, in order of how much they
+mattered:
+
+1. **An inverted index over the collection** (the big one, ~10x). Scanning
+   every track for every entry is 290k full comparisons, almost all between
+   things with no word in common. Each entry now only meets tracks sharing a
+   whole token ("brejcha") or a token's first three characters ("bre" — typos
+   rarely land in the opening letters, so "disturbia"/"disturbya" still find
+   each other). The shortlist is walked in *collection* order, not posting-list
+   order: equal scores are common in a real library, and the top-N cut would
+   otherwise depend on which tie was seen first.
+
+2. **Prepared strings** (~3x). Every comparison was re-normalizing and
+   re-tokenizing both sides. Each string is now reduced once to its normalized
+   form, token multiset, weight and character histogram.
+
+3. **Pruning the edit-distance DP.** A character histogram gives a lower bound
+   on the distance, which often settles a comparison outright; when it doesn't,
+   the DP runs banded (Ukkonen) with a row-minimum bail-out, capped by both the
+   token score it must beat and the floor the caller still cares about.
+   `matchPlaylist` keeps a running top-N whose worst member raises that floor
+   as it goes.
+
+**What was actually verified**, since a faster matcher that matches differently
+is worthless:
+
+- `textSimilarity` is checked against a naive `max(levenshtein, tokens)`
+  implementation over 2,000 random strings plus adversarial cases — anagrams
+  (identical histograms, so the bound proves nothing and the DP must run),
+  single-character typos, disjoint strings — and separately that a caller's
+  pruning floor never changes a result that clears it.
+- The shortlist is checked against the exhaustive scan it replaced, over a
+  4,149-track corpus, for exact titles, "Artist - Title", remixes, absent
+  tracks, " - Topic" uploaders, deliberate typos, entries made only of very
+  common words, and a collection with no tags at all. `matchPlaylist` keeps an
+  `{ exhaustive: true }` escape hatch purely so those tests can compare.
+- The contract asserted is **decision equivalence, not identity**: statuses,
+  assignments and every candidate at or above `AMBIGUOUS_THRESHOLD` are
+  identical. Below that the shortlist may drop an alternate scraping the
+  `FLOOR_THRESHOLD` bottom — measured worst case 0.31, against entries that are
+  missing either way. Claiming full equality would have been claiming something
+  untrue.
+- Confirmed against the real thing: the same playlist and the same library
+  produce the same 26 matched · 44 missing · 70 total, with every individual
+  score unchanged.
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

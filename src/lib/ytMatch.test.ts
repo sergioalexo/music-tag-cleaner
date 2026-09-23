@@ -5,8 +5,12 @@ import {
   CONFIDENT_THRESHOLD,
   matchPlaylist,
   parseSearchableBackup,
+  prepare,
+  preparedTextSimilarity,
   splitArtistTitle,
+  stringSimilarity,
   textSimilarity,
+  tokenSimilarity,
   versionSignature,
 } from "./ytMatch";
 
@@ -90,6 +94,78 @@ describe("textSimilarity", () => {
 
   it("tolerates an extra featured artist", () => {
     expect(textSimilarity("Calvin Harris Summer", "Calvin Harris feat. Example Summer")).toBeGreaterThan(0.8);
+  });
+});
+
+/**
+ * The fast path skips the edit-distance DP whenever a character-histogram
+ * bound proves it cannot beat the token score. That is only sound if the
+ * answer is bit-for-bit identical to computing both and taking the max, so
+ * this checks it against a naive implementation over adversarial inputs:
+ * anagrams (identical histograms, different order), single-character typos,
+ * shared prefixes, and disjoint strings.
+ */
+describe("textSimilarity pruning", () => {
+  const naive = (a: string, b: string) => Math.max(stringSimilarity(a, b), tokenSimilarity(a, b));
+
+  const CASES: [string, string][] = [
+    ["", ""],
+    ["", "gravity"],
+    ["gravity", "gravity"],
+    ["gravity", "gravty"],
+    ["gravity", "ytivarg"],
+    ["boris brejcha gravity", "gravity boris brejcha"],
+    ["disturbia", "rihanna disturbia"],
+    ["rihanna disturbia", "disturbia"],
+    ["evacuate the dancefloor", "cascada evacuate the dancefloor"],
+    ["metallica enter sandman", "boris brejcha gravity"],
+    ["aaaa", "aaab"],
+    ["abc def", "def abc"],
+    ["a", "b"],
+    ["the the the", "the"],
+    ["hotel room service", "pitbull hotel room service"],
+    ["calvin harris summer", "calvin harris feat example summer"],
+  ];
+
+  it("returns exactly what the unpruned definition returns", () => {
+    for (const [a, b] of CASES) {
+      expect(textSimilarity(a, b)).toBeCloseTo(naive(a, b), 12);
+      // Symmetry matters too: the bound uses max(da, db), not one direction.
+      expect(textSimilarity(b, a)).toBeCloseTo(naive(b, a), 12);
+    }
+  });
+
+  it("is unaffected by the caller's minUseful floor when the result clears it", () => {
+    // A floor only ever licenses returning a lower bound for results that
+    // fall below it; anything at or above must still be exact.
+    for (const [a, b] of CASES) {
+      const exact = textSimilarity(a, b);
+      for (const floor of [0, 0.3, 0.6, 0.87, 1]) {
+        const v = preparedTextSimilarity(prepare(a), prepare(b), floor);
+        if (exact >= floor) expect(v).toBeCloseTo(exact, 12);
+        else expect(v).toBeLessThanOrEqual(exact + 1e-12);
+      }
+    }
+  });
+
+  it("agrees with the unpruned definition on random strings", () => {
+    const alphabet = "abcdefg hij";
+    let seed = 12345;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const str = () => {
+      const n = 1 + Math.floor(rnd() * 18);
+      let out = "";
+      for (let i = 0; i < n; i++) out += alphabet[Math.floor(rnd() * alphabet.length)];
+      return out;
+    };
+    for (let i = 0; i < 2000; i++) {
+      const a = str();
+      const b = str();
+      expect(textSimilarity(a, b)).toBeCloseTo(naive(a, b), 12);
+    }
   });
 });
 
