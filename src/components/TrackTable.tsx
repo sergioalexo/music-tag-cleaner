@@ -34,6 +34,7 @@ import { basename, FIELD_LABELS, formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { internalDrag } from "../lib/internalDrag";
+import { matchesTerms, parseQuery } from "../lib/trackSearch";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
 import { AudioPreview, formatDuration, releasePlayback, takeOverPlayback } from "./AudioPreview";
@@ -1041,22 +1042,25 @@ export function TrackTable({
     setAnchorPath(path);
   };
 
-  /** Rows (in display order) whose visible cell text matches the search query. */
+  /**
+   * Rows (in display order) that match the search query.
+   *
+   * This searches the **tags**, not the rendered cells. It used to scan
+   * visible columns only, which meant hiding the Artist column silently
+   * turned off artist search — indistinguishable, from the outside, from
+   * search being broken. `searchTracks` also covers the filename and the
+   * pre-clean searchable backup, and understands `artist:x`, `-exclude` and
+   * "quoted phrases" (see lib/trackSearch.ts).
+   */
   const searchMatches = useMemo(() => {
-    if (!searchQuery.trim()) return [] as string[];
-    const q = searchQuery.trim().toLowerCase();
+    const terms = parseQuery(searchQuery);
+    if (!terms.length) return [] as string[];
     const out: string[] = [];
     for (const f of rows) {
-      const t = tags[f.path];
-      const hit = columns.some((c) => {
-        if (c.custom) return false;
-        const v = c.value(f, t);
-        return v && v.toLowerCase().includes(q);
-      });
-      if (hit) out.push(f.path);
+      if (matchesTerms(f, tags[f.path], terms)) out.push(f.path);
     }
     return out;
-  }, [rows, tags, columns, searchQuery]);
+  }, [rows, tags, searchQuery]);
 
   useEffect(() => {
     setMatchIndex(0);

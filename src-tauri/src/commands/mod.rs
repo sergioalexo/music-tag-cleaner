@@ -8,6 +8,7 @@ pub mod convert;
 pub mod duplicates;
 pub mod ffmpeg;
 pub mod files;
+pub mod library_index;
 pub mod rekordbox_import;
 pub mod usb;
 pub mod ytmusic;

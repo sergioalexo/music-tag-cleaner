@@ -19,6 +19,7 @@ import { useAnalytics } from "./hooks/useAnalytics";
 import { useFiles } from "./hooks/useFiles";
 import { useHistory, type HistoryChange } from "./hooks/useHistory";
 import { useSettings } from "./hooks/useSettings";
+import { useLibraryIndex, mergeWithSession } from "./hooks/useLibraryIndex";
 import { useTags } from "./hooks/useTags";
 import { LibraryPage } from "./pages/LibraryPage";
 import {
@@ -29,7 +30,7 @@ import {
   isUid,
   removeCharsFrom,
 } from "./lib/standardize";
-import { activePreset, detectGenreGroups } from "./lib/genres";
+import { detectGenreGroups, libraryGenreNames } from "./lib/genres";
 import { matchesShortcut } from "./lib/shortcuts";
 import { internalDrag } from "./lib/internalDrag";
 import { check } from "@tauri-apps/plugin-updater";
@@ -136,6 +137,7 @@ export default function App() {
   const { covers, invalidate: invalidateCovers } = useCovers(filesApi.files);
   const imageInfoApi = useImageInfo(filesApi.files, settings.visibleColumns.includes("imageInfo"));
   const analytics = useAnalytics();
+  const libraryIndex = useLibraryIndex();
   const withTrack = (name: string, fn: () => void) => () => {
     analytics.track(name);
     fn();
@@ -146,11 +148,33 @@ export default function App() {
   };
 
   const [libraryTags, setLibraryTags] = useState<Record<string, TagData>>({});
-  // Feeds Settings > Genre Presets > "Detect genres" — every distinct genre
-  // spelling in the loaded collection, near-duplicates grouped together.
-  const collectionGenreGroups = useMemo(
-    () => detectGenreGroups(Object.values(libraryTags).map((t) => t.genre)),
-    [libraryTags],
+
+  /**
+   * The genre vocabulary: whatever the indexed collection uses, plus the
+   * genres on tracks loaded right now. No stored preset — see lib/genres.ts.
+   */
+  const genreOptions = useMemo(
+    () => libraryGenreNames(libraryIndex.genres, libraryTags),
+    [libraryIndex.genres, libraryTags],
+  );
+
+  // Feeds Settings > Genres > "Detect genres" — every distinct genre spelling
+  // in the collection, near-duplicates grouped together. Drawn from the index
+  // when there is one, so it sees the whole library and not just what's open.
+  const collectionGenreGroups = useMemo(() => {
+    const fromIndex = libraryIndex.genres.flatMap((g) => Array<string>(g.count).fill(g.name));
+    const fromSession = Object.values(libraryTags).map((t) => t.genre);
+    return detectGenreGroups(fromIndex.length ? fromIndex : fromSession);
+  }, [libraryIndex.genres, libraryTags]);
+
+  /**
+   * Everything the app knows about, for matching and search: the indexed
+   * collection with this session's loaded files layered on top. See
+   * `mergeWithSession` for why both halves are needed.
+   */
+  const wholeCollection = useMemo(
+    () => mergeWithSession(libraryIndex.files, libraryIndex.tags, filesApi.files, libraryTags),
+    [libraryIndex.files, libraryIndex.tags, filesApi.files, libraryTags],
   );
   const [pending, setPending] = useState<PendingChange[] | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>("clear");
@@ -556,11 +580,16 @@ export default function App() {
   const runGenre = async () => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
-    const preset = activePreset(settings.genrePresets, settings.activeGenrePreset);
-    if (!preset || preset.genres.length === 0)
-      return notify("The active genre preset has no genres — add some in Settings", "info");
+    // The target vocabulary is the collection's own genres. If the library
+    // has never been indexed there is nothing to snap to, and guessing a
+    // default taxonomy would be exactly the drift this replaced.
+    if (genreOptions.length === 0)
+      return notify(
+        "No genres found in your collection yet — index your library in Settings first",
+        "info",
+      );
 
-    if (settings.aiBackend === "manual") return openManual("genre", preset.genres);
+    if (settings.aiBackend === "manual") return openManual("genre", genreOptions);
 
     const status = await ai.check(settings.ollamaUrl);
     if (!status.running) {
@@ -586,7 +615,7 @@ export default function App() {
         map,
         settings,
         model,
-        preset.genres,
+        genreOptions,
         (done, total) =>
           setProgress({
             done,
@@ -1549,64 +1578,94 @@ export default function App() {
     }
   };
 
-  /** Adds a genre to the active preset (used by the "+" row in the table's genre editor). */
-  const addGenreToPreset = (genre: string) => {
-    const trimmed = genre.trim();
-    if (!trimmed) return;
-    const preset = activePreset(settings.genrePresets, settings.activeGenrePreset);
-    if (!preset || preset.genres.some((g) => g.toLowerCase() === trimmed.toLowerCase())) return;
-    save({
-      ...settings,
-      genrePresets: settings.genrePresets.map((p) =>
-        p.name === settings.activeGenrePreset ? { ...p, genres: [...p.genres, trimmed] } : p,
-      ),
-    });
+  /**
+   * The table's genre editor offers "Add …" for a value that isn't in the
+   * list yet. There is no list to add it *to* any more — the vocabulary is
+   * whatever the files carry — so creating a genre just means writing it to
+   * the track, which the Combobox's own commit already does. This exists to
+   * keep that affordance (and its analytics) rather than to store anything.
+   */
+  const noteNewGenre = (genre: string) => {
+    if (genre.trim()) analytics.track("genre-created");
   };
 
   /**
-   * Renames a genre within the active preset, then — if any loaded track
-   * still carries the old name — offers to retag the collection to match,
-   * so the preset and the actual files don't drift apart.
+   * Renames a genre **across the whole collection**, not just the tracks
+   * currently open.
+   *
+   * This is the point of deriving genres from the library: the name in the
+   * picker and the name in the files are the same thing, so renaming one has
+   * to rename the other or they drift apart again. Tracks that aren't loaded
+   * are retagged in Rust (`retag_field`), which also refreshes their index
+   * rows; loaded tracks go through the normal edit path so undo still covers
+   * them.
    */
-  const renameGenreInPreset = async (oldName: string, newName: string) => {
+  const renameGenreEverywhere = async (oldName: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed || trimmed === oldName) return;
-    await save({
-      ...settings,
-      genrePresets: settings.genrePresets.map((p) =>
-        p.name === settings.activeGenrePreset
-          ? { ...p, genres: p.genres.map((g) => (g === oldName ? trimmed : g)) }
-          : p,
-      ),
-    });
-    const matching = Object.entries(libraryTags)
+
+    let paths: string[] = [];
+    try {
+      paths = await libraryIndex.pathsWithGenre(oldName);
+    } catch {
+      paths = [];
+    }
+    // Loaded-but-not-yet-indexed tracks matter too — they're the ones most
+    // likely to have just been given this genre by hand.
+    const loaded = Object.entries(libraryTags)
       .filter(([, t]) => t.genre === oldName)
       .map(([path]) => path);
-    if (!matching.length) return;
+    const all = [...new Set([...paths, ...loaded])];
+    if (!all.length) {
+      notify(`Nothing in the collection uses "${oldName}"`, "info");
+      return;
+    }
+
     const ok = await confirm(
-      `${matching.length} track${matching.length === 1 ? "" : "s"} in the collection ` +
-        `${matching.length === 1 ? "uses" : "use"} "${oldName}". Rename ${
-          matching.length === 1 ? "it" : "them"
-        } to "${trimmed}"?`,
-      { title: "Rename Genre", kind: "info" },
+      `${all.length} track${all.length === 1 ? "" : "s"} in your collection ` +
+        `${all.length === 1 ? "uses" : "use"} "${oldName}". Rename ${
+          all.length === 1 ? "it" : "them"
+        } to "${trimmed}"?
+
+This rewrites the genre tag on ${
+          all.length === 1 ? "that file" : "those files"
+        }.`,
+      { title: "Rename Genre", kind: "warning" },
     );
     if (!ok) return;
-    await editField(matching, "genre", trimmed);
-  };
 
-  /** Appends genre names to the active preset (skipping ones already there). */
-  const addGenresToPreset = async (names: string[]) => {
-    const preset = settings.genrePresets.find((p) => p.name === settings.activeGenrePreset);
-    if (!preset) return;
-    const existing = new Set(preset.genres.map((g) => g.toLowerCase()));
-    const toAdd = names.filter((n) => n.trim() && !existing.has(n.trim().toLowerCase()));
-    if (!toAdd.length) return;
-    await save({
-      ...settings,
-      genrePresets: settings.genrePresets.map((p) =>
-        p.name === settings.activeGenrePreset ? { ...p, genres: [...p.genres, ...toAdd] } : p,
-      ),
-    });
+    const loadedSet = new Set(filesApi.files.map((f) => f.path));
+    const inSession = all.filter((p) => loadedSet.has(p));
+    const offSession = all.filter((p) => !loadedSet.has(p));
+
+    setBusy(true);
+    try {
+      if (inSession.length) await editField(inSession, "genre", trimmed);
+      if (offSession.length) {
+        const results = await invoke<{ path: string; error: string | null }[]>("retag_field", {
+          paths: offSession,
+          field: "genre",
+          value: trimmed,
+          preserveArt: settingsRef.current.preserveCoverArt,
+          backupField: settingsRef.current.searchableBackup
+            ? settingsRef.current.backupField
+            : null,
+        });
+        const failed = results.filter((r) => r.error);
+        failed.forEach((r) => notify(`${basename(r.path)}: ${r.error}`, "error"));
+        notify(
+          `Renamed "${oldName}" to "${trimmed}" on ${all.length - failed.length} track(s)`,
+          "success",
+        );
+      } else {
+        notify(`Renamed "${oldName}" to "${trimmed}"`, "success");
+      }
+      await libraryIndex.refresh();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
   };
 
   /**
@@ -1729,8 +1788,9 @@ export default function App() {
               onStandardizeContainers={withTrack("standardizeContainers", standardizeContainers)}
               onRename={withTrack("renameToStandard", renameToStandard)}
               onClearFields={withTrack1("clearFields", runClearFields)}
-              onAddGenre={addGenreToPreset}
-              onRenameGenre={renameGenreInPreset}
+              onAddGenre={noteNewGenre}
+              onRenameGenre={renameGenreEverywhere}
+              genreOptions={genreOptions}
               onBackup={withTrack("backup", runBackup)}
               onRestore={withTrack("restore", restoreBackup)}
               onBackupArchive={withTrack("backupArchive", runBackupArchive)}
@@ -1769,12 +1829,18 @@ export default function App() {
             />
           ) : page === "ytmusic" ? (
             <YtMusicImportPage
-              files={filesApi.files}
-              tags={libraryTags}
+              files={wholeCollection.files}
+              tags={wholeCollection.tags}
+              indexedCount={libraryIndex.stats?.trackCount ?? 0}
               notify={notify}
               onInspect={(path) => {
                 const file = filesApi.files.find((f) => f.path === path);
                 if (file) inspect(file);
+                else
+                  notify(
+                    "That track is in the index but not loaded — open its folder to inspect it",
+                    "info",
+                  );
               }}
             />
           ) : page === "components" ? (
@@ -1795,9 +1861,9 @@ export default function App() {
             <SettingsPage
               settings={settings}
               onSave={save}
-              onRenameGenre={renameGenreInPreset}
+              onRenameGenre={renameGenreEverywhere}
               collectionGenreGroups={collectionGenreGroups}
-              onAddGenres={addGenresToPreset}
+              libraryIndex={libraryIndex}
               onMergeGenreVariants={mergeGenreVariants}
               checkOllama={ai.check}
               notify={notify}

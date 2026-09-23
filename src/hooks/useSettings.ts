@@ -2,9 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { load, type Store } from "@tauri-apps/plugin-store";
 import type { Settings } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
-import { DEFAULT_GENRE_PRESETS } from "../lib/genres";
 
-export const CURRENT_SETTINGS_VERSION = 7;
+export const CURRENT_SETTINGS_VERSION = 8;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -44,8 +43,6 @@ export const DEFAULT_SETTINGS: Settings = {
   flagExtraChars: DEFAULT_FLAG_EXTRA_CHARS,
   fieldNaming: "friendly",
   removeChars: ",.",
-  genrePresets: DEFAULT_GENRE_PRESETS,
-  activeGenrePreset: "Sergio Alexo",
   nextTrackId: 0,
   trackIdDigits: 6,
   strictFilenames: true,
@@ -74,6 +71,9 @@ const STORE_FILE = "settings.json";
  * this bump only records that the shape grew. v6 retires "Strip to common
  * tags only" along with the Clean Tags action, and lowers the artwork target.
  * v7 retires the manual theme toggle: the app follows the OS theme.
+ * v8 retires the stored genre presets: the genre vocabulary is now derived
+ * from the indexed library, so a remembered list can no longer drift from
+ * the files.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -112,6 +112,11 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     // "dark" for all but a deliberate toggle, and there is no longer any
     // UI that would let someone restore a pinned choice.
     next.theme = "system";
+  }
+  if (savedVersion < 8) {
+    const legacy = next as unknown as Record<string, unknown>;
+    delete legacy.genrePresets;
+    delete legacy.activeGenrePreset;
   }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;

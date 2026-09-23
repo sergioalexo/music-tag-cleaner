@@ -278,6 +278,131 @@ pub async fn fetch_ytmusic_playlist(app: AppHandle, url: String) -> Result<Playl
     Ok(result)
 }
 
+/// A saved import session: the fetched playlist plus every decision made
+/// about it.
+///
+/// The point is resumability. A playlist is rarely matched in one sitting —
+/// you match what you own, go and buy the rest, come back a week later and
+/// re-fetch. Without this, that second pass starts from zero and every
+/// confirmation and denial from the first pass is lost, which is worse than
+/// useless: the matcher will happily re-propose exactly the matches you
+/// already rejected.
+///
+/// Decisions are keyed by video id inside `payload`, so they survive the
+/// playlist gaining, losing or reordering tracks, and they survive the
+/// library growing — which is the case that matters, since the whole reason
+/// to come back is that you now own more of it.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSession {
+    pub key: String,
+    pub title: String,
+    pub url: String,
+    pub saved_at: i64,
+    /// Opaque JSON owned by the frontend (entries + overrides + denials).
+    /// Kept opaque on purpose: the shape of a decision is a UI concern, and
+    /// versioning it here would mean a migration every time the UI grows a
+    /// new kind of decision.
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSessionSummary {
+    pub key: String,
+    pub title: String,
+    pub url: String,
+    pub saved_at: i64,
+}
+
+#[tauri::command]
+pub async fn save_import_session(
+    app: AppHandle,
+    key: String,
+    title: String,
+    url: String,
+    payload: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::commands::library_index::open_db(&app)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT OR REPLACE INTO import_session (key, title, url, saved_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![key, title, url, now, payload],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Saving the import session failed unexpectedly".to_string())?
+}
+
+#[tauri::command]
+pub async fn load_import_session(app: AppHandle, key: String) -> Result<Option<ImportSession>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::commands::library_index::open_db(&app)?;
+        let found = conn
+            .query_row(
+                "SELECT key, title, url, saved_at, payload FROM import_session WHERE key = ?1",
+                rusqlite::params![key],
+                |r| {
+                    Ok(ImportSession {
+                        key: r.get(0)?,
+                        title: r.get(1)?,
+                        url: r.get(2)?,
+                        saved_at: r.get(3)?,
+                        payload: r.get(4)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(found)
+    })
+    .await
+    .map_err(|_| "Loading the import session failed unexpectedly".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_import_sessions(app: AppHandle) -> Result<Vec<ImportSessionSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::commands::library_index::open_db(&app)?;
+        let mut stmt = conn
+            .prepare("SELECT key, title, url, saved_at FROM import_session ORDER BY saved_at DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ImportSessionSummary {
+                    key: r.get(0)?,
+                    title: r.get(1)?,
+                    url: r.get(2)?,
+                    saved_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    })
+    .await
+    .map_err(|_| "Listing import sessions failed unexpectedly".to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_import_session(app: AppHandle, key: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::commands::library_index::open_db(&app)?;
+        conn.execute("DELETE FROM import_session WHERE key = ?1", rusqlite::params![key])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Deleting the import session failed unexpectedly".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

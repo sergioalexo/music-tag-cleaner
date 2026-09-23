@@ -16,11 +16,21 @@ import {
   Link2,
   ListMusic,
   Loader2,
+  RefreshCw,
   RotateCcw,
+  Save,
   Search,
+  Trash2,
   X,
 } from "lucide-react";
-import type { AudioFile, PlaylistFetchResult, TagData, YtDlpInfo } from "../types";
+import type {
+  AudioFile,
+  ImportSession,
+  PlaylistEntry,
+  PlaylistFetchResult,
+  TagData,
+  YtDlpInfo,
+} from "../types";
 import { AudioPreview } from "../components/AudioPreview";
 import {
   AMBIGUOUS_THRESHOLD,
@@ -39,6 +49,41 @@ import { LibrarySearchPanel } from "../components/LibrarySearchPanel";
 
 function sanitizeFilenamePart(s: string): string {
   return s.replace(/[\\/:*?"<>|]+/g, " ").trim() || "playlist";
+}
+
+/**
+ * Everything about one import run that is worth surviving the app closing.
+ *
+ * Matching a playlist is rarely a single sitting: you match what you own, go
+ * and buy the rest, and come back days later to re-fetch. Without this, that
+ * second pass starts from nothing — every confirmation and, worse, every
+ * *denial* is lost, so the matcher cheerfully re-proposes exactly the matches
+ * already rejected.
+ *
+ * Decisions are keyed by video id, never by position, so they survive the
+ * playlist gaining, losing or reordering tracks, and they survive the library
+ * growing — which is the whole reason to come back.
+ */
+interface SessionPayload {
+  version: 1;
+  entries: PlaylistEntry[];
+  overrides: Record<string, string>;
+  denied: Record<string, string[]>;
+  candIndex: Record<string, number>;
+  fromSearch: Record<string, boolean>;
+}
+
+/**
+ * Stable identity for a playlist. The `list=` id is the same across
+ * `music.youtube.com` and `youtube.com` and survives extra query params, so
+ * a session saved from one link is found again from the other.
+ */
+export function sessionKeyFor(url: string): string {
+  const m = url.match(/[?&]list=([^&]+)/i);
+  if (m) return `list:${m[1]}`;
+  const v = url.match(/[?&]v=([^&]+)/i);
+  if (v) return `video:${v[1]}`;
+  return `url:${url.trim()}`;
 }
 
 type EffectiveStatus = "matched" | "ambiguous" | "missing";
@@ -74,11 +119,15 @@ function StatusBadge({ status, score }: { status: EffectiveStatus; score?: numbe
 export function YtMusicImportPage({
   files,
   tags,
+  indexedCount,
   notify,
   onInspect,
 }: {
+  /** The whole collection: indexed tracks plus this session's loaded files. */
   files: AudioFile[];
   tags: Record<string, TagData>;
+  /** How many of `files` came from the index, for the "index your library" hint. */
+  indexedCount: number;
   notify: (message: string, kind?: "success" | "error" | "info") => void;
   onInspect: (path: string) => void;
 }) {
@@ -105,6 +154,9 @@ export function YtMusicImportPage({
   /** videoIds whose match was dragged in from the search panel. */
   const [fromSearch, setFromSearch] = useState<Record<string, boolean>>({});
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  /** The saved session this run was resumed from, if any. */
+  const [resumedFrom, setResumedFrom] = useState<ImportSession | null>(null);
+  const [rematching, setRematching] = useState(false);
 
   // --- Bottom library-search dock + its drag-to-match gesture.
   const [panelHeight, setPanelHeight] = useState(180);
@@ -193,6 +245,32 @@ export function YtMusicImportPage({
       setFetchedUrl(trimmed);
       setMatches(matchPlaylist(result.entries, files, tags));
       notify(`Fetched ${result.entries.length} track(s) from "${result.title}"`, "success");
+
+      // Re-fetching a playlist that was matched before restores every
+      // decision made last time. The matcher has just re-run against the
+      // (possibly larger) collection, and these decisions are layered on
+      // top — so newly-acquired tracks get matched while past confirmations
+      // and denials stand.
+      const saved = await invoke<ImportSession | null>("load_import_session", {
+        key: sessionKeyFor(trimmed),
+      });
+      if (saved) {
+        try {
+          const payload = JSON.parse(saved.payload) as SessionPayload;
+          setOverrides(payload.overrides ?? {});
+          setDenied(payload.denied ?? {});
+          setCandIndex(payload.candIndex ?? {});
+          setFromSearch(payload.fromSearch ?? {});
+          setResumedFrom(saved);
+          const decided = Object.keys(payload.overrides ?? {}).length;
+          notify(
+            `Resumed ${decided} saved decision(s) from ${new Date(saved.savedAt * 1000).toLocaleDateString()}`,
+            "info",
+          );
+        } catch {
+          notify("A saved session for this playlist could not be read — starting fresh", "info");
+        }
+      }
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -351,6 +429,66 @@ export function YtMusicImportPage({
     window.addEventListener("mouseup", onUp);
   };
 
+  // --- Session persistence --------------------------------------------------
+  const sessionKey = fetchedUrl ? sessionKeyFor(fetchedUrl) : null;
+
+  const buildPayload = (): SessionPayload => ({
+    version: 1,
+    entries: playlist?.entries ?? [],
+    overrides,
+    denied,
+    candIndex,
+    fromSearch,
+  });
+
+  const persist = async (quiet: boolean) => {
+    if (!sessionKey || !playlist) return;
+    try {
+      await invoke("save_import_session", {
+        key: sessionKey,
+        title: playlist.title,
+        url: fetchedUrl,
+        payload: JSON.stringify(buildPayload()),
+      });
+      if (!quiet) notify("Import session saved", "success");
+    } catch (e) {
+      if (!quiet) notify(String(e), "error");
+    }
+  };
+
+  // Autosave, debounced: every decision is a keystroke-scale event and each
+  // one is a sqlite write, so they are coalesced rather than written per
+  // click. The explicit Save button exists for reassurance, not necessity.
+  useEffect(() => {
+    if (!sessionKey || !matches) return;
+    const t = setTimeout(() => void persist(true), 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overrides, denied, candIndex, fromSearch, sessionKey, matches]);
+
+  const forgetSession = async () => {
+    if (!sessionKey) return;
+    await invoke("delete_import_session", { key: sessionKey });
+    setResumedFrom(null);
+    notify("Saved decisions for this playlist discarded", "info");
+  };
+
+  /**
+   * Re-runs matching against the collection as it is *now*, keeping every
+   * decision. This is the "I went and bought the missing ones" button: the
+   * new files get matched, and nothing already settled moves.
+   */
+  const rematch = () => {
+    if (!playlist) return;
+    setRematching(true);
+    try {
+      setMatches(matchPlaylist(playlist.entries, files, tags));
+      notify(`Re-matched against ${files.length} track(s) — your decisions were kept`, "success");
+    } finally {
+      setRematching(false);
+    }
+  };
+
   // --- Clipboard / export ---------------------------------------------------
   const copyMissingLinks = async () => {
     if (!missingList.length) return;
@@ -452,7 +590,8 @@ export function YtMusicImportPage({
           <h1 className="text-xl font-bold">YouTube Music Import</h1>
           <p className="text-sm text-muted-foreground">
             Paste a YouTube Music (or YouTube) playlist link, match it against your collection, and export a
-            Rekordbox playlist — {files.length} loaded track{files.length === 1 ? "" : "s"}
+            Rekordbox playlist — matching against {files.length} track{files.length === 1 ? "" : "s"}
+            {indexedCount > 0 ? ` (${indexedCount} from your library index)` : ""}
           </p>
         </div>
 
@@ -517,6 +656,20 @@ export function YtMusicImportPage({
                 </span>
               </div>
               <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={rematch}
+                  disabled={rematching}
+                  title="Re-run matching against the collection as it is now, keeping every decision you've made"
+                >
+                  <RefreshCw className={rematching ? "animate-spin" : undefined} />
+                  Re-match
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => void persist(false)}>
+                  <Save />
+                  Save Session
+                </Button>
                 <Button variant="secondary" size="sm" onClick={copyMatchLog}>
                   <ClipboardCopy />
                   Copy Match Log
@@ -540,6 +693,26 @@ export function YtMusicImportPage({
                 </Button>
               </div>
             </div>
+
+            {resumedFrom && (
+              <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs">
+                <RotateCcw className="h-3.5 w-3.5 shrink-0 text-primary" />
+                <span className="min-w-0 flex-1">
+                  Resumed the decisions you saved on{" "}
+                  {new Date(resumedFrom.savedAt * 1000).toLocaleString()}. Newly-acquired tracks
+                  were matched on top — press <span className="font-medium">Re-match</span> after
+                  indexing more music.
+                </span>
+                <button
+                  onClick={() => void forgetSession()}
+                  className="flex shrink-0 items-center gap-1 text-muted-foreground hover:text-destructive"
+                  title="Discard the saved decisions for this playlist"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Forget
+                </button>
+              </div>
+            )}
 
             <Card className="p-2">
               <div className="space-y-1">

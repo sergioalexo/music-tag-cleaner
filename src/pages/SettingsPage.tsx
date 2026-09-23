@@ -2,8 +2,20 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
-import { Download, ListMusic, Plus, PlugZap, Sparkles, Upload, X } from "lucide-react";
-import type { CharReplacement, DjApp, GenrePreset, ImportResult, OllamaStatus, Settings } from "../types";
+import {
+  Download,
+  FolderOpen,
+  Library,
+  ListMusic,
+  Loader2,
+  Plus,
+  PlugZap,
+  RefreshCw,
+  Sparkles,
+  Upload,
+  X,
+} from "lucide-react";
+import type { CharReplacement, DjApp, ImportResult, OllamaStatus, Settings } from "../types";
 import { CONVERT_PRESETS } from "../types";
 import {
   CAP_OPTIONS,
@@ -21,16 +33,17 @@ import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
 import type { GenreGroup } from "../lib/genres";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
 import { Combobox } from "../components/Combobox";
+import type { LibraryIndexApi } from "../hooks/useLibraryIndex";
 
 interface Props {
   settings: Settings;
   onSave: (settings: Settings) => void;
-  /** Renames a genre in the active preset; may prompt to retag the collection. */
+  /** Renames a genre across the whole collection, after confirming. */
   onRenameGenre: (oldName: string, newName: string) => void;
-  /** Every distinct genre spelling found in the loaded collection, grouped. */
+  /** Every distinct genre spelling in the collection, near-duplicates grouped. */
   collectionGenreGroups: GenreGroup[];
-  /** Appends the given genre names to the active preset. */
-  onAddGenres: (names: string[]) => void;
+  /** The whole-library index — roots, indexing, and the genre tally. */
+  libraryIndex: LibraryIndexApi;
   /** Offers to retag tracks using a non-canonical spelling to the canonical one. */
   onMergeGenreVariants: (variants: string[], canonical: string) => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
@@ -65,14 +78,19 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
  * every keystroke. Committing goes through `onCommit(newName)` (a rename,
  * not a raw array splice) so the caller can offer to retag the collection.
  */
+/**
+ * One genre from the collection. Editing the name is a rename *of the
+ * collection* — there is no list this could be edited in isolation from —
+ * so the commit handler prompts before rewriting any tags.
+ */
 function GenreRow({
   value,
+  count,
   onCommit,
-  onRemove,
 }: {
   value: string;
+  count: number;
   onCommit: (next: string) => void;
-  onRemove: () => void;
 }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
@@ -94,111 +112,247 @@ function GenreRow({
           if (e.key === "Enter") e.currentTarget.blur();
           else if (e.key === "Escape") setDraft(value);
         }}
+        title={`${count} track${count === 1 ? "" : "s"} use this genre`}
       />
-      <button className="text-muted-foreground hover:text-destructive" title="Remove genre" onClick={onRemove}>
-        <X className="h-4 w-4" />
-      </button>
+      <span className="w-16 shrink-0 text-right text-xs text-muted-foreground">
+        {count} track{count === 1 ? "" : "s"}
+      </span>
     </div>
   );
 }
 
 /**
- * Lists every genre spelling detected in the loaded collection that isn't
- * already in the active preset, grouped so near-duplicate spellings ("Hip
- * Hop" / "Hip-Hop") show as one row. Ticking a row adds its canonical
- * spelling to the preset; if the row has more than one variant, adding it
- * also offers to retag the collection's other-spelling tracks to match.
+ * Near-duplicate genre spellings ("Hip Hop" vs "Hip-Hop") found in the
+ * collection, offered as merges.
+ *
+ * It used to also offer to *add* detected genres to a preset; there is no
+ * preset any more, and a genre already on a track is already in the
+ * vocabulary by definition. Only the merge is a real action now.
  */
 function DetectGenresPanel({
   groups,
-  presetGenres,
-  onAdd,
   onMerge,
 }: {
   groups: GenreGroup[];
-  presetGenres: string[];
-  onAdd: (names: string[]) => void;
   onMerge: (variants: string[], canonical: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const existing = new Set(presetGenres.map((g) => g.toLowerCase()));
-  const candidates = groups.filter((g) => !existing.has(g.canonical.toLowerCase()));
-  const [checked, setChecked] = useState<Set<string>>(new Set(candidates.map((g) => g.canonical)));
+  const mergeable = groups.filter((g) => g.variants.length > 1);
 
   if (!open) {
     return (
-      <Button variant="ghost" size="sm" className="mt-1" onClick={() => setOpen(true)}>
+      <Button variant="ghost" size="sm" className="mt-2" onClick={() => setOpen(true)}>
         <Sparkles />
-        Detect genres from collection
+        Find near-duplicate spellings ({mergeable.length})
       </Button>
     );
   }
 
-  const apply = () => {
-    const toAdd = candidates.filter((g) => checked.has(g.canonical));
-    onAdd(toAdd.map((g) => g.canonical));
-    for (const g of toAdd) {
-      if (g.variants.length > 1) onMerge(g.variants.map((v) => v.name), g.canonical);
-    }
-    setOpen(false);
-  };
-
   return (
     <div className="mt-2 rounded-lg border bg-secondary/20 p-3">
-      {candidates.length === 0 ? (
+      {mergeable.length === 0 ? (
         <p className="text-xs text-muted-foreground">
-          No new genres found — every genre in the collection is already in this preset.
+          No near-duplicates — every genre in the collection is spelled one way.
         </p>
       ) : (
         <>
           <p className="mb-2 text-xs text-muted-foreground">
-            Found {candidates.length} genre{candidates.length === 1 ? "" : "s"} in the loaded
-            collection not yet in this preset. Untick any you don't want.
+            These genres differ only by case, punctuation or separator style. Merging retags every
+            track using a variant.
           </p>
-          <div className="max-h-56 space-y-1.5 overflow-y-auto">
-            {candidates.map((g) => (
-              <label key={g.canonical} className="flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="mt-0.5 accent-[var(--primary)]"
-                  checked={checked.has(g.canonical)}
-                  onChange={(e) =>
-                    setChecked((prev) => {
-                      const next = new Set(prev);
-                      if (e.target.checked) next.add(g.canonical);
-                      else next.delete(g.canonical);
-                      return next;
-                    })
-                  }
-                />
-                <span>
-                  {g.canonical}{" "}
+          <div className="max-h-56 space-y-2 overflow-y-auto">
+            {mergeable.map((g) => (
+              <div key={g.canonical} className="flex items-start justify-between gap-2 text-sm">
+                <span className="min-w-0">
+                  <span className="font-medium">{g.canonical}</span>{" "}
                   <span className="text-xs text-muted-foreground">
                     ({g.count} track{g.count === 1 ? "" : "s"})
                   </span>
-                  {g.variants.length > 1 && (
-                    <span className="block text-xs text-muted-foreground">
-                      also seen as: {g.variants.slice(1).map((v) => v.name).join(", ")} — will
-                      offer to retag those to "{g.canonical}"
-                    </span>
-                  )}
+                  <span className="block text-xs text-muted-foreground">
+                    also spelled: {g.variants.slice(1).map((v) => v.name).join(", ")}
+                  </span>
                 </span>
-              </label>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => onMerge(g.variants.map((v) => v.name), g.canonical)}
+                >
+                  Merge
+                </Button>
+              </div>
             ))}
           </div>
         </>
       )}
-      <div className="mt-3 flex gap-2">
-        {candidates.length > 0 && (
-          <Button variant="default" size="sm" onClick={apply} disabled={checked.size === 0}>
-            Add {checked.size || ""} genre{checked.size === 1 ? "" : "s"}
-          </Button>
-        )}
+      <div className="mt-3">
         <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
-          Cancel
+          Close
         </Button>
       </div>
     </div>
+  );
+}
+
+/**
+ * The whole-library index: which folders it covers, when it last ran, and
+ * what it found.
+ *
+ * Indexing is incremental — a file whose size and modified time both match
+ * the stored row is skipped without being opened — so re-running it after
+ * adding a few tracks costs seconds, not another full pass. "Re-read
+ * everything" is there for when that assumption is wrong (files restored
+ * from a backup keep their old mtime, for instance).
+ */
+function LibraryIndexCard({
+  libraryIndex,
+  notify,
+}: {
+  libraryIndex: LibraryIndexApi;
+  notify: (message: string, kind?: "success" | "error" | "info") => void;
+}) {
+  const { stats, indexing, progress } = libraryIndex;
+  const roots = stats?.roots ?? [];
+
+  const addRoot = async () => {
+    const picked = await open({ directory: true, multiple: false, title: "Add a library folder" });
+    if (typeof picked !== "string") return;
+    if (roots.includes(picked)) return;
+    await libraryIndex.setRoots([...roots, picked]);
+  };
+
+  const removeRoot = async (root: string) => {
+    const ok = await confirm(
+      `Stop indexing "${root}"?\n\nIts tracks are removed from the index. The files themselves are not touched.`,
+      { title: "Remove Library Folder", kind: "warning" },
+    );
+    if (!ok) return;
+    await libraryIndex.setRoots(roots.filter((r) => r !== root));
+  };
+
+  const runIndex = async (rescanAll: boolean) => {
+    try {
+      const summary = await libraryIndex.runIndex(rescanAll);
+      const bits = [
+        `${summary.scanned} scanned`,
+        summary.added ? `${summary.added} added` : null,
+        summary.updated ? `${summary.updated} updated` : null,
+        summary.removed ? `${summary.removed} removed` : null,
+        summary.unchanged ? `${summary.unchanged} unchanged` : null,
+      ].filter(Boolean);
+      notify(`Library indexed — ${bits.join(", ")}`, "success");
+      summary.errors.slice(0, 5).forEach((e) => notify(e, "error"));
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const clearIndex = async () => {
+    const ok = await confirm(
+      "Empty the library index?\n\nNothing on disk changes — you would just need to index again.",
+      { title: "Clear Index", kind: "warning" },
+    );
+    if (!ok) return;
+    await libraryIndex.clear();
+    notify("Library index cleared", "info");
+  };
+
+  const pct =
+    progress && progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : null;
+
+  return (
+    <Card>
+      <CardHeader
+        title="Library Index"
+        hint="Scans your whole collection so genres, search and playlist matching see every track — not just the ones you opened"
+      />
+      <div className="px-5 py-3">
+        <div className="mb-3 space-y-1.5">
+          {roots.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No folders yet. Add the folder your music lives in, then index it.
+            </p>
+          ) : (
+            roots.map((r) => (
+              <div key={r} className="flex items-center gap-2 rounded-md bg-secondary/30 px-2 py-1.5">
+                <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate font-mono text-xs" title={r}>
+                  {r}
+                </span>
+                <button
+                  onClick={() => void removeRoot(r)}
+                  disabled={indexing}
+                  className="shrink-0 text-muted-foreground hover:text-destructive disabled:opacity-30"
+                  title="Stop indexing this folder"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" onClick={addRoot} disabled={indexing}>
+            <Plus />
+            Add Folder
+          </Button>
+          <Button size="sm" onClick={() => void runIndex(false)} disabled={indexing || !roots.length}>
+            {indexing ? <Loader2 className="animate-spin" /> : <Library />}
+            {indexing ? "Indexing…" : "Index Library"}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void runIndex(true)}
+            disabled={indexing || !roots.length}
+            title="Ignore the size/modified-time check and re-read every file"
+          >
+            <RefreshCw />
+            Re-read Everything
+          </Button>
+          {(stats?.trackCount ?? 0) > 0 && (
+            <Button variant="ghost" size="sm" onClick={clearIndex} disabled={indexing}>
+              Clear
+            </Button>
+          )}
+        </div>
+
+        {indexing && (
+          <div className="mt-3">
+            <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
+              <div
+                className="h-full bg-primary transition-all"
+                style={{ width: pct !== null ? `${pct}%` : "15%" }}
+              />
+            </div>
+            <p className="mt-1 truncate text-[10px] text-muted-foreground">
+              {progress?.phase === "walking"
+                ? "Finding files…"
+                : progress
+                  ? `${progress.done} / ${progress.total} — ${progress.current}`
+                  : "Starting…"}
+            </p>
+          </div>
+        )}
+
+        {!indexing && stats && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {stats.trackCount === 0 ? (
+              "Not indexed yet."
+            ) : (
+              <>
+                <span className="font-medium text-foreground">{stats.trackCount}</span> tracks ·{" "}
+                {stats.artistCount} artists · {stats.genreCount} genres
+                {stats.lastIndexedAt
+                  ? ` · last indexed ${new Date(stats.lastIndexedAt * 1000).toLocaleString()}`
+                  : ""}
+              </>
+            )}
+          </p>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -207,7 +361,7 @@ export function SettingsPage({
   onSave,
   onRenameGenre,
   collectionGenreGroups,
-  onAddGenres,
+  libraryIndex,
   onMergeGenreVariants,
   checkOllama,
   notify,
@@ -339,37 +493,6 @@ export function SettingsPage({
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     onSave({ ...settings, [key]: value });
-
-  // Genre-preset editing (keyed by index so renames are safe).
-  const gIdx = Math.max(
-    0,
-    settings.genrePresets.findIndex((p) => p.name === settings.activeGenrePreset),
-  );
-  const gPreset: GenrePreset = settings.genrePresets[gIdx] ?? settings.genrePresets[0];
-  const updateGenres = (genres: string[]) =>
-    set(
-      "genrePresets",
-      settings.genrePresets.map((p, i) => (i === gIdx ? { ...p, genres } : p)),
-    );
-  const renamePreset = (name: string) =>
-    onSave({
-      ...settings,
-      activeGenrePreset: name,
-      genrePresets: settings.genrePresets.map((p, i) => (i === gIdx ? { ...p, name } : p)),
-    });
-  const addPreset = () => {
-    const name = `Preset ${settings.genrePresets.length + 1}`;
-    onSave({
-      ...settings,
-      genrePresets: [...settings.genrePresets, { name, genres: [] }],
-      activeGenrePreset: name,
-    });
-  };
-  const deletePreset = () => {
-    if (settings.genrePresets.length <= 1) return;
-    const next = settings.genrePresets.filter((_, i) => i !== gIdx);
-    onSave({ ...settings, genrePresets: next, activeGenrePreset: next[0].name });
-  };
 
   const test = async (u: string) => {
     setTesting(true);
@@ -968,77 +1091,41 @@ export function SettingsPage({
         </div>
       </Card>
 
+      <LibraryIndexCard libraryIndex={libraryIndex} notify={notify} />
+
       <Card>
         <CardHeader
-          title="Genre Presets"
-          hint="The Genre button snaps each track's genre to the active preset"
+          title="Genres"
+          hint="Taken from your collection — there is no stored list to keep in sync"
         />
         <div className="px-5 py-3">
-          <Row label="Active preset" hint="Used by the Genre action and the genre dropdown">
-            <div className="flex items-center gap-2">
-              <select
-                className={cn(selectClass, "w-44")}
-                value={settings.activeGenrePreset}
-                onChange={(e) => set("activeGenrePreset", e.target.value)}
-              >
-                {settings.genrePresets.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name}
-                  </option>
+          {libraryIndex.genres.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No genres yet. Index your library above (or open some tracks) and the genres you
+              actually use will appear here.
+            </p>
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-muted-foreground">
+                {libraryIndex.genres.length} genre
+                {libraryIndex.genres.length === 1 ? "" : "s"} across{" "}
+                {libraryIndex.stats?.trackCount ?? 0} indexed track
+                {libraryIndex.stats?.trackCount === 1 ? "" : "s"}. Renaming one here rewrites the
+                genre tag on every track that uses it.
+              </p>
+              <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+                {libraryIndex.genres.map((g) => (
+                  <GenreRow
+                    key={g.name}
+                    value={g.name}
+                    count={g.count}
+                    onCommit={(next) => onRenameGenre(g.name, next)}
+                  />
                 ))}
-              </select>
-              <Button variant="ghost" size="sm" onClick={addPreset} title="Add a new preset">
-                <Plus />
-              </Button>
-              <button
-                className="text-muted-foreground hover:text-destructive disabled:opacity-30"
-                onClick={deletePreset}
-                disabled={settings.genrePresets.length <= 1}
-                title="Delete this preset"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-          </Row>
-          <Row label="Preset name">
-            <input
-              className={cn(inputClass, "w-44")}
-              value={gPreset.name}
-              onChange={(e) => renamePreset(e.target.value)}
-            />
-          </Row>
-
-          <div className="border-t py-3">
-            <div className="mb-2 text-sm font-medium">Genres in "{gPreset.name}"</div>
-            <div className="space-y-2">
-              {gPreset.genres.map((g, i) => (
-                <GenreRow
-                  key={i}
-                  value={g}
-                  onCommit={(next) => onRenameGenre(g, next)}
-                  onRemove={() => updateGenres(gPreset.genres.filter((_, idx) => idx !== i))}
-                />
-              ))}
-              {gPreset.genres.length === 0 && (
-                <p className="text-xs text-muted-foreground">No genres yet — add one below.</p>
-              )}
-            </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="mt-2"
-              onClick={() => updateGenres([...gPreset.genres, ""])}
-            >
-              <Plus />
-              Add genre
-            </Button>
-            <DetectGenresPanel
-              groups={collectionGenreGroups}
-              presetGenres={gPreset.genres}
-              onAdd={onAddGenres}
-              onMerge={onMergeGenreVariants}
-            />
-          </div>
+              </div>
+            </>
+          )}
+          <DetectGenresPanel groups={collectionGenreGroups} onMerge={onMergeGenreVariants} />
         </div>
       </Card>
 

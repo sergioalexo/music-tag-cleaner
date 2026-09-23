@@ -34,7 +34,6 @@ import type {
 } from "../types";
 import { KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
-import { activePreset } from "../lib/genres";
 import { buildTrackGroups, trackIdFormats } from "../lib/trackGroups";
 import { shortcutFor } from "../lib/shortcuts";
 import { TrackTable } from "../components/TrackTable";
@@ -97,6 +96,8 @@ interface Props {
   onRename: () => void;
   onClearFields: (fields: string[]) => void;
   onAddGenre: (genre: string) => void;
+  /** Genre vocabulary derived from the indexed library (see lib/genres.ts). */
+  genreOptions: string[];
   onRenameGenre: (oldName: string, newName: string) => void;
   onBackup: () => void;
   onRestore: () => void;
@@ -159,6 +160,7 @@ export function LibraryPage({
   onRename,
   onClearFields,
   onAddGenre,
+  genreOptions,
   onRenameGenre,
   onBackup,
   onRestore,
@@ -199,7 +201,6 @@ export function LibraryPage({
   const backupCount = filesApi.files.filter(
     (f) => filesApi.selected.has(f.path) && f.hasBackup,
   ).length;
-  const genreOptions = activePreset(settings.genrePresets, settings.activeGenrePreset)?.genres ?? [];
 
   // Extra tag-frame keys present on the currently selected files, offered as
   // additional Clear Fields targets (curated fields already have their own).
@@ -502,12 +503,12 @@ export function LibraryPage({
             disabled={noSel}
             title={
               settings.aiBackend === "manual"
-                ? `Match each genre to the "${settings.activeGenrePreset}" preset by copy/paste into any AI`
-                : `Match each genre to the "${settings.activeGenrePreset}" preset using the local model`
+                ? "Match each genre to one your collection already uses, by copy/paste into any AI"
+                : "Match each genre to one your collection already uses, using the local model"
             }
           >
             <Tags />
-            Genre: {settings.activeGenrePreset}
+            Genre
           </Button>
 
           <span className="mx-1 h-6 w-px bg-border" />

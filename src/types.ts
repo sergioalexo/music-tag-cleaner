@@ -218,11 +218,6 @@ export interface PlanInfo {
   creditsTotal: number;
 }
 
-export interface GenrePreset {
-  name: string;
-  genres: string[];
-}
-
 export interface Settings {
   /**
    * "ollama" runs the local model; "manual" hands you the prompt to paste into
@@ -273,9 +268,6 @@ export interface Settings {
   fieldNaming: "friendly" | "raw" | "both";
   /** Characters removed by the "Remove characters" action. */
   removeChars: string;
-  /** Named genre presets; the Genre action snaps genres to the active one. */
-  genrePresets: GenrePreset[];
-  activeGenrePreset: string;
   /** Next sequential track ID to assign (zero-padded to trackIdDigits). */
   nextTrackId: number;
   /** Digit count for generated track IDs (also the required length to count as a UID). */
@@ -452,6 +444,111 @@ export interface PlaylistEntry {
 export interface PlaylistFetchResult {
   title: string;
   entries: PlaylistEntry[];
+}
+
+// v0.13 — whole-library index. Matches the camelCase structs in
+// `src-tauri/src/commands/library_index.rs`.
+
+/** One track as the persistent index has it (one database row, flattened). */
+export interface IndexedTrack {
+  path: string;
+  filename: string;
+  format: string;
+  size: number;
+  durationSecs?: number | null;
+  hasBackup: boolean;
+  hasCoverArt: boolean;
+  title?: string | null;
+  artist?: string | null;
+  album?: string | null;
+  albumArtist?: string | null;
+  genre?: string | null;
+  year?: string | null;
+  comment?: string | null;
+  composer?: string | null;
+  originalArtist?: string | null;
+  trackId?: string | null;
+  rating?: number | null;
+}
+
+export interface IndexSummary {
+  scanned: number;
+  added: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
+  errors: string[];
+}
+
+export interface LibraryStats {
+  trackCount: number;
+  roots: string[];
+  lastIndexedAt?: number | null;
+  genreCount: number;
+  artistCount: number;
+}
+
+export interface GenreCount {
+  name: string;
+  count: number;
+}
+
+export interface IndexProgress {
+  phase: "walking" | "reading" | "retagging" | "done";
+  done: number;
+  total: number;
+  current: string;
+}
+
+/** A saved YouTube-import session (see `ImportSession` in ytmusic.rs). */
+export interface ImportSession {
+  key: string;
+  title: string;
+  url: string;
+  savedAt: number;
+  /** JSON owned by the import page — see `SessionPayload` there. */
+  payload: string;
+}
+
+export interface ImportSessionSummary {
+  key: string;
+  title: string;
+  url: string;
+  savedAt: number;
+}
+
+/** Splits an indexed row back into the `AudioFile` + `TagData` pair the rest
+ * of the app works with, so matching and search take one shape of input
+ * whether a track is loaded in the session or only indexed. `allFields` is
+ * empty: the index stores the curated fields only, which is everything those
+ * two consumers read. */
+export function indexedToFile(t: IndexedTrack): AudioFile {
+  return {
+    path: t.path,
+    filename: t.filename,
+    format: t.format,
+    size: t.size,
+    hasBackup: t.hasBackup,
+    durationSecs: t.durationSecs ?? undefined,
+  };
+}
+
+export function indexedToTags(t: IndexedTrack): TagData {
+  return {
+    title: t.title ?? undefined,
+    artist: t.artist ?? undefined,
+    album: t.album ?? undefined,
+    albumArtist: t.albumArtist ?? undefined,
+    genre: t.genre ?? undefined,
+    year: t.year ?? undefined,
+    comment: t.comment ?? undefined,
+    composer: t.composer ?? undefined,
+    originalArtist: t.originalArtist ?? undefined,
+    trackId: t.trackId ?? undefined,
+    rating: t.rating ?? undefined,
+    hasCoverArt: t.hasCoverArt,
+    allFields: {},
+  };
 }
 
 export function basename(path: string): string {

@@ -1486,6 +1486,85 @@ matches, a true negative staying missing) and 10 for search (field scoping,
 negation, diacritic folding, ranking a title hit above a comment hit).
 
 
+### 46. Whole-library index; genres derived from the collection — v0.13.0
+
+Everything before this worked only on the files loaded into the current
+session. That is right for editing a folder and wrong for every question
+about the *collection*: which genres do I actually use, do I already own this
+playlist track, where is that track I remember but haven't opened.
+
+**The index** (`src-tauri/src/commands/library_index.rs`). A sqlite index of
+one or more root folders holding the curated tag fields plus `mtime` + `size`
+for identity. Its own database (`library-index.sqlite`), not the
+fingerprint/waveform cache: that one is a derived-computation cache that can
+be deleted to reclaim space, this one is user-facing state whose loss means
+re-walking the collection.
+
+- **Incremental.** A file whose size and modified time both match its row is
+  skipped without being opened, so re-indexing after adding a few tracks
+  costs seconds. "Re-read Everything" exists for when that assumption breaks
+  (a restore from backup keeps the old mtime).
+- **A cache of the files, never a source of truth.** Tags on disk always win,
+  a changed file is re-read, a deleted one is dropped, and nothing is ever
+  written to a file because of what the index says.
+- **An offline drive doesn't erase its half of the index.** Stale rows are
+  only removed when the path genuinely no longer exists — an unplugged
+  external drive is indistinguishable from a deletion by absence alone.
+- Tag parsing runs in parallel (`par_map`) and the database write happens
+  afterwards in one transaction: sqlite is single-writer, and interleaving
+  would serialise the parses too.
+- Settings gains a **Library Index** card — roots, progress, and what it
+  found.
+
+**Genres are now the collection's own** (`src/lib/genres.ts`,
+`settings.genrePresets` retired at settings v8). The stored preset list is
+gone. A remembered list is wrong in both directions: it offers genres no
+track carries, and misses ones typed straight into a track. The picker is now
+`libraryGenreNames()` — the indexed genre tally plus the genres on loaded
+tracks, ordered by use — so it cannot drift from the files.
+
+**Renaming a genre renames it everywhere.** That is the point of deriving the
+list: the name in the picker and the name in the files are the same thing, so
+editing one has to rewrite the other. `retag_field` rewrites the genre tag on
+every indexed track carrying the old name (preserving every other frame via
+the file's own `all_fields` minus the typed ones, exactly as an inline edit
+does) and refreshes their index rows; loaded tracks go through the normal
+edit path so undo still covers them. It confirms first, with the real count.
+
+Detect Genres now only offers **merges** of near-duplicate spellings — a
+genre already on a track is in the vocabulary by definition, so there is
+nothing left to "add".
+
+**Playlist matching sees the whole collection.** `mergeWithSession()` layers
+this session's loaded files over the index (session wins on a shared path, so
+a just-retagged track matches on its new tags). The import screen's search
+dock searches the same merged set.
+
+**Resumable import sessions** (`import_session` table + `save/load/list/
+delete_import_session`). Matching a playlist is rarely one sitting: you match
+what you own, buy the rest, come back and re-fetch. Without this the second
+pass starts from nothing — every confirmation and, worse, every *denial* is
+lost, so the matcher re-proposes exactly the matches already rejected.
+Decisions autosave (debounced) keyed by video id, never by position, so they
+survive the playlist being reordered and the library growing. Re-fetching
+restores them, a banner says so, and **Re-match** re-runs scoring against the
+collection as it is now while every decision stands — the "I went and bought
+the missing ones" button.
+
+**Table search fixed.** The find bar scanned rendered cells, so hiding the
+Artist column silently stopped artist search from working, which from the
+outside is indistinguishable from search being broken. It now goes through
+`searchTracks`/`matchesTerms`, which read the tags regardless of which
+columns are visible.
+
+**Verification:** 33 TypeScript tests (7 new for the genre vocabulary and
+spelling groups) and 64 Rust tests, 5 new — including
+`kept_field_keys_match_the_frontend`, which parses `src/types.ts` and fails if
+the Rust and TypeScript kept-field lists ever drift. They have to agree: a key
+in one but not the other is either dropped on write or duplicated as a raw
+frame, and neither shows up until someone's tags are already damaged.
+
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

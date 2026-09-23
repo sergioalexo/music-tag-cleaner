@@ -135,6 +135,19 @@ fn main() {
             commands::ytmusic::ytdlp_info,
             commands::ytmusic::install_ytdlp,
             commands::ytmusic::fetch_ytmusic_playlist,
+            commands::ytmusic::save_import_session,
+            commands::ytmusic::load_import_session,
+            commands::ytmusic::list_import_sessions,
+            commands::ytmusic::delete_import_session,
+            commands::library_index::library_roots,
+            commands::library_index::set_library_roots,
+            commands::library_index::index_library,
+            commands::library_index::clear_library_index,
+            commands::library_index::library_tracks,
+            commands::library_index::library_stats,
+            commands::library_index::library_genres,
+            commands::library_index::library_paths_with_genre,
+            commands::library_index::retag_field,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicTagCleaner");
