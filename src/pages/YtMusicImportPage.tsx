@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -26,6 +26,7 @@ import {
 import type {
   AudioFile,
   ImportSession,
+  ImportSessionSummary,
   PlaylistEntry,
   PlaylistFetchResult,
   TagData,
@@ -193,6 +194,59 @@ export function YtMusicImportPage({
     return m;
   }, [files, flatLabel]);
 
+  /**
+   * Restores the most recent import session when the page mounts.
+   *
+   * Page state is component-local, so switching to Settings — which is
+   * exactly where you go to index your library mid-session — used to throw
+   * the fetched playlist away and leave you re-pasting the URL. The saved
+   * session already carries the entries, so this rebuilds the whole screen
+   * with no network call at all; matching re-runs from the effect below.
+   */
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    void (async () => {
+      try {
+        const sessions = await invoke<ImportSessionSummary[]>("list_import_sessions");
+        const latest = sessions[0];
+        if (!latest) return;
+        const saved = await invoke<ImportSession | null>("load_import_session", {
+          key: latest.key,
+        });
+        if (!saved) return;
+        const payload = JSON.parse(saved.payload) as SessionPayload;
+        if (!payload.entries?.length) return;
+        setPlaylist({ title: saved.title, entries: payload.entries });
+        setFetchedUrl(saved.url);
+        setUrl(saved.url);
+        setOverrides(payload.overrides ?? {});
+        setDenied(payload.denied ?? {});
+        setCandIndex(payload.candIndex ?? {});
+        setFromSearch(payload.fromSearch ?? {});
+        setResumedFrom(saved);
+      } catch {
+        // Nothing to restore is the normal case on a first run.
+      }
+    })();
+  }, []);
+
+  /**
+   * Keeps the matches in step with whatever the playlist and the collection
+   * currently are. Re-scoring never discards anything: every decision lives
+   * in its own state, layered on top. So finishing an index (which grows
+   * `files`) re-matches automatically, and the explicit Re-match button is
+   * just a way to force it.
+   */
+  useEffect(() => {
+    if (!playlist?.entries.length) {
+      setMatches(null);
+      return;
+    }
+    setMatches(matchPlaylist(playlist.entries, files, tags));
+  }, [playlist, files, tags]);
+
   const refreshYtdlp = async () => {
     setCheckingYtdlp(true);
     try {
@@ -235,6 +289,7 @@ export function YtMusicImportPage({
     setFetching(true);
     setPlaylist(null);
     setMatches(null);
+    setResumedFrom(null);
     setOverrides({});
     setDenied({});
     setCandIndex({});
@@ -243,7 +298,7 @@ export function YtMusicImportPage({
       const result = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: trimmed });
       setPlaylist(result);
       setFetchedUrl(trimmed);
-      setMatches(matchPlaylist(result.entries, files, tags));
+      // Matching is driven by the effect above, so it happens here too.
       notify(`Fetched ${result.entries.length} track(s) from "${result.title}"`, "success");
 
       // Re-fetching a playlist that was matched before restores every
@@ -470,6 +525,10 @@ export function YtMusicImportPage({
     if (!sessionKey) return;
     await invoke("delete_import_session", { key: sessionKey });
     setResumedFrom(null);
+    setOverrides({});
+    setDenied({});
+    setCandIndex({});
+    setFromSearch({});
     notify("Saved decisions for this playlist discarded", "info");
   };
 
@@ -487,6 +546,13 @@ export function YtMusicImportPage({
     } finally {
       setRematching(false);
     }
+  };
+
+  /** Clears the screen without touching the saved session. */
+  const closePlaylist = () => {
+    setPlaylist(null);
+    setFetchedUrl("");
+    setResumedFrom(null);
   };
 
   // --- Clipboard / export ---------------------------------------------------
@@ -703,6 +769,14 @@ export function YtMusicImportPage({
                   were matched on top — press <span className="font-medium">Re-match</span> after
                   indexing more music.
                 </span>
+                <button
+                  onClick={closePlaylist}
+                  className="flex shrink-0 items-center gap-1 text-muted-foreground hover:text-foreground"
+                  title="Close this playlist — the saved decisions are kept"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  Close
+                </button>
                 <button
                   onClick={() => void forgetSession()}
                   className="flex shrink-0 items-center gap-1 text-muted-foreground hover:text-destructive"
