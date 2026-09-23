@@ -378,6 +378,26 @@ function scoreIdentity(want: WantedEntry, id: TrackIdentity): MatchCandidate {
     }
   }
 
+  // A playlist entry with *no* artist at all — a bare track title, which is
+  // what a YouTube Music playlist usually gives ("Disturbia", not "Rihanna -
+  // Disturbia") — must also be compared against the library track's title on
+  // its own. Otherwise it is scored against "artist title" and the artist
+  // tokens it could never have supplied drag it down: "Disturbia" against
+  // "Rihanna Disturbia" scored 0.59, far below the confident threshold,
+  // despite being exactly right. Observed on a real 70-track playlist where
+  // every correct match landed in the 59-86% band and nothing auto-accepted.
+  //
+  // Slightly discounted, because a title alone is genuinely weaker evidence
+  // than a title plus a confirmed artist: where both fit, the one that also
+  // agrees on the artist should still win the greedy assignment.
+  if (!want.artist && id.title) {
+    const titleOnly = textSimilarity(want.raw, id.title) * 0.98;
+    if (titleOnly > best) {
+      best = titleOnly;
+      bestVia = "tags";
+    }
+  }
+
   const delta =
     want.durationSecs && id.durationSecs && want.durationSecs > 0 && id.durationSecs > 0
       ? Math.abs(want.durationSecs - id.durationSecs)

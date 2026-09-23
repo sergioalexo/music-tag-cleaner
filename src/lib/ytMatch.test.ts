@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AudioFile, PlaylistEntry, TagData } from "../types";
 import {
   buildIdentity,
+  CONFIDENT_THRESHOLD,
   matchPlaylist,
   parseSearchableBackup,
   splitArtistTitle,
@@ -176,6 +177,45 @@ describe("matchPlaylist", () => {
     const f = file("C:/music/gravity.mp3", 402);
     const tags = { [f.path]: tag({ artist: "Boris Brejcha", title: "Gravity" }) };
     const [m] = matchPlaylist([entry(0, "Metallica - Enter Sandman", 331)], [f], tags);
+    expect(m.status).toBe("missing");
+  });
+
+  /**
+   * The case that motivated the title-only comparison. A real YouTube Music
+   * playlist ("(Dance) Wedding Music", 70 tracks) gave bare titles with no
+   * uploader, so every entry had no artist. Scored against the library's
+   * "artist title" the correct matches landed at 59-86% and *nothing*
+   * auto-accepted — the artist tokens the entry could never have supplied
+   * were counted against it.
+   */
+  it("auto-matches a bare title with no artist against the right track", () => {
+    const f = file("C:/music/rihanna-disturbia.mp3", 238);
+    const tags = { [f.path]: tag({ artist: "Rihanna", title: "Disturbia" }) };
+    const [m] = matchPlaylist([entry(0, "Disturbia", 238)], [f], tags);
+    expect(m.candidates[0].score).toBeGreaterThan(CONFIDENT_THRESHOLD);
+    expect(m.status).toBe("matched");
+  });
+
+  it("still prefers the track whose artist also agrees", () => {
+    const cascada = file("C:/music/cascada.mp3", 200);
+    const cover = file("C:/music/cover.mp3", 200);
+    const tags = {
+      [cascada.path]: tag({ artist: "Cascada", title: "Evacuate The Dancefloor" }),
+      [cover.path]: tag({ artist: "Someone Else", title: "Evacuate The Dancefloor" }),
+    };
+    const [m] = matchPlaylist(
+      [entry(0, "Cascada - Evacuate the Dancefloor", 200)],
+      [cascada, cover],
+      tags,
+    );
+    expect(m.candidates[0].path).toBe(cascada.path);
+  });
+
+  /** A title-only entry must not become a licence to match anything. */
+  it("does not let a bare title match an unrelated track", () => {
+    const f = file("C:/music/gravity.mp3", 402);
+    const tags = { [f.path]: tag({ artist: "Boris Brejcha", title: "Gravity" }) };
+    const [m] = matchPlaylist([entry(0, "Enter Sandman", 331)], [f], tags);
     expect(m.status).toBe("missing");
   });
 

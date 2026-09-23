@@ -1424,6 +1424,15 @@ independently, and stopped there. Now:
   order and each file can back at most one entry, so two near-identical
   entries can't both claim the same file — the stronger pairing wins and the
   weaker falls through to its own next best candidate.
+- **A title-only entry is compared against the title alone.** Found by running
+  a real 70-track playlist against a 4,149-track indexed library: YouTube
+  Music playlists commonly give bare titles with no uploader, so every entry
+  had no artist. Scored against the library's "artist title" the *correct*
+  matches landed at 59-86% and only 2 of 70 auto-accepted — the artist tokens
+  the entry could never have supplied were being counted against it. Adding a
+  title-only comparison (discounted 2%, so a match that also agrees on the
+  artist still wins the assignment) took the same playlist to 26 auto-matched
+  with no false positives.
 - Duration is a proportionate gate, not a flat weight: ≤3s is a small bonus,
   >25s caps the score at 0.5 no matter how well the titles read.
 
