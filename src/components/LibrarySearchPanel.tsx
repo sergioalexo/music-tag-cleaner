@@ -134,6 +134,7 @@ export function LibrarySearchPanel({
                     // the gesture ours.
                     draggable={false}
                     onDragStart={(e) => e.preventDefault()}
+                    data-selfdrag=""
                     onDoubleClick={() => onPick(file.path)}
                     title={`${file.path}\n\nDrag onto a playlist row to match, or double-click to use for the highlighted row`}
                     className={cn(

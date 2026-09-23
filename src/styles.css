@@ -114,3 +114,22 @@
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/*
+ * Elements that drive their own drag gesture (the YouTube-import search dock
+ * dragging a track onto a playlist row).
+ *
+ * `draggable={false}` only opts an element out of the HTML5 drag *API*.
+ * Chromium will still start its own content drag for text, images and media,
+ * and that drag runs a modal loop in the browser process which blocks the
+ * renderer's main thread until it ends — the window keeps its last painted
+ * frame, stops running timers, and ignores input. `-webkit-user-drag: none`
+ * is what actually stops it starting, and it has to reach every descendant,
+ * not just the row.
+ */
+[data-selfdrag],
+[data-selfdrag] * {
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
