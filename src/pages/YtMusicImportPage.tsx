@@ -43,7 +43,6 @@ import {
 } from "../lib/ytMatch";
 import { buildMatchLog, matchLogToMarkdown, type DecisionState } from "../lib/ytMatchLog";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
-import { internalDrag } from "../lib/internalDrag";
 import { Button, Card, CardHeader, cn } from "../components/ui";
 import { Combobox } from "../components/Combobox";
 import { LibrarySearchPanel } from "../components/LibrarySearchPanel";
@@ -152,19 +151,16 @@ export function YtMusicImportPage({
   const [denied, setDenied] = useState<Record<string, string[]>>({});
   /** videoId -> which of the surviving candidates is currently shown. */
   const [candIndex, setCandIndex] = useState<Record<string, number>>({});
-  /** videoIds whose match was dragged in from the search panel. */
+  /** videoIds whose match was picked by hand in the search dock. */
   const [fromSearch, setFromSearch] = useState<Record<string, boolean>>({});
   const [focusedId, setFocusedId] = useState<string | null>(null);
   /** The saved session this run was resumed from, if any. */
   const [resumedFrom, setResumedFrom] = useState<ImportSession | null>(null);
   const [rematching, setRematching] = useState(false);
 
-  // --- Bottom library-search dock + its drag-to-match gesture.
+  // --- Bottom library-search dock.
   const [panelHeight, setPanelHeight] = useState(180);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
-  const [dragPath, setDragPath] = useState<string | null>(null);
-  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
   const fileByPath = useMemo(() => Object.fromEntries(files.map((f) => [f.path, f])), [files]);
 
@@ -442,101 +438,6 @@ export function YtMusicImportPage({
     overrides[videoId] !== undefined ||
     (denied[videoId]?.length ?? 0) > 0 ||
     (candIndex[videoId] ?? 0) !== 0;
-
-  // --- Drag from the search dock onto a playlist row ------------------------
-  /**
-   * Drag-to-match, driven by **captured pointer events**.
-   *
-   * Two earlier approaches both failed here, in ways that look fine until you
-   * actually drag something:
-   *
-   * - HTML5 drag-and-drop never fires `drop` at all, because Tauri's own OS
-   *   drop target swallows it on Windows (the same reason column reordering
-   *   moved off it — see `lib/internalDrag.ts`).
-   * - Plain `mousedown` plus window-level `mousemove`/`mouseup` starts
-   *   correctly but never *ends*: the release goes somewhere else, so the
-   *   ghost, the drop outline and the lifted row all stay stuck on screen
-   *   forever. Observed on a real drag before this was rewritten.
-   *
-   * `setPointerCapture` is the fix rather than a workaround: it guarantees
-   * every subsequent move and the release are delivered to the element that
-   * captured them, whatever else the webview thinks it is doing. `pointerup`
-   * and `pointercancel` share one teardown so the drag cannot get stuck even
-   * if the gesture is aborted by the OS.
-   */
-  const beginDrag = (path: string, e: React.PointerEvent) => {
-    if (dragPath) return; // a drag is already in flight
-    const el = e.currentTarget as HTMLElement;
-    const pointerId = e.pointerId;
-    const startX = e.clientX;
-    const startY = e.clientY;
-    let moved = false;
-
-    e.preventDefault();
-    try {
-      el.setPointerCapture(pointerId);
-    } catch {
-      // Capture is best-effort; the listeners below still work without it.
-    }
-
-    const entryAt = (x: number, y: number): string | null => {
-      const hit = document.elementFromPoint(x, y) as HTMLElement | null;
-      return hit?.closest("[data-yt-entry]")?.getAttribute("data-yt-entry") ?? null;
-    };
-
-    // Belt and braces against the webview starting its *own* drag from any
-    // element under the pointer. An OS drag loop takes the mouse and blocks
-    // the renderer until it decides the gesture is over — timers stop, input
-    // stops, and the window just sits there looking fine. Refuse every
-    // `dragstart` for the duration of our gesture, at the document level and
-    // in the capture phase, so no child element can slip one past.
-    const refuseNativeDrag = (ev: Event) => ev.preventDefault();
-    document.addEventListener("dragstart", refuseNativeDrag, true);
-    document.addEventListener("selectstart", refuseNativeDrag, true);
-
-    const finish = () => {
-      document.removeEventListener("dragstart", refuseNativeDrag, true);
-      document.removeEventListener("selectstart", refuseNativeDrag, true);
-      el.removeEventListener("pointermove", onMove);
-      el.removeEventListener("pointerup", onUp);
-      el.removeEventListener("pointercancel", onCancel);
-      try {
-        el.releasePointerCapture(pointerId);
-      } catch {
-        // Already released, or never captured.
-      }
-      internalDrag.active = false;
-      setDragPath(null);
-      setDragPos(null);
-      setDropTargetId(null);
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (!moved) {
-        if (Math.abs(ev.clientX - startX) < 4 && Math.abs(ev.clientY - startY) < 4) return;
-        moved = true;
-        internalDrag.active = true;
-        setDragPath(path);
-      }
-      setDragPos({ x: ev.clientX, y: ev.clientY });
-      setDropTargetId(entryAt(ev.clientX, ev.clientY));
-    };
-
-    const onUp = (ev: PointerEvent) => {
-      const target = moved ? entryAt(ev.clientX, ev.clientY) : null;
-      finish();
-      if (target) {
-        assignFromSearch(target, path);
-        notify(`Matched to ${flatLabel(path)}`, "success");
-      }
-    };
-
-    const onCancel = () => finish();
-
-    el.addEventListener("pointermove", onMove);
-    el.addEventListener("pointerup", onUp);
-    el.addEventListener("pointercancel", onCancel);
-  };
 
   // --- Session persistence --------------------------------------------------
   const sessionKey = fetchedUrl ? sessionKeyFor(fetchedUrl) : null;
@@ -854,17 +755,14 @@ export function YtMusicImportPage({
                   const want = buildWanted(m.entry);
                   const displayPath = path ?? shown?.path ?? null;
                   const lib = displayPath ? trackLabel(displayPath) : null;
-                  const isDropTarget = dropTargetId === id;
 
                   return (
                     <div
                       key={id}
-                      data-yt-entry={id}
                       onClick={() => setFocusedId(id)}
                       className={cn(
                         "flex items-center gap-3 rounded-md px-2 py-1.5",
                         focusedId === id ? "bg-accent/30" : "hover:bg-accent/20",
-                        isDropTarget && "outline outline-2 outline-primary",
                       )}
                     >
                       <span className="w-6 shrink-0 text-right text-xs text-muted-foreground">
@@ -919,7 +817,7 @@ export function YtMusicImportPage({
                           </>
                         ) : (
                           <span className="flex-1 text-xs text-muted-foreground">
-                            Not found — drag one in from the search below
+                            Not found — pick one from the search below
                           </span>
                         )}
                         <StatusBadge status={status} score={shown?.score} />
@@ -1088,13 +986,11 @@ export function YtMusicImportPage({
           height={panelHeight}
           collapsed={panelCollapsed}
           label={trackLabel}
-          draggingPath={dragPath}
           onHeightChange={setPanelHeight}
           onCollapsedChange={setPanelCollapsed}
-          onBeginDrag={beginDrag}
           onPick={(p) => {
             if (!focusedId) {
-              notify("Click a playlist row first, then double-click a result to match it", "info");
+              notify("Click a playlist row first, then press Match on a result", "info");
               return;
             }
             assignFromSearch(focusedId, p);
@@ -1103,16 +999,6 @@ export function YtMusicImportPage({
         />
       )}
 
-      {/* Drag ghost. pointer-events-none is load-bearing: the drop target is
-          found with elementFromPoint, which would otherwise hit the ghost. */}
-      {dragPath && dragPos && (
-        <div
-          className="pointer-events-none fixed z-50 max-w-xs truncate rounded-md border bg-popover px-2 py-1 text-xs shadow-lg"
-          style={{ left: dragPos.x + 12, top: dragPos.y + 12 }}
-        >
-          {flatLabel(dragPath)}
-        </div>
-      )}
     </div>
   );
 }

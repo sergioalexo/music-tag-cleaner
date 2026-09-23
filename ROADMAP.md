@@ -1788,6 +1788,27 @@ separation, not four copies: spectral centroids land where they should (bass
 cross-correlation between stems is near zero (+0.01 to +0.11).
 
 
+### 51. Drag-to-match replaced by a Match button - v0.13.1
+
+The search dock's drag-to-match gesture is gone. It was rewritten twice -
+HTML5 drag-and-drop never fires `drop` because Tauri's own OS drop target
+swallows it on Windows, then window-level mouse events started the gesture
+but lost the release, then captured pointer events fixed the drop - and it
+still wedged the app shortly after a drag, because the webview starts its
+*own* native content drag from a row full of text and that drag runs a modal
+loop in the browser process which blocks the renderer.
+
+A `-webkit-user-drag: none` hook on the row and every descendant is the
+correct fix for that last failure (committed, then reverted here), but three
+rewrites for one affordance is enough. Each result row now carries a
+**Match** button that assigns it to the highlighted playlist row, with
+double-click as the shortcut; the ghost, the drop outline, the pointer
+capture, the `dragstart`/`selectstart` refusals and the `[data-selfdrag]`
+stylesheet rule all went with it. 170 lines removed, no gesture left that
+can hand the mouse to the OS.
+
+Worth revisiting only if drag turns out to be genuinely missed.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
