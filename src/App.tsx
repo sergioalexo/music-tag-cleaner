@@ -1709,6 +1709,7 @@ This rewrites the genre tag on ${
           paths: offSession,
           field: "genre",
           value: trimmed,
+          backup: settingsRef.current.backupBeforeChanges,
           preserveArt: settingsRef.current.preserveCoverArt,
           backupField: settingsRef.current.searchableBackup
             ? settingsRef.current.backupField

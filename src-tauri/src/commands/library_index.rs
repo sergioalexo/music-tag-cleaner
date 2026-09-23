@@ -589,12 +589,18 @@ pub async fn library_paths_with_genre(app: AppHandle, genre: String) -> Result<V
 /// Every other tag frame is preserved: the file's own `all_fields` dump minus
 /// the typed fields is passed back as `keep_extra`, matching what the
 /// frontend does for an ordinary inline edit.
+///
+/// `backup` carries the user's "Backup original tags before changes" setting.
+/// It must be threaded through rather than assumed: this path can rewrite
+/// thousands of files the user never opened, which is precisely when they
+/// would most want the full pre-change snapshot they asked for.
 #[tauri::command]
 pub async fn retag_field(
     app: AppHandle,
     paths: Vec<String>,
     field: String,
     value: String,
+    backup: bool,
     preserve_art: bool,
     backup_field: Option<String>,
 ) -> Result<Vec<WriteResult>, String> {
@@ -637,7 +643,7 @@ pub async fn retag_field(
             let err = crate::commands::files::write_tags_blocking(
                 path,
                 tags,
-                false,
+                backup,
                 keep_extra,
                 preserve_art,
                 backup_field.clone(),
