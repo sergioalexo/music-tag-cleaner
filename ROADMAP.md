@@ -1809,6 +1809,62 @@ can hand the mouse to the OS.
 
 Worth revisiting only if drag turns out to be genuinely missed.
 
+### 52. YT-import matcher polish: playback, arrow drift, artist fallback, YouTube prelisten, richer logs — v0.13.2
+
+A batch of usability fixes from a real session's feedback:
+
+- **AudioPreview didn't reload on candidate switch.** The `<audio>` element
+  is reused across candidates (cycling arrows, switching matches), and the
+  old effect only ever set `src` once (`if (el && !el.src)`), so switching
+  to another candidate kept playing — or silently failed to play — the
+  previous file. It now rebuilds the element on every `path` change.
+- **Confirm/deny shifted the candidate-cycle arrows.** The action buttons
+  were conditionally rendered inline, so confirming or denying a match
+  (which changes which buttons show) moved the arrows sideways mid-click.
+  Every control now sits in a fixed-width slot, empty or not.
+- **Removed the per-row "Pick…" combobox** — redundant with the search dock
+  below, and it carried every track's label into every row for nothing.
+- **Search dock lag after the first keystroke.** The library search dock
+  rebuilt every file's searchable text from scratch on every character
+  typed, over 4000+ tracks. Fixed with a 150ms debounce, a cache keyed on
+  `TagData` object identity (`cachedTrackSearchText` in `trackSearch.ts`),
+  a tighter result cap for short queries, and `AudioPreview` no longer
+  eagerly preloading metadata in `compact` mode (nothing shows it there).
+- **"Unknown artist" fallback.** `ytmusic.rs` now also reads yt-dlp's
+  `artist`/`creator` fields when present (real per-track metadata, stronger
+  than the uploading channel). `buildWanted()` prioritizes metadata > title
+  split > channel, and tags which one won (`artistSource`) so the UI can
+  show a channel-derived guess (marked "(channel)") instead of collapsing
+  straight to "Unknown artist".
+- **Claude CLI native-installer path.** `find_claude()` now also checks
+  `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows) — where
+  `irm https://claude.ai/install.ps1 | iex` puts `claude`, and which isn't
+  on PATH by default.
+- **Richer, structured session logs.** `notify()` takes an optional
+  `{details, silent}`: `details` is structured data (a fetched URL, a
+  match's score and runner-ups, an export's file list, …) shown expanded
+  and copyable in the Logs page without cluttering the toast; `silent`
+  records the entry without popping a toast, for high-frequency events
+  (every confirm/deny/cycle/skip/reset click) that still belong in a
+  session's paper trail. Copy All now includes each entry's details.
+- **Duplicate "Added N files" log.** `useFiles.importPaths` now de-dupes an
+  identical paths call arriving within 2s of the last one (React
+  StrictMode's dev-mode double-effect-invoke and a multi-file "Open with"'s
+  process burst both funnel through here and could double-fire it).
+- **YouTube prelisten.** New `YouTubePreview` component (YouTube IFrame
+  Player API) adds a play button on the YouTube side of each matcher row,
+  matching `AudioPreview`'s play/scrub UI and joining the same
+  single-thing-plays-at-a-time system. The player is created lazily on
+  first press (never for all rows up front — same lesson as the
+  `preload="metadata"` fix above). A video that refuses to embed falls
+  back to opening it in the browser.
+
+Type-checked, `npm test` (50 TS) and `cargo test` (79 Rust) all pass.
+**Not yet verified against the real app** — this app cannot run in a plain
+browser (every Tauri `invoke` throws on mount), so the UI changes above are
+unverified beyond code review + automated tests until exercised in
+`npm run tauri dev`.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
