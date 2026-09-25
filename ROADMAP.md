@@ -1859,7 +1859,7 @@ A batch of usability fixes from a real session's feedback:
   `preload="metadata"` fix above). A video that refuses to embed falls
   back to opening it in the browser.
 
-Type-checked, `npm test` (50 TS) and `cargo test` (79 Rust) all pass.
+Type-checked, `npm test` (50 TS) and `cargo test` (76 Rust) all pass.
 **Not yet verified against the real app** — this app cannot run in a plain
 browser (every Tauri `invoke` throws on mount), so the UI changes above are
 unverified beyond code review + automated tests until exercised in
