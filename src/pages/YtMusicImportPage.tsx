@@ -34,6 +34,7 @@ import type {
   YtDlpInfo,
 } from "../types";
 import { AudioPreview } from "../components/AudioPreview";
+import { YouTubePreview } from "../components/YouTubePreview";
 import {
   AMBIGUOUS_THRESHOLD,
   buildWanted,
@@ -834,40 +835,43 @@ export function YtMusicImportPage({
                       </span>
 
                       {/* What YouTube has — title on top, artist underneath. */}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
-                          <span className="truncate text-sm" title={m.entry.title}>
-                            {want.title}
-                          </span>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void openUrl(m.entry.url);
-                            }}
-                            className="shrink-0 text-muted-foreground hover:text-primary"
-                            title="Open on YouTube Music"
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <YouTubePreview videoId={m.entry.videoId} url={m.entry.url} compact />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="truncate text-sm" title={m.entry.title}>
+                              {want.title}
+                            </span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void openUrl(m.entry.url);
+                              }}
+                              className="shrink-0 text-muted-foreground hover:text-primary"
+                              title="Open on YouTube Music"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                            </button>
+                          </div>
+                          <div
+                            className="truncate text-xs text-muted-foreground"
+                            title={
+                              want.artistSource === "channel"
+                                ? `${want.artist} — this is the uploading channel, not a confirmed artist`
+                                : want.artist ?? ""
+                            }
                           >
-                            <ExternalLink className="h-3 w-3" />
-                          </button>
-                        </div>
-                        <div
-                          className="truncate text-xs text-muted-foreground"
-                          title={
-                            want.artistSource === "channel"
-                              ? `${want.artist} — this is the uploading channel, not a confirmed artist`
-                              : want.artist ?? ""
-                          }
-                        >
-                          {want.artist ? (
-                            <>
-                              {want.artist}
-                              {want.artistSource === "channel" && (
-                                <span className="ml-1 italic opacity-70">(channel)</span>
-                              )}
-                            </>
-                          ) : (
-                            "Unknown artist"
-                          )}
+                            {want.artist ? (
+                              <>
+                                {want.artist}
+                                {want.artistSource === "channel" && (
+                                  <span className="ml-1 italic opacity-70">(channel)</span>
+                                )}
+                              </>
+                            ) : (
+                              "Unknown artist"
+                            )}
+                          </div>
                         </div>
                       </div>
 
