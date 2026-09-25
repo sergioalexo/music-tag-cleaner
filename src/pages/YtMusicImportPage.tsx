@@ -836,7 +836,7 @@ export function YtMusicImportPage({
 
                       {/* What YouTube has — title on top, artist underneath. */}
                       <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                        <YouTubePreview videoId={m.entry.videoId} url={m.entry.url} compact />
+                        <YouTubePreview videoId={m.entry.videoId} url={m.entry.url} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
                             <span className="truncate text-sm" title={m.entry.title}>

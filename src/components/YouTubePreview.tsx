@@ -90,7 +90,7 @@ let mountSeq = 0;
 
 type Status = "idle" | "loading" | "ready" | "unavailable";
 
-export function YouTubePreview({ videoId, url, compact = true }: { videoId: string; url: string; compact?: boolean }) {
+export function YouTubePreview({ videoId, url }: { videoId: string; url: string }) {
   const mountId = useRef(`yt-preview-${++mountSeq}`).current;
   const hostRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null);
@@ -250,7 +250,17 @@ export function YouTubePreview({ videoId, url, compact = true }: { videoId: stri
           <Play className="h-3 w-3" />
         )}
       </button>
-      {!compact && status !== "unavailable" && (
+      {/*
+        The scrub bar only appears once the player has actually loaded
+        (`ready`) rather than being reserved space in every idle row — a
+        row starts as just a play button, exactly like the local-file
+        AudioPreview does, and only grows once you've pressed it. Fixed
+        (not flex-1) widths here on purpose: this preview sits as a plain
+        flex item next to the row's title/artist text, which is what
+        shrinks to make room — an unbounded flex-1 range here would fight
+        it for space instead.
+      */}
+      {status === "ready" && (
         <>
           <input
             type="range"
@@ -260,8 +270,7 @@ export function YouTubePreview({ videoId, url, compact = true }: { videoId: stri
             value={time}
             onChange={seek}
             onMouseDown={(e) => e.stopPropagation()}
-            disabled={status !== "ready" && status !== "loading"}
-            className="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--primary)] disabled:opacity-40"
+            className="h-1 w-16 shrink-0 cursor-pointer accent-[var(--primary)]"
             title="Scrub — click to play from here"
           />
           <span className="w-9 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
