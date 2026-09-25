@@ -2036,8 +2036,11 @@ must never lock someone out of editing their own files.
   decodes. Debounce / hover-dwell, or drop the per-row size tooltip.
 - `file_info` does a full tag parse just for `hasBackup` + `duration`; making
   those lazy would make import near-instant (`fs::metadata` only).
-- No automated tests for `standardize.ts` or the table selection logic — add
-  Vitest and cover the cases above so they don't regress.
+- ~~No automated tests for `standardize.ts`~~ — done 2026-09-25
+  (`src/lib/standardize.test.ts`, 51 tests: replacements, capitalization
+  modes incl. Roman numerals/initialisms/shouting, weird-char flagging,
+  both filename sanitizers incl. Cyrillic, rename-stem building, track-id
+  helpers). Table selection logic still has no automated tests.
 - Capitalization "casing exceptions" — a user-editable list of protected
   tokens (`AC/DC`, `feat.`, `McFly`, …) to override the default recasing.
 - `settings.columnWidths` accumulates an `extra:<key>` entry for every raw
