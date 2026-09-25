@@ -66,8 +66,16 @@ fn on_path() -> Option<PathBuf> {
             }
         }
     }
-    // A GUI app launched from Finder/Dock doesn't inherit a shell PATH, and
-    // npm's global bin is the usual install location on all three platforms.
+    // A GUI app launched from Finder/Dock/the Windows shell doesn't inherit a
+    // shell PATH, so the two places `claude` actually gets installed to are
+    // checked directly rather than relying on PATH alone.
+    //
+    // 1. npm's global bin (`npm i -g @anthropic-ai/claude-code`).
+    // 2. The native installer (`irm https://claude.ai/install.ps1 | iex` on
+    //    Windows, the equivalent curl script on macOS/Linux), which drops
+    //    `claude` in `~/.local/bin` and tells the user to add that to PATH
+    //    themselves — a step it's easy to skip, so this app shouldn't
+    //    require it.
     #[cfg(target_os = "macos")]
     for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
         let p = PathBuf::from(dir).join(CLAUDE_EXE);
@@ -82,6 +90,20 @@ fn on_path() -> Option<PathBuf> {
             if p.is_file() {
                 return Some(p);
             }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let p = PathBuf::from(&profile).join(".local").join("bin").join(CLAUDE_EXE);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(&home).join(".local").join("bin").join(CLAUDE_EXE);
+        if p.is_file() {
+            return Some(p);
         }
     }
     None

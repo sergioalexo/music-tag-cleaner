@@ -58,6 +58,10 @@ pub struct PlaylistEntry {
     /// auto-generated YouTube Music uploads — stripping that suffix is left
     /// to the matching step, not this fetch.
     pub uploader: Option<String>,
+    /// Structured artist metadata (`artist`/`creator`), when yt-dlp's
+    /// flat-playlist extractor includes it for this entry. Stronger than
+    /// `uploader` — see the field comment on `parse_playlist_json`.
+    pub artist: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -220,6 +224,18 @@ fn parse_playlist_json(raw: &str) -> Result<PlaylistFetchResult, String> {
             .as_str()
             .or_else(|| e["channel"].as_str())
             .map(String::from);
+        // Real per-track metadata, when yt-dlp's flat-playlist extractor
+        // happens to include it (music-typed uploads sometimes carry MP4/ID3
+        // style `artist`/`creator` fields alongside `title`). This is a much
+        // stronger signal than `uploader`/`channel`, which is the *uploading
+        // channel* — often the artist, but also often a label, a compilation
+        // channel, or "Various Artists". Kept separate from `uploader` so the
+        // matching/display layer can tell a confirmed artist from a guess.
+        let artist = e["artist"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| e["creator"].as_str().filter(|s| !s.trim().is_empty()))
+            .map(String::from);
         entries.push(PlaylistEntry {
             index: entries.len(),
             url: format!("https://music.youtube.com/watch?v={video_id}"),
@@ -227,6 +243,7 @@ fn parse_playlist_json(raw: &str) -> Result<PlaylistFetchResult, String> {
             title,
             duration_secs: e["duration"].as_f64(),
             uploader,
+            artist,
         });
     }
     Ok(PlaylistFetchResult { title, entries })
@@ -460,6 +477,30 @@ mod tests {
         let raw = r#"{"title": "x", "entries": [{"id": "v1", "title": "t", "channel": "Some Artist - Topic"}]}"#;
         let result = parse_playlist_json(raw).unwrap();
         assert_eq!(result.entries[0].uploader.as_deref(), Some("Some Artist - Topic"));
+    }
+
+    #[test]
+    fn reads_structured_artist_metadata_when_present() {
+        let raw = r#"{"title": "x", "entries": [
+            {"id": "v1", "title": "t", "artist": "Real Artist", "channel": "Some Label Channel"}
+        ]}"#;
+        let result = parse_playlist_json(raw).unwrap();
+        assert_eq!(result.entries[0].artist.as_deref(), Some("Real Artist"));
+        assert_eq!(result.entries[0].uploader.as_deref(), Some("Some Label Channel"));
+    }
+
+    #[test]
+    fn falls_back_to_creator_when_artist_is_absent() {
+        let raw = r#"{"title": "x", "entries": [{"id": "v1", "title": "t", "creator": "Creator Name"}]}"#;
+        let result = parse_playlist_json(raw).unwrap();
+        assert_eq!(result.entries[0].artist.as_deref(), Some("Creator Name"));
+    }
+
+    #[test]
+    fn leaves_artist_none_when_yt_dlp_gives_only_a_channel() {
+        let raw = r#"{"title": "x", "entries": [{"id": "v1", "title": "t", "channel": "Some Channel"}]}"#;
+        let result = parse_playlist_json(raw).unwrap();
+        assert_eq!(result.entries[0].artist, None);
     }
 
     #[test]

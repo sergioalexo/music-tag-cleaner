@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AudioFile, PlaylistEntry, TagData } from "../types";
 import {
   buildIdentity,
+  buildWanted,
   CONFIDENT_THRESHOLD,
   matchPlaylist,
   parseSearchableBackup,
@@ -29,7 +30,13 @@ function tag(partial: Partial<TagData>): TagData {
   return { hasCoverArt: false, allFields: {}, ...partial };
 }
 
-function entry(index: number, title: string, durationSecs?: number, uploader?: string): PlaylistEntry {
+function entry(
+  index: number,
+  title: string,
+  durationSecs?: number,
+  uploader?: string,
+  artist?: string,
+): PlaylistEntry {
   return {
     index,
     videoId: `v${index}`,
@@ -37,6 +44,7 @@ function entry(index: number, title: string, durationSecs?: number, uploader?: s
     title,
     durationSecs,
     uploader,
+    artist,
   };
 }
 
@@ -68,6 +76,32 @@ describe("splitArtistTitle", () => {
 
   it("leaves an unsplittable title whole", () => {
     expect(splitArtistTitle("Delilah")).toEqual({ artist: null, title: "Delilah" });
+  });
+});
+
+describe("buildWanted — artist source priority", () => {
+  it("prefers structured metadata over the title split and the channel", () => {
+    const w = buildWanted(entry(0, "Some Video Title", undefined, "Some Channel - Topic", "Real Artist"));
+    expect(w.artist).toBe("Real Artist");
+    expect(w.artistSource).toBe("metadata");
+  });
+
+  it("falls back to splitting the title when there's no metadata artist", () => {
+    const w = buildWanted(entry(0, "Boris Brejcha - Gravity", undefined, "Some Channel"));
+    expect(w.artist).toBe("Boris Brejcha");
+    expect(w.artistSource).toBe("title");
+  });
+
+  it("falls back to the uploading channel, flagged as a guess, when the title has no split", () => {
+    const w = buildWanted(entry(0, "Gravity", undefined, "Boris Brejcha - Topic"));
+    expect(w.artist).toBe("Boris Brejcha");
+    expect(w.artistSource).toBe("channel");
+  });
+
+  it("has no artist at all when nothing is available", () => {
+    const w = buildWanted(entry(0, "Gravity"));
+    expect(w.artist).toBeNull();
+    expect(w.artistSource).toBeNull();
   });
 });
 

@@ -444,7 +444,13 @@ export interface PlaylistEntry {
   url: string;
   title: string;
   durationSecs?: number | null;
+  /** The uploading channel — often the artist, but a guess (label,
+   * compilation channel, "Various Artists"). See `artist` for the stronger
+   * signal, when yt-dlp provides one. */
   uploader?: string | null;
+  /** Structured artist metadata, when yt-dlp's flat-playlist extractor
+   * includes it for this entry. */
+  artist?: string | null;
 }
 
 export interface PlaylistFetchResult {

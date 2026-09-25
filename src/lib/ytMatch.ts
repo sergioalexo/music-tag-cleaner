@@ -439,9 +439,15 @@ export function buildIdentity(file: AudioFile, tag: TagData | undefined): TrackI
   };
 }
 
+/** Where an entry's displayed artist came from, best confidence first. */
+export type ArtistSource = "metadata" | "title" | "channel" | null;
+
 /** A playlist entry reduced to the same shape, so both sides are comparable. */
 export interface WantedEntry {
   artist: string | null;
+  /** How confident `artist` is — a real "channel name" guess is worth
+   * flagging in the UI differently from a parsed/structured artist. */
+  artistSource: ArtistSource;
   title: string;
   /** The whole cleaned video title, used when the artist/title split misfired. */
   raw: string;
@@ -456,11 +462,34 @@ export interface WantedEntry {
 
 export function buildWanted(entry: PlaylistEntry): WantedEntry {
   const split = splitArtistTitle(entry.title);
-  const artist = split.artist ?? (entry.uploader ? stripTopicSuffix(entry.uploader) : null);
+  const channelGuess = entry.uploader ? stripTopicSuffix(entry.uploader) : null;
+
+  // Prefer real structured metadata (yt-dlp's `artist`/`creator`, when
+  // present) over splitting the title, and both over the uploading channel
+  // — a channel is often the artist, but is also often a label or a
+  // compilation/"Various Artists" channel, so it's the weakest signal and
+  // the only one worth flagging as a guess in the UI.
+  let artist: string | null;
+  let artistSource: ArtistSource;
+  if (entry.artist?.trim()) {
+    artist = entry.artist.trim();
+    artistSource = "metadata";
+  } else if (split.artist) {
+    artist = split.artist;
+    artistSource = "title";
+  } else if (channelGuess) {
+    artist = channelGuess;
+    artistSource = "channel";
+  } else {
+    artist = null;
+    artistSource = null;
+  }
+
   const raw = stripTitleNoise(entry.title);
   const rawP = prepare(raw);
   return {
     artist,
+    artistSource,
     title: split.title,
     raw,
     durationSecs: entry.durationSecs,

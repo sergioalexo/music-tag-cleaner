@@ -779,8 +779,24 @@ export function YtMusicImportPage({
                             <ExternalLink className="h-3 w-3" />
                           </button>
                         </div>
-                        <div className="truncate text-xs text-muted-foreground" title={want.artist ?? ""}>
-                          {want.artist || "Unknown artist"}
+                        <div
+                          className="truncate text-xs text-muted-foreground"
+                          title={
+                            want.artistSource === "channel"
+                              ? `${want.artist} — this is the uploading channel, not a confirmed artist`
+                              : want.artist ?? ""
+                          }
+                        >
+                          {want.artist ? (
+                            <>
+                              {want.artist}
+                              {want.artistSource === "channel" && (
+                                <span className="ml-1 italic opacity-70">(channel)</span>
+                              )}
+                            </>
+                          ) : (
+                            "Unknown artist"
+                          )}
                         </div>
                       </div>
 
