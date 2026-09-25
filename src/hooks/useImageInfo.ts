@@ -12,6 +12,9 @@ export interface ImageInfo {
 /** Files per `image_info_batch` call — see the note on useCovers' CHUNK. */
 const CHUNK = 48;
 
+/** How long a row has to stay hovered before `fetchOne` actually fires. */
+const HOVER_DWELL_MS = 150;
+
 interface ImageInfoResult {
   path: string;
   info: ImageInfo | null;
@@ -33,6 +36,18 @@ export function useImageInfo(files: AudioFile[], enabled: boolean) {
   infoRef.current = info;
   // Paths with a fetch already in flight, so a hover storm can't queue duplicates.
   const inFlightRef = useRef<Set<string>>(new Set());
+  // The single pending hover-dwell timer — only the most recently hovered
+  // row's request survives. A fast sweep across a long table used to fire
+  // `image_info` (a real IPC round trip + cover decode) for every row the
+  // cursor merely passed over; now only a row the cursor actually stays on
+  // for `HOVER_DWELL_MS` gets fetched.
+  const dwellRef = useRef<{ path: string; timer: number } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (dwellRef.current) window.clearTimeout(dwellRef.current.timer);
+    };
+  }, []);
 
   useEffect(() => {
     if (!enabled) return;
@@ -64,8 +79,7 @@ export function useImageInfo(files: AudioFile[], enabled: boolean) {
     };
   }, [files, enabled, reloadToken]);
 
-  /** Fetches a single file on demand (e.g. row hover) regardless of `enabled`. */
-  const fetchOne = useCallback(async (path: string) => {
+  const fetchNow = useCallback(async (path: string) => {
     if (path in infoRef.current || inFlightRef.current.has(path)) return;
     inFlightRef.current.add(path);
     try {
@@ -77,6 +91,25 @@ export function useImageInfo(files: AudioFile[], enabled: boolean) {
       inFlightRef.current.delete(path);
     }
   }, []);
+
+  /**
+   * Requests a single file on demand (e.g. row hover) regardless of
+   * `enabled`. Debounced to the row actually being hovered for a moment —
+   * see `dwellRef` — rather than firing on every `mouseenter` a sweep
+   * passes through.
+   */
+  const fetchOne = useCallback(
+    (path: string) => {
+      if (path in infoRef.current || inFlightRef.current.has(path)) return;
+      if (dwellRef.current) window.clearTimeout(dwellRef.current.timer);
+      const timer = window.setTimeout(() => {
+        dwellRef.current = null;
+        void fetchNow(path);
+      }, HOVER_DWELL_MS);
+      dwellRef.current = { path, timer };
+    },
+    [fetchNow],
+  );
 
   const invalidate = useCallback((paths: string[]) => {
     if (!paths.length) return;

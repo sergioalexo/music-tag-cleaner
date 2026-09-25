@@ -2031,9 +2031,11 @@ must never lock someone out of editing their own files.
 
 - Optional one-click "move Track Number ids into Track ID" for pre-v4
   libraries (use `isUid()` to pick which Track Number values are app ids).
-- `useImageInfo.fetchOne` fires on every row `onMouseEnter` (for the thumbnail
-  tooltip) — a fast mouse sweep over a big list queues hundreds of image
-  decodes. Debounce / hover-dwell, or drop the per-row size tooltip.
+- ~~`useImageInfo.fetchOne` fires on every row `onMouseEnter`~~ — done
+  2026-09-25: a 150ms hover-dwell debounce (`HOVER_DWELL_MS`/`dwellRef` in
+  `useImageInfo.ts`) now keeps only the most recently hovered row's request,
+  so a fast sweep across the table no longer queues an `image_info` call
+  per row passed over.
 - `file_info` does a full tag parse just for `hasBackup` + `duration`; making
   those lazy would make import near-instant (`fs::metadata` only).
 - ~~No automated tests for `standardize.ts`~~ — done 2026-09-25
