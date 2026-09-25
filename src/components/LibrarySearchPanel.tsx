@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import type { AudioFile, TagData } from "../types";
 import { searchTracks } from "../lib/trackSearch";
@@ -34,10 +34,25 @@ export function LibrarySearchPanel({
   onPick: (path: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  // The query is searched debounced, not on every keystroke: with a 4000+
+  // track library, re-scoring the whole collection on each character is
+  // what made typing visibly glitch right after the first letter and only
+  // catch up a moment later. Typing itself stays instant — only the search
+  // that reacts to it is delayed.
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query), 150);
+    return () => clearTimeout(t);
+  }, [query]);
 
+  // A one- or two-character query matches almost everything in a large
+  // library, so it's capped tighter than a longer, more specific one — fewer
+  // rows to render (and fewer `<AudioPreview>`s to mount) while you're still
+  // mid-word.
+  const resultLimit = debouncedQuery.trim().length < 3 ? 40 : 300;
   const results = useMemo(
-    () => searchTracks(files, tags, query, 300),
-    [files, tags, query],
+    () => searchTracks(files, tags, debouncedQuery, resultLimit),
+    [files, tags, debouncedQuery, resultLimit],
   );
 
   const startResize = (e: React.MouseEvent) => {
@@ -76,7 +91,10 @@ export function LibrarySearchPanel({
         />
         {query && (
           <button
-            onClick={() => setQuery("")}
+            onClick={() => {
+              setQuery("");
+              setDebouncedQuery("");
+            }}
             className="shrink-0 text-muted-foreground hover:text-foreground"
             title="Clear"
           >

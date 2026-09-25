@@ -44,7 +44,6 @@ import {
 import { buildMatchLog, matchLogToMarkdown, type DecisionState } from "../lib/ytMatchLog";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
 import { Button, Card, CardHeader, cn } from "../components/ui";
-import { Combobox } from "../components/Combobox";
 import { LibrarySearchPanel } from "../components/LibrarySearchPanel";
 
 function sanitizeFilenamePart(s: string): string {
@@ -183,12 +182,6 @@ export function YtMusicImportPage({
     };
   }, [trackLabel]);
 
-  const allLabels = useMemo(() => files.map((f) => flatLabel(f.path)), [files, flatLabel]);
-  const labelToPath = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of files) m.set(flatLabel(f.path), f.path);
-    return m;
-  }, [files, flatLabel]);
 
   /**
    * Restores the most recent import session when the page mounts.
@@ -823,102 +816,109 @@ export function YtMusicImportPage({
                         <StatusBadge status={status} score={shown?.score} />
                       </div>
 
-                      <div className="flex w-[13.5rem] shrink-0 items-center justify-end gap-1">
-                        {live.length > 1 && (
-                          <span className="flex items-center text-muted-foreground">
+                      {/*
+                        Every slot below has a fixed width and is always
+                        rendered, empty or not. Buttons used to be conditionally
+                        rendered inline, so confirming/denying a match — which
+                        changes which buttons are visible — shifted the arrow
+                        buttons sideways, breaking "just keep clicking" without
+                        moving the mouse. A fixed slot per control keeps every
+                        button's position stable regardless of this row's state.
+                      */}
+                      <div className="flex w-44 shrink-0 items-center justify-end gap-1">
+                        <span className="flex w-16 shrink-0 items-center justify-end text-muted-foreground">
+                          {live.length > 1 && (
+                            <>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  cycleCandidate(m, -1);
+                                }}
+                                className="rounded p-0.5 hover:bg-accent hover:text-foreground"
+                                title="Previous candidate"
+                              >
+                                <ChevronLeft className="h-3.5 w-3.5" />
+                              </button>
+                              <span className="min-w-[2.2rem] text-center text-[10px] tabular-nums">
+                                {shownIndex + 1}/{live.length}
+                              </span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  cycleCandidate(m, 1);
+                                }}
+                                className="rounded p-0.5 hover:bg-accent hover:text-foreground"
+                                title="Next candidate — other mixes and near-misses"
+                              >
+                                <ChevronRight className="h-3.5 w-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </span>
+
+                        <span className="flex w-6 shrink-0 items-center justify-center">
+                          {shown && !path && (
                             <button
+                              title="Confirm this match"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                cycleCandidate(m, -1);
+                                confirmMatch(m);
                               }}
-                              className="rounded p-0.5 hover:bg-accent hover:text-foreground"
-                              title="Previous candidate"
+                              className="rounded-md border border-primary bg-primary/10 p-1 text-primary hover:bg-primary/20"
                             >
-                              <ChevronLeft className="h-3.5 w-3.5" />
+                              <Check className="h-3.5 w-3.5" />
                             </button>
-                            <span className="min-w-[2.2rem] text-center text-[10px] tabular-nums">
-                              {shownIndex + 1}/{live.length}
-                            </span>
+                          )}
+                        </span>
+
+                        <span className="flex w-6 shrink-0 items-center justify-center">
+                          {shown && (
                             <button
+                              title={
+                                live.length > 1
+                                  ? "Deny this match — show the next candidate instead"
+                                  : "Deny this match — nothing else fits, so it becomes Missing"
+                              }
                               onClick={(e) => {
                                 e.stopPropagation();
-                                cycleCandidate(m, 1);
+                                denyMatch(m);
                               }}
-                              className="rounded p-0.5 hover:bg-accent hover:text-foreground"
-                              title="Next candidate — other mixes and near-misses"
+                              className="rounded-md border border-input p-1 text-muted-foreground hover:border-destructive hover:text-destructive"
                             >
-                              <ChevronRight className="h-3.5 w-3.5" />
+                              <X className="h-3.5 w-3.5" />
                             </button>
-                          </span>
-                        )}
+                          )}
+                        </span>
 
-                        {shown && !path && (
-                          <button
-                            title="Confirm this match"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              confirmMatch(m);
-                            }}
-                            className="rounded-md border border-primary bg-primary/10 p-1 text-primary hover:bg-primary/20"
-                          >
-                            <Check className="h-3.5 w-3.5" />
-                          </button>
-                        )}
+                        <span className="flex w-6 shrink-0 items-center justify-center">
+                          {overrides[id] !== "" && (
+                            <button
+                              title="Mark as missing — I don't have this one"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                skipEntry(m);
+                              }}
+                              className="rounded-md border border-input p-1 text-muted-foreground hover:bg-accent"
+                            >
+                              <Ban className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </span>
 
-                        {shown && (
-                          <button
-                            title={
-                              live.length > 1
-                                ? "Deny this match — show the next candidate instead"
-                                : "Deny this match — nothing else fits, so it becomes Missing"
-                            }
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              denyMatch(m);
-                            }}
-                            className="rounded-md border border-input p-1 text-muted-foreground hover:border-destructive hover:text-destructive"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
-                        )}
-
-                        {overrides[id] !== "" && (
-                          <button
-                            title="Mark as missing — I don't have this one"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              skipEntry(m);
-                            }}
-                            className="rounded-md border border-input p-1 text-muted-foreground hover:bg-accent"
-                          >
-                            <Ban className="h-3.5 w-3.5" />
-                          </button>
-                        )}
-
-                        <Combobox
-                          value=""
-                          options={allLabels}
-                          placeholder="Pick…"
-                          className="w-20"
-                          onChange={(label) => {
-                            const p = labelToPath.get(label);
-                            if (p) assignFromSearch(id, p);
-                          }}
-                          onClose={undefined}
-                        />
-
-                        {touched(id) && (
-                          <button
-                            title="Reset to the automatic match"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              resetEntry(m);
-                            }}
-                            className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                          </button>
-                        )}
+                        <span className="flex w-6 shrink-0 items-center justify-center">
+                          {touched(id) && (
+                            <button
+                              title="Reset to the automatic match"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                resetEntry(m);
+                              }}
+                              className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </span>
                       </div>
                     </div>
                   );

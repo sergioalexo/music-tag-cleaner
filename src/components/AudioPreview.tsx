@@ -48,13 +48,35 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
   const [duration, setDuration] = useState(0);
 
   useEffect(() => {
-    // Load metadata (duration) up front so the scrub bar works before Play is ever pressed.
-    // preload="metadata" keeps this cheap — it reads just enough to get duration, not the full file.
+    // Load metadata (duration) up front so the scrub bar works before Play is
+    // ever pressed. `compact` rows don't show a scrub bar or duration, so
+    // there's nothing to preload for — skip it there. This matters at scale:
+    // the library search dock and the YouTube-import matcher can render
+    // hundreds of these at once (one per visible result), and setting `src`
+    // on mount used to make every one of them start reading file metadata
+    // immediately, which is what made typing into the search box feel like
+    // it froze. Non-compact preload is unaffected: preload="metadata" reads
+    // just enough to get duration, not the full file.
+    //
+    // This must run on every `path` change, not just mount: the YouTube-import
+    // matcher reuses the same <AudioPreview> element when you cycle candidates
+    // (arrow buttons) or switch matches, so `path` changes without the
+    // component ever unmounting. The old `!el.src` guard only ever set the
+    // source once, so switching candidates kept playing (or silently failed
+    // to play) the previous file.
     const el = audioRef.current;
-    if (el && !el.src) {
-      el.src = convertFileSrc(path);
-      setReady(true);
+    if (el) {
+      el.pause();
+      if (compact) {
+        el.removeAttribute("src");
+      } else {
+        el.src = convertFileSrc(path);
+      }
     }
+    setReady(!compact);
+    setPlaying(false);
+    setTime(0);
+    setDuration(0);
     return () => {
       if (audioRef.current) audioRef.current.pause();
       releasePlayback(pause);

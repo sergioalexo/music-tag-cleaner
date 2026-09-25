@@ -82,6 +82,28 @@ export function trackSearchText(file: AudioFile, tag: TagData | undefined): stri
   return fold(parts.filter(Boolean).join(" \u0001 "));
 }
 
+/**
+ * Caches each file's searchable haystack, keyed by path with the `TagData`
+ * object identity as the invalidation check.
+ *
+ * `trackSearchText` folds/normalizes every tag field on a file, which is
+ * cheap once but not 4000+ times per keystroke — searching the library
+ * search dock used to rebuild every haystack from scratch on every
+ * character typed, which is what made the first letter of a query visibly
+ * stall the UI. Tags only change when the user edits or re-tags a file, so
+ * a stale cache entry is caught the moment `tags[path]` becomes a new
+ * object (edits always replace, never mutate, `TagData`).
+ */
+const haystackCache = new Map<string, { tag: TagData | undefined; text: string }>();
+
+export function cachedTrackSearchText(file: AudioFile, tag: TagData | undefined): string {
+  const cached = haystackCache.get(file.path);
+  if (cached && cached.tag === tag) return cached.text;
+  const text = trackSearchText(file, tag);
+  haystackCache.set(file.path, { tag, text });
+  return text;
+}
+
 interface Term {
   /** A specific field to look in, or null for "anywhere". */
   field: (keyof TagData | "filename" | "path") | null;
@@ -159,7 +181,7 @@ export function searchTracks(
 
   for (const file of files) {
     const tag = tags[file.path];
-    const haystack = trackSearchText(file, tag);
+    const haystack = cachedTrackSearchText(file, tag);
     if (!matchesTerms(file, tag, terms, haystack)) continue;
 
     let score = 1;

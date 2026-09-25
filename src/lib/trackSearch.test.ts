@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AudioFile, TagData } from "../types";
-import { parseQuery, searchTracks, trackSearchText } from "./trackSearch";
+import { cachedTrackSearchText, parseQuery, searchTracks, trackSearchText } from "./trackSearch";
 
 function file(path: string): AudioFile {
   return { path, filename: path.split(/[\\/]/).pop() ?? path, format: "mp3", size: 1, hasBackup: false };
@@ -26,6 +26,25 @@ describe("trackSearchText", () => {
     expect(text).toContain("track01");
     expect(text).toContain("boris brejcha");
     expect(text).toContain("2019");
+  });
+});
+
+describe("cachedTrackSearchText", () => {
+  it("reuses the cached text while the tag object is unchanged", () => {
+    const f = file("C:/music/cached.mp3");
+    const t = tag({ artist: "A", title: "B" });
+    const first = cachedTrackSearchText(f, t);
+    const second = cachedTrackSearchText(f, t);
+    expect(second).toBe(first);
+    expect(first).toBe(trackSearchText(f, t));
+  });
+
+  it("recomputes once the tag object is replaced, as an edit always does", () => {
+    const f = file("C:/music/recache.mp3");
+    const before = cachedTrackSearchText(f, tag({ artist: "Old", title: "X" }));
+    const after = cachedTrackSearchText(f, tag({ artist: "New", title: "X" }));
+    expect(after).not.toBe(before);
+    expect(after).toContain("new");
   });
 });
 
