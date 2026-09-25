@@ -16,7 +16,7 @@ import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
 import { useImageInfo } from "./hooks/useImageInfo";
 import { useAnalytics } from "./hooks/useAnalytics";
-import { useFiles } from "./hooks/useFiles";
+import { useFiles, type NotifyOpts } from "./hooks/useFiles";
 import { useHistory, type HistoryChange } from "./hooks/useHistory";
 import { useSettings } from "./hooks/useSettings";
 import { useLibraryIndex, mergeWithSession } from "./hooks/useLibraryIndex";
@@ -106,6 +106,10 @@ export interface LogEntry {
   time: number;
   message: string;
   kind: "success" | "error" | "info";
+  /** Structured context for this entry (a fetched URL, a match's score and
+   * runner-ups, an export's file list, …) — shown expanded in the Logs page
+   * and included when the log is copied. */
+  details?: unknown;
 }
 
 const LOG_LIMIT = 500;
@@ -121,11 +125,20 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
-  const notify = useCallback((message: string, kind: Toast["kind"] = "info") => {
+  const notify = useCallback((message: string, kind: Toast["kind"] = "info", opts?: NotifyOpts) => {
     const id = ++toastId;
-    setToasts((prev) => [...prev, { id, message, kind }]);
-    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
-    setLogs((prev) => [...prev.slice(-(LOG_LIMIT - 1)), { id, time: Date.now(), message, kind }]);
+    // `silent` records the log line without the on-screen toast — for
+    // per-click events (confirming/denying a YT-import match, cycling a
+    // candidate, …) that are too frequent to pop up but still worth having
+    // in the Logs page when troubleshooting a session afterwards.
+    if (!opts?.silent) {
+      setToasts((prev) => [...prev, { id, message, kind }]);
+      setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
+    }
+    setLogs((prev) => [
+      ...prev.slice(-(LOG_LIMIT - 1)),
+      { id, time: Date.now(), message, kind, details: opts?.details },
+    ]);
   }, []);
 
   // Keep a live reference so async callbacks always see current settings.

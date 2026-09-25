@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -36,7 +37,7 @@ import { Badge, Button, Card, cn, inputClass } from "../components/ui";
 
 interface Props {
   ollamaUrl: string;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
   onOllamaChanged: () => void;
   onFfmpegChanged: () => void;
 }

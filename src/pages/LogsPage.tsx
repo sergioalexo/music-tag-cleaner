@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { BarChart3, CheckCircle2, Copy, Info, Terminal, Trash2, XCircle } from "lucide-react";
+import { BarChart3, CheckCircle2, ChevronDown, ChevronRight, Copy, Info, Terminal, Trash2, XCircle } from "lucide-react";
 import type { LogEntry } from "../App";
 import type { ActionCounts } from "../hooks/useAnalytics";
 import { Button, Card, cn } from "../components/ui";
@@ -30,11 +30,29 @@ function formatTime(ms: number): string {
 export function LogsPage({ logs, onClear, actionCounts, onResetActionCounts }: Props) {
   const [filter, setFilter] = useState<"all" | "error">("all");
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
   const visible = filter === "error" ? logs.filter((l) => l.kind === "error") : logs;
 
+  const toggleExpanded = (id: number) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Every entry's structured `details` (a fetched URL, a match's score and
+  // runner-ups, an export's file list, …) is included under its line, so
+  // pasting this into an AI carries the whole story — not just "Matched to
+  // X" with no idea what else was considered or why.
   const copyAll = async () => {
-    const text = visible.map((l) => `[${formatTime(l.time)}] ${l.kind.toUpperCase()}: ${l.message}`).join("\n");
+    const text = visible
+      .map((l) => {
+        const line = `[${formatTime(l.time)}] ${l.kind.toUpperCase()}: ${l.message}`;
+        return l.details !== undefined ? `${line}\n${JSON.stringify(l.details, null, 2)}` : line;
+      })
+      .join("\n");
     await navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
@@ -95,13 +113,34 @@ export function LogsPage({ logs, onClear, actionCounts, onResetActionCounts }: P
           <div className="divide-y divide-border/50 font-mono text-xs">
             {[...visible].reverse().map((l) => {
               const Icon = KIND_ICON[l.kind];
+              const hasDetails = l.details !== undefined;
+              const isOpen = expanded.has(l.id);
               return (
-                <div key={l.id} className="flex items-start gap-2 px-3 py-2">
-                  <Icon className={cn("mt-0.5 h-3.5 w-3.5 shrink-0", KIND_COLOR[l.kind])} />
-                  <span className="shrink-0 text-muted-foreground">{formatTime(l.time)}</span>
-                  <span className={cn("min-w-0 flex-1 whitespace-pre-wrap break-words", KIND_COLOR[l.kind])}>
-                    {l.message}
-                  </span>
+                <div key={l.id} className="px-3 py-2">
+                  <div
+                    className={cn("flex items-start gap-2", hasDetails && "cursor-pointer")}
+                    onClick={() => hasDetails && toggleExpanded(l.id)}
+                  >
+                    {hasDetails ? (
+                      isOpen ? (
+                        <ChevronDown className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      )
+                    ) : (
+                      <span className="w-3.5 shrink-0" />
+                    )}
+                    <Icon className={cn("mt-0.5 h-3.5 w-3.5 shrink-0", KIND_COLOR[l.kind])} />
+                    <span className="shrink-0 text-muted-foreground">{formatTime(l.time)}</span>
+                    <span className={cn("min-w-0 flex-1 whitespace-pre-wrap break-words", KIND_COLOR[l.kind])}>
+                      {l.message}
+                    </span>
+                  </div>
+                  {hasDetails && isOpen && (
+                    <pre className="ml-9 mt-1 max-h-48 overflow-auto rounded-md bg-secondary/50 p-2 text-[10px] text-foreground">
+                      {JSON.stringify(l.details, null, 2)}
+                    </pre>
+                  )}
                 </div>
               );
             })}

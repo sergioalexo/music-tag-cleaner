@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { AlertTriangle, HardDrive, Loader2, RotateCw, Usb } from "lucide-react";
 import { Badge, Button, Card, cn } from "./ui";
 
@@ -33,7 +34,7 @@ function formatSize(bytes: number): string {
 export function UsbFormatCard({
   notify,
 }: {
-  notify: (m: string, k?: "info" | "success" | "error") => void;
+  notify: Notify;
 }) {
   const [drives, setDrives] = useState<RemovableDrive[] | null>(null);
   const [loading, setLoading] = useState(false);

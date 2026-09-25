@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
@@ -54,7 +55,7 @@ interface Props {
   /** Offers to retag tracks using a non-canonical spelling to the canonical one. */
   onMergeGenreVariants: (variants: string[], canonical: string) => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
 }
 
 const BATCH_SIZES = [10, 25, 50, 100];
@@ -216,7 +217,7 @@ function LibraryIndexCard({
   notify,
 }: {
   libraryIndex: LibraryIndexApi;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
 }) {
   const { stats, indexing, progress } = libraryIndex;
   const roots = stats?.roots ?? [];

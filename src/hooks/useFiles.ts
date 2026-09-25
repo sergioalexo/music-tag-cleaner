@@ -3,7 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AUDIO_EXTENSIONS, type AudioFile } from "../types";
 
-export type Notify = (message: string, kind?: "success" | "error" | "info") => void;
+export interface NotifyOpts {
+  /** Structured data to keep alongside the log line — shown expanded in the
+   * Logs page and included when it's copied, without cluttering the toast. */
+  details?: unknown;
+  /** Records the entry in the Logs page but skips the on-screen toast — for
+   * events too frequent or minor to pop up (e.g. a single match-row click),
+   * that should still show up when troubleshooting a session. */
+  silent?: boolean;
+}
+
+export type Notify = (message: string, kind?: "success" | "error" | "info", opts?: NotifyOpts) => void;
 
 export function useFiles(
   recursive: boolean,
@@ -74,9 +84,24 @@ export function useFiles(
     }
   };
 
+  // App.tsx wires this up from two places — the OS drag-and-drop listener and
+  // the "opened with this app" drain — and both can legitimately fire for the
+  // very same drop: React StrictMode's mount→unmount→mount in dev re-runs an
+  // effect before its async listener registration has settled, and a
+  // multi-file "Open with" launches a short burst of OS processes that each
+  // report the same paths. Either way the symptom is identical: "Added N
+  // files" logged twice for one drop. Rather than chase which path fired
+  // twice, de-duplicate here — the one place both funnels converge — by
+  // ignoring a call with the exact same paths as the one just handled.
+  const lastImportRef = useRef<{ key: string; at: number } | null>(null);
+
   /** Imports dropped paths (files and/or folders). */
   const importPaths = async (paths: string[]) => {
     if (!paths.length) return;
+    const key = paths.join("\u0001");
+    const last = lastImportRef.current;
+    if (last && last.key === key && Date.now() - last.at < 2000) return;
+    lastImportRef.current = { key, at: Date.now() };
     try {
       setScanning(true);
       const found = await invoke<AudioFile[]>("import_paths", { paths, recursive });

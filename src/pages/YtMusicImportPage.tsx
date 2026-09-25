@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -127,7 +128,7 @@ export function YtMusicImportPage({
   tags: Record<string, TagData>;
   /** How many of `files` came from the index, for the "index your library" hint. */
   indexedCount: number;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
   onInspect: (path: string) => void;
 }) {
   const [ytdlp, setYtdlp] = useState<YtDlpInfo | null>(null);
@@ -283,12 +284,22 @@ export function YtMusicImportPage({
     setDenied({});
     setCandIndex({});
     setFromSearch({});
+    const fetchStarted = Date.now();
     try {
       const result = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: trimmed });
       setPlaylist(result);
       setFetchedUrl(trimmed);
       // Matching is driven by the effect above, so it happens here too.
-      notify(`Fetched ${result.entries.length} track(s) from "${result.title}"`, "success");
+      const noArtist = result.entries.filter((e) => !buildWanted(e).artist).length;
+      notify(`Fetched ${result.entries.length} track(s) from "${result.title}"`, "success", {
+        details: {
+          url: trimmed,
+          title: result.title,
+          trackCount: result.entries.length,
+          entriesWithNoIdentifiableArtist: noArtist,
+          fetchMs: Date.now() - fetchStarted,
+        },
+      });
 
       // Re-fetching a playlist that was matched before restores every
       // decision made last time. The matcher has just re-run against the
@@ -316,7 +327,7 @@ export function YtMusicImportPage({
         }
       }
     } catch (e) {
-      notify(String(e), "error");
+      notify(String(e), "error", { details: { url: trimmed } });
     } finally {
       setFetching(false);
     }
@@ -364,9 +375,37 @@ export function YtMusicImportPage({
   const setOverride = (videoId: string, path: string) =>
     setOverrides((prev) => ({ ...prev, [videoId]: path }));
 
+  /**
+   * A quiet log entry per click — confirm/deny/cycle/skip/reset never pop a
+   * toast (dozens of these a minute would bury everything else), but each
+   * one is worth having in the Logs page afterwards: which playlist row,
+   * what YouTube called it, which file was involved, its score and why it
+   * matched, and — for a deny — what's still in the running.
+   */
+  const logDecision = (action: string, m: EntryMatch, extra?: Record<string, unknown>) => {
+    const w = buildWanted(m.entry);
+    const shown = shownCandidate(m);
+    notify(`${action}: row ${m.entry.index + 1} "${w.artist ? `${w.artist} - ${w.title}` : w.title}"`, "info", {
+      silent: true,
+      details: {
+        action,
+        row: m.entry.index + 1,
+        videoId: m.entry.videoId,
+        wantedArtist: w.artist,
+        wantedTitle: w.title,
+        shownCandidate: shown ? { path: shown.path, score: shown.score, via: shown.via } : null,
+        remainingCandidates: liveCandidates(m).map((c) => ({ path: c.path, score: c.score, via: c.via })),
+        ...extra,
+      },
+    });
+  };
+
   const confirmMatch = (m: EntryMatch) => {
     const shown = shownCandidate(m);
-    if (shown) setOverride(m.entry.videoId, shown.path);
+    if (shown) {
+      setOverride(m.entry.videoId, shown.path);
+      logDecision("Confirmed", m);
+    }
   };
 
   /** Rejects the candidate on screen. The next best takes its place; when
@@ -376,6 +415,7 @@ export function YtMusicImportPage({
     const shown = shownCandidate(m);
     if (!shown) return;
     const id = m.entry.videoId;
+    logDecision("Denied", m, { deniedPath: shown.path });
     setDenied((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), shown.path] }));
     setCandIndex((prev) => ({ ...prev, [id]: 0 }));
     setOverrides((prev) => {
@@ -390,7 +430,10 @@ export function YtMusicImportPage({
     });
   };
 
-  const skipEntry = (m: EntryMatch) => setOverride(m.entry.videoId, "");
+  const skipEntry = (m: EntryMatch) => {
+    setOverride(m.entry.videoId, "");
+    logDecision("Marked missing", m);
+  };
 
   const cycleCandidate = (m: EntryMatch, delta: number) => {
     const live = liveCandidates(m);
@@ -407,6 +450,10 @@ export function YtMusicImportPage({
       delete nextOv[id];
       return nextOv;
     });
+    logDecision(delta > 0 ? "Next candidate" : "Previous candidate", m, {
+      shownIndex: next + 1,
+      of: live.length,
+    });
   };
 
   const resetEntry = (m: EntryMatch) => {
@@ -416,6 +463,7 @@ export function YtMusicImportPage({
       delete next[id];
       return next;
     };
+    logDecision("Reset to automatic match", m);
     setOverrides(drop);
     setDenied(drop);
     setCandIndex(drop);
@@ -488,9 +536,21 @@ export function YtMusicImportPage({
   const rematch = () => {
     if (!playlist) return;
     setRematching(true);
+    const started = Date.now();
     try {
-      setMatches(matchPlaylist(playlist.entries, files, tags));
-      notify(`Re-matched against ${files.length} track(s) — your decisions were kept`, "success");
+      const next = matchPlaylist(playlist.entries, files, tags);
+      setMatches(next);
+      const byStatus = { matched: 0, ambiguous: 0, missing: 0 };
+      for (const m of next) byStatus[m.status]++;
+      notify(`Re-matched against ${files.length} track(s) — your decisions were kept`, "success", {
+        details: {
+          trackCount: files.length,
+          rematchMs: Date.now() - started,
+          matcherStatus: byStatus,
+          confidentThreshold: CONFIDENT_THRESHOLD,
+          ambiguousThreshold: AMBIGUOUS_THRESHOLD,
+        },
+      });
     } finally {
       setRematching(false);
     }
@@ -504,10 +564,19 @@ export function YtMusicImportPage({
   };
 
   // --- Clipboard / export ---------------------------------------------------
+  /** The missing list as plain data, for logging/reporting — not just a count. */
+  const missingListDetails = () =>
+    missingList.map(({ m }) => {
+      const w = buildWanted(m.entry);
+      return { title: w.title, artist: w.artist, url: m.entry.url, videoId: m.entry.videoId };
+    });
+
   const copyMissingLinks = async () => {
     if (!missingList.length) return;
     await navigator.clipboard.writeText(missingList.map(({ m }) => m.entry.url).join("\n"));
-    notify(`Copied ${missingList.length} link(s) to the clipboard`, "success");
+    notify(`Copied ${missingList.length} link(s) to the clipboard`, "success", {
+      details: missingListDetails(),
+    });
   };
 
   const copyMissingTitles = async () => {
@@ -519,7 +588,9 @@ export function YtMusicImportPage({
       })
       .join("\n");
     await navigator.clipboard.writeText(text);
-    notify(`Copied ${missingList.length} title(s) to the clipboard`, "success");
+    notify(`Copied ${missingList.length} title(s) to the clipboard`, "success", {
+      details: missingListDetails(),
+    });
   };
 
   const decisionState = (): DecisionState => ({ overrides, denied, fromSearch });
@@ -1010,7 +1081,16 @@ export function YtMusicImportPage({
               return;
             }
             assignFromSearch(focusedId, p);
-            notify(`Matched to ${flatLabel(p)}`, "success");
+            const row = matches?.find((m) => m.entry.videoId === focusedId);
+            notify(`Matched to ${flatLabel(p)}`, "success", {
+              details: {
+                action: "Matched by hand search",
+                row: row ? row.entry.index + 1 : null,
+                videoId: focusedId,
+                wantedTitle: row?.entry.title,
+                path: p,
+              },
+            });
           }}
         />
       )}

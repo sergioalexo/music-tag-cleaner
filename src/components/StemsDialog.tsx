@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -37,7 +38,7 @@ export function StemsDialog({
   options: StemOptions;
   onSaveOptions: (options: StemOptions) => void;
   onClose: () => void;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
 }) {
   const [opts, setOpts] = useState<StemOptions>(initial);
   const [running, setRunning] = useState(false);

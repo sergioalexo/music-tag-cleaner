@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Copy, Loader2, Trash2 } from "lucide-react";
 import type { AudioFile, DuplicateGroup, TagData } from "../types";
@@ -72,7 +73,7 @@ export function DuplicatesPage({
 }: {
   files: AudioFile[];
   tags: Record<string, TagData>;
-  notify: (message: string, kind?: "success" | "error" | "info") => void;
+  notify: Notify;
   onDelete: (paths: string[]) => Promise<boolean>;
   onInspect: (path: string) => void;
 }) {
