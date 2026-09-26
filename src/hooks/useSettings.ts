@@ -4,7 +4,7 @@ import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 9;
+export const CURRENT_SETTINGS_VERSION = 10;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -41,6 +41,7 @@ export const DEFAULT_SETTINGS: Settings = {
   sidebarCollapsed: false,
   replacements: DEFAULT_REPLACEMENTS,
   capitalization: "asis",
+  casingExceptions: [],
   highlightSymbols: false,
   flagExtraChars: DEFAULT_FLAG_EXTRA_CHARS,
   fieldNaming: "friendly",
@@ -77,7 +78,9 @@ const STORE_FILE = "settings.json";
  * v8 retires the stored genre presets: the genre vocabulary is now derived
  * from the indexed library, so a remembered list can no longer drift from
  * the files. v9 adds Demucs stem-separation defaults (`stemOptions`), filled
- * in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge.
+ * in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge. v10 adds
+ * `casingExceptions` (user-defined tokens Capitalize/Title Case always
+ * renders as-typed), same merge-fills-it-in bump.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };

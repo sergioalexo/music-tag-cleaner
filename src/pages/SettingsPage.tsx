@@ -392,6 +392,7 @@ export function SettingsPage({
   const [recordingShortcut, setRecordingShortcut] = useState<string | null>(null);
   const [rbImporting, setRbImporting] = useState(false);
   const [rbProgress, setRbProgress] = useState<{ done: number; total: number } | null>(null);
+  const [casingExceptionDraft, setCasingExceptionDraft] = useState("");
 
   const exportSettings = async () => {
     const dest = await save({
@@ -508,6 +509,19 @@ export function SettingsPage({
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     onSave({ ...settings, [key]: value });
+
+  const addCasingException = () => {
+    const value = casingExceptionDraft.trim();
+    if (!value) return;
+    // Case-insensitive de-dupe: re-adding "ac/dc" after "AC/DC" replaces the
+    // stored casing rather than piling up a second, shadowed entry.
+    const without = settings.casingExceptions.filter((e) => e.toLowerCase() !== value.toLowerCase());
+    set("casingExceptions", [...without, value]);
+    setCasingExceptionDraft("");
+  };
+
+  const removeCasingException = (value: string) =>
+    set("casingExceptions", settings.casingExceptions.filter((e) => e !== value));
 
   /**
    * Probes the Claude CLI. This costs a real (tiny) round trip because
@@ -1007,6 +1021,43 @@ export function SettingsPage({
                   {o.label}
                 </button>
               ))}
+            </div>
+          </Row>
+
+          <Row
+            label="Casing exceptions"
+            hint='Tokens Capitalize/Title Case always renders exactly as typed here, whatever case they appear in — "AC/DC", "feat.", "McFly"'
+          >
+            <div className="flex w-full flex-col gap-2">
+              <div className="flex gap-2">
+                <input
+                  className={cn(inputClass, "w-40")}
+                  placeholder="e.g. AC/DC"
+                  value={casingExceptionDraft}
+                  onChange={(e) => setCasingExceptionDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addCasingException()}
+                />
+                <Button variant="secondary" size="sm" onClick={addCasingException}>
+                  <Plus />
+                  Add
+                </Button>
+              </div>
+              {settings.casingExceptions.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {settings.casingExceptions.map((exc) => (
+                    <Badge key={exc} className="gap-1 bg-secondary font-mono">
+                      {exc}
+                      <button
+                        onClick={() => removeCasingException(exc)}
+                        className="text-muted-foreground hover:text-destructive"
+                        title={`Remove "${exc}"`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              )}
             </div>
           </Row>
 

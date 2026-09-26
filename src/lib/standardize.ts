@@ -58,23 +58,61 @@ export function removeCharsFrom(value: string, chars: string): string {
   return collapseSpaces(out);
 }
 
-export function applyCapitalization(value: string, mode: Capitalization): string {
-  switch (mode) {
-    case "upper":
-      return value.toUpperCase();
-    case "lower":
-      return value.toLowerCase();
-    case "title":
-      return toTitleCase(value);
-    case "sentence": {
-      const lower = value.toLowerCase();
-      const idx = lower.search(/\p{L}/u);
-      if (idx === -1) return lower;
-      return lower.slice(0, idx) + lower[idx].toUpperCase() + lower.slice(idx + 1);
-    }
-    default:
-      return value;
+/**
+ * Re-stamps any user-defined "casing exception" token — a name or acronym
+ * that should always render exactly as the user typed it in Settings,
+ * regardless of what capitalization mode did to it ("AC/DC", "feat.",
+ * "McFly", …) — over whatever `applyCapitalization` produced.
+ *
+ * Applied as a final corrective pass rather than protecting these tokens
+ * during recasing: it doesn't matter what intermediate casing a mode
+ * produced for the token's letters, since this stomps it with the exact
+ * stored text regardless. That sidesteps the mismatch between
+ * `toTitleCase`'s per-letter-run word matching (which would split
+ * "AC/DC" into separate "AC" and "DC" tokens around the slash) and an
+ * exception that itself contains punctuation — matching the whole phrase
+ * case-insensitively, word-boundary to word-boundary, works for both a
+ * bare word like "McFly" and a punctuated one like "AC/DC" or "feat."
+ * the same way.
+ */
+export function applyCasingExceptions(value: string, exceptions: string[]): string {
+  let out = value;
+  for (const exception of exceptions) {
+    const trimmed = exception.trim();
+    if (!trimmed) continue;
+    const pattern = new RegExp(
+      `(?<![\\p{L}\\p{N}])${escapeRegExp(trimmed)}(?![\\p{L}\\p{N}])`,
+      "giu",
+    );
+    out = out.replace(pattern, trimmed);
   }
+  return out;
+}
+
+export function applyCapitalization(
+  value: string,
+  mode: Capitalization,
+  exceptions: string[] = [],
+): string {
+  const base = (() => {
+    switch (mode) {
+      case "upper":
+        return value.toUpperCase();
+      case "lower":
+        return value.toLowerCase();
+      case "title":
+        return toTitleCase(value);
+      case "sentence": {
+        const lower = value.toLowerCase();
+        const idx = lower.search(/\p{L}/u);
+        if (idx === -1) return lower;
+        return lower.slice(0, idx) + lower[idx].toUpperCase() + lower.slice(idx + 1);
+      }
+      default:
+        return value;
+    }
+  })();
+  return exceptions.length ? applyCasingExceptions(base, exceptions) : base;
 }
 
 /**

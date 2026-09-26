@@ -25,11 +25,13 @@ first letter of every word** — no small‑word rule. Also:
 
 The Settings tooltip for `Aa` is now "Capitalize Each Word".
 
-**Known limitations** (candidates for a future "casing exceptions" setting):
-- lowercase initialisms can't be detected — `dj snake` → `Dj Snake`
-- Irish/Scots names — `O'Brien` → `O'brien`, `McFly` → `Mcfly`
-- a value that is *only* `AC/DC` or `MGMT` is treated as shouting → `Ac/Dc`, `Mgmt`
-- `feat.` / `ft.` are capitalized like any other word
+**Known limitations** — lowercase initialisms can't be detected
+(`dj snake` → `Dj Snake`), Irish/Scots names lose their internal capital
+(`O'Brien` → `O'brien`, `McFly` → `Mcfly`), a value that is *only* `AC/DC`
+or `MGMT` is treated as shouting (→ `Ac/Dc`, `Mgmt`), and `feat.`/`ft.` are
+capitalized like any other word. The backlog's "casing exceptions" setting
+(item 52 area, done 2026-09-26 — see its entry further down) is the fix:
+add the exact spelling once in Settings and it always renders that way.
 
 ### 2. Editing a field cleared the row selection
 Double‑clicking a cell to edit fired the row's `click` handler first, which
@@ -2048,8 +2050,15 @@ must never lock someone out of editing their own files.
   modes incl. Roman numerals/initialisms/shouting, weird-char flagging,
   both filename sanitizers incl. Cyrillic, rename-stem building, track-id
   helpers). Table selection logic still has no automated tests.
-- Capitalization "casing exceptions" — a user-editable list of protected
-  tokens (`AC/DC`, `feat.`, `McFly`, …) to override the default recasing.
+- ~~Capitalization "casing exceptions"~~ — done 2026-09-26:
+  `applyCasingExceptions()` (`standardize.ts`) re-stamps each user-defined
+  token over whatever a capitalization mode produced, matched case-
+  insensitively at a word boundary as a whole phrase (handles a punctuated
+  exception like `AC/DC` or `feat.` the same as a bare word like `McFly` —
+  `toTitleCase`'s own per-letter-run word matching would otherwise split
+  `AC/DC` into separate `AC`/`DC` tokens around the slash). New
+  `settings.casingExceptions: string[]` (settings v10), editable as a chip
+  list on Settings → Standardize under "Casing exceptions".
 - `settings.columnWidths` accumulates an `extra:<key>` entry for every raw
   field ever resized and never prunes them — harmless but untidy.
 - ~~The `file_cache` sqlite table has no algorithm-version stamp~~ — done

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CharReplacement, TagData } from "../types";
 import {
   applyCapitalization,
+  applyCasingExceptions,
   applyReplacements,
   buildRenameStem,
   buildTrackIdMigrationPreview,
@@ -133,6 +134,46 @@ describe("applyCapitalization", () => {
     it("recases a lowercase or mixed-case word normally", () => {
       expect(applyCapitalization("rIVERS", "title")).toBe("Rivers");
     });
+
+    it("stamps a casing exception over the default recasing, including one containing punctuation", () => {
+      expect(applyCapitalization("ac/dc live", "title", ["AC/DC"])).toBe("AC/DC Live");
+      expect(applyCapitalization("mcfly live", "title", ["McFly"])).toBe("McFly Live");
+    });
+  });
+
+  it("applies casing exceptions under every mode, not just 'title' — overriding what the mode itself produced", () => {
+    // "upper" would otherwise shout "FEAT." — the exception un-shouts it.
+    expect(applyCapitalization("live feat. someone", "upper", ["feat."])).toBe("LIVE feat. SOMEONE");
+    // "lower" would otherwise flatten "AC/DC" to "ac/dc".
+    expect(applyCapitalization("AC/DC live", "lower", ["AC/DC"])).toBe("AC/DC live");
+  });
+});
+
+describe("applyCasingExceptions", () => {
+  it("replaces a case-insensitive match with the exception's exact stored casing", () => {
+    expect(applyCasingExceptions("Ac/Dc is loud", ["AC/DC"])).toBe("AC/DC is loud");
+  });
+
+  it("matches a punctuated exception as one phrase, not per letter-run word", () => {
+    expect(applyCasingExceptions("Song FEAT. Someone", ["feat."])).toBe("Song feat. Someone");
+  });
+
+  it("only matches at a word boundary — a substring inside a longer word is untouched", () => {
+    expect(applyCasingExceptions("Mcflyer is unrelated", ["McFly"])).toBe("Mcflyer is unrelated");
+  });
+
+  it("applies every exception in the list", () => {
+    expect(applyCasingExceptions("ac/dc feat. mcfly", ["AC/DC", "feat.", "McFly"])).toBe(
+      "AC/DC feat. McFly",
+    );
+  });
+
+  it("ignores a blank exception rather than matching everything", () => {
+    expect(applyCasingExceptions("Some Title", ["", "   "])).toBe("Some Title");
+  });
+
+  it("leaves the value unchanged when nothing matches", () => {
+    expect(applyCasingExceptions("Nothing here", ["AC/DC"])).toBe("Nothing here");
   });
 });
 

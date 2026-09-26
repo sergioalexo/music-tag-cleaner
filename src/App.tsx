@@ -534,7 +534,7 @@ export default function App() {
     void save({ ...settings, capitalization: mode });
     runStandardize(
       "standardize",
-      (value) => applyCapitalization(value, mode),
+      (value) => applyCapitalization(value, mode, settingsRef.current.casingExceptions),
       "Nothing to change with this capitalization",
     );
   };

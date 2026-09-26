@@ -264,6 +264,9 @@ export interface Settings {
   /** Character replacement rules for the Standardize action. */
   replacements: CharReplacement[];
   capitalization: Capitalization;
+  /** Tokens ("AC/DC", "feat.", "McFly", …) that Capitalize/Title Case always
+   * renders exactly as stored here, overriding its default recasing. */
+  casingExceptions: string[];
   /** Highlight non-standard symbols in Title/Artist cells in the table. */
   highlightSymbols: boolean;
   /** Characters always flagged in Title/Artist, on top of the built-in rule. */
