@@ -2047,12 +2047,13 @@ must never lock someone out of editing their own files.
   tokens (`AC/DC`, `feat.`, `McFly`, …) to override the default recasing.
 - `settings.columnWidths` accumulates an `extra:<key>` entry for every raw
   field ever resized and never prunes them — harmless but untidy.
-- The `file_cache` sqlite table (duplicate detection, item 31/34) has no
-  algorithm-version stamp — if `fingerprint_config()` or the waveform bucket
-  count ever changes again, old cached rows would silently compare against
-  new ones as if they were the same algorithm. Add an `algo_version INTEGER`
-  column, bump a constant whenever the algorithm changes, and treat a
-  version mismatch as a cache miss.
+- ~~The `file_cache` sqlite table has no algorithm-version stamp~~ — done
+  2026-09-26: `algo_version INTEGER` column (`duplicates.rs`), an
+  `ALGO_VERSION` constant to bump whenever `fingerprint_config()` or
+  `WAVEFORM_BUCKETS` changes, `open_db` migrates an existing database via
+  `ALTER TABLE` (ignoring the "already has this column" error), and a row
+  whose `algo_version` doesn't match is treated as a cache miss for both
+  the fingerprint and the waveform.
 - A genuine duplicate that fragments into several matching segments (re-
   encoding artifacts, minor structural drift) under-classifies as
   "alternate version" rather than "duplicate", because `classify_pair` only

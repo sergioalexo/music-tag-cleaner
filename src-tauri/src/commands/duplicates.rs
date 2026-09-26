@@ -81,12 +81,27 @@ const FILE_CACHE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS file_cache (
     fingerprint TEXT,
     duration_secs REAL,
     sample_rate INTEGER,
-    waveform_peaks TEXT
+    waveform_peaks TEXT,
+    algo_version INTEGER
 );";
+
+/// Bump whenever `fingerprint_config()` or `WAVEFORM_BUCKETS` changes. A
+/// cached row is only trusted when its `algo_version` matches this constant
+/// (see `get_or_compute`/`get_or_compute_waveform`), so an algorithm change
+/// invalidates existing cached fingerprints/waveforms instead of silently
+/// comparing them against ones computed a different way — no manual
+/// cache-clear step needed.
+const ALGO_VERSION: i64 = 1;
 
 pub(crate) fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
     conn.execute_batch(FILE_CACHE_SCHEMA_SQL).map_err(|e| e.to_string())?;
+    // `algo_version` was added after the original schema shipped — a fresh
+    // database gets it from FILE_CACHE_SCHEMA_SQL above, but an existing
+    // one predates the column. SQLite has no "ADD COLUMN IF NOT EXISTS", so
+    // the "duplicate column name" error from a database that already has it
+    // is simply ignored.
+    let _ = conn.execute("ALTER TABLE file_cache ADD COLUMN algo_version INTEGER", []);
     Ok(conn)
 }
 
@@ -225,24 +240,29 @@ fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<V
 pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
     let (mtime, size) = file_stat(Path::new(path))?;
 
-    let cached: Option<(Option<String>, Option<String>, Option<f64>, Option<u32>)> = conn
+    let cached: Option<(Option<String>, Option<String>, Option<f64>, Option<u32>, Option<i64>)> = conn
         .query_row(
-            "SELECT blake3_hash, fingerprint, duration_secs, sample_rate FROM file_cache
+            "SELECT blake3_hash, fingerprint, duration_secs, sample_rate, algo_version FROM file_cache
              WHERE path = ?1 AND mtime = ?2 AND size = ?3",
             params![path, mtime, size],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    // All four columns must be present — a row that only has a cached
-    // waveform (F3, computed independently) doesn't count as a fingerprint hit.
-    if let Some((Some(blake3), Some(fp_str), Some(duration_secs), Some(sample_rate))) = cached {
-        return Ok(CachedFingerprint {
-            blake3,
-            fingerprint: fp_str.split(',').filter_map(|s| s.parse().ok()).collect(),
-            duration_secs,
-            sample_rate,
-        });
+    // All four fingerprint columns must be present — a row that only has a
+    // cached waveform (F3, computed independently) doesn't count as a
+    // fingerprint hit — and `algo_version` must match this build's, or a
+    // fingerprint computed under a since-changed `fingerprint_config()`
+    // would be returned as if it were still comparable to a fresh one.
+    if let Some((Some(blake3), Some(fp_str), Some(duration_secs), Some(sample_rate), Some(v))) = cached {
+        if v == ALGO_VERSION {
+            return Ok(CachedFingerprint {
+                blake3,
+                fingerprint: fp_str.split(',').filter_map(|s| s.parse().ok()).collect(),
+                duration_secs,
+                sample_rate,
+            });
+        }
     }
 
     let blake3 = compute_blake3(Path::new(path))?;
@@ -257,17 +277,19 @@ pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFing
     // carried forward under the new mtime/size stamp, or a future waveform
     // read would silently return stale data for the changed file.
     conn.execute(
-        "INSERT INTO file_cache (path, mtime, size, blake3_hash, fingerprint, duration_secs, sample_rate)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO file_cache (path, mtime, size, blake3_hash, fingerprint, duration_secs, sample_rate, algo_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime, size = excluded.size,
             blake3_hash = excluded.blake3_hash, fingerprint = excluded.fingerprint,
             duration_secs = excluded.duration_secs, sample_rate = excluded.sample_rate,
+            algo_version = excluded.algo_version,
             waveform_peaks = CASE
                 WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                     AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.waveform_peaks ELSE NULL
             END",
-        params![path, mtime, size, blake3, fp_str, duration_secs, sample_rate],
+        params![path, mtime, size, blake3, fp_str, duration_secs, sample_rate, ALGO_VERSION],
     )
     .map_err(|e| e.to_string())?;
 
@@ -309,18 +331,20 @@ fn compute_waveform_peaks(pcm: &[i16], channels: u32) -> Vec<f32> {
 fn get_or_compute_waveform(conn: &Connection, path: &str) -> Result<Vec<f32>, String> {
     let (mtime, size) = file_stat(Path::new(path))?;
 
-    let cached: Option<Option<String>> = conn
+    let cached: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
-            "SELECT waveform_peaks FROM file_cache WHERE path = ?1 AND mtime = ?2 AND size = ?3",
+            "SELECT waveform_peaks, algo_version FROM file_cache WHERE path = ?1 AND mtime = ?2 AND size = ?3",
             params![path, mtime, size],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some(Some(peaks_str)) = cached {
-        let peaks: Vec<f32> = peaks_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if !peaks.is_empty() {
-            return Ok(peaks);
+    if let Some((Some(peaks_str), Some(v))) = cached {
+        if v == ALGO_VERSION {
+            let peaks: Vec<f32> = peaks_str.split(',').filter_map(|s| s.parse().ok()).collect();
+            if !peaks.is_empty() {
+                return Ok(peaks);
+            }
         }
     }
 
@@ -332,27 +356,32 @@ fn get_or_compute_waveform(conn: &Connection, path: &str) -> Result<Vec<f32>, St
     // carry the existing fingerprint columns forward if mtime/size (the
     // file's content) haven't changed since they were cached.
     conn.execute(
-        "INSERT INTO file_cache (path, mtime, size, waveform_peaks)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO file_cache (path, mtime, size, waveform_peaks, algo_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime, size = excluded.size, waveform_peaks = excluded.waveform_peaks,
+            algo_version = excluded.algo_version,
             blake3_hash = CASE
                 WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                     AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.blake3_hash ELSE NULL
             END,
             fingerprint = CASE
                 WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                     AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.fingerprint ELSE NULL
             END,
             duration_secs = CASE
                 WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                     AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.duration_secs ELSE NULL
             END,
             sample_rate = CASE
                 WHEN file_cache.mtime = excluded.mtime AND file_cache.size = excluded.size
+                     AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.sample_rate ELSE NULL
             END",
-        params![path, mtime, size, peaks_str],
+        params![path, mtime, size, peaks_str, ALGO_VERSION],
     )
     .map_err(|e| e.to_string())?;
 
@@ -852,6 +881,71 @@ mod tests {
         for (a, b) in peaks.iter().zip(peaks_again.iter()) {
             assert!((a - b).abs() < 0.001, "peak drifted too far after a cache round-trip: {a} vs {b}");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_row_from_a_different_algo_version_is_treated_as_a_cache_miss() {
+        let dir = scratch_dir("algo-version-mismatch");
+        let path = dir.join("tone.wav");
+        let sr = 44_100;
+        write_wav(&path, &sine_pcm(440.0, sr, 3.0), sr);
+        let path_str = path.to_str().unwrap();
+
+        let conn = Connection::open(dir.join("cache.sqlite")).unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
+
+        let first = get_or_compute(&conn, path_str).unwrap();
+        let first_peaks = get_or_compute_waveform(&conn, path_str).unwrap();
+
+        // Simulate a row left behind by an older build, before an algorithm
+        // change bumped ALGO_VERSION — same mtime/size, stale version.
+        conn.execute("UPDATE file_cache SET algo_version = -1 WHERE path = ?1", params![path_str])
+            .unwrap();
+
+        // Both must recompute rather than trust the stale row, and the
+        // recompute must restamp the row with the current ALGO_VERSION so a
+        // third call hits the cache again instead of recomputing forever.
+        let refreshed = get_or_compute(&conn, path_str).unwrap();
+        assert_eq!(first.fingerprint, refreshed.fingerprint, "same audio, so the recomputed value matches");
+        let refreshed_peaks = get_or_compute_waveform(&conn, path_str).unwrap();
+        assert_eq!(first_peaks.len(), refreshed_peaks.len());
+
+        let version: i64 =
+            conn.query_row("SELECT algo_version FROM file_cache WHERE path = ?1", params![path_str], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, ALGO_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_algo_version_migration_is_idempotent_on_a_pre_migration_database() {
+        let dir = scratch_dir("pre-migration-db");
+        let db_path = dir.join("cache.sqlite");
+
+        // A database created before `algo_version` existed in the schema —
+        // what `open_db`'s ALTER TABLE has to cope with on a real user's
+        // existing database (it can't call `open_db` itself here, which
+        // needs a live `AppHandle`, so this exercises the same migration
+        // statement it runs).
+        let legacy_schema = "CREATE TABLE IF NOT EXISTS file_cache (
+            path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, size INTEGER NOT NULL,
+            blake3_hash TEXT, fingerprint TEXT, duration_secs REAL, sample_rate INTEGER,
+            waveform_peaks TEXT
+        );";
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(legacy_schema).unwrap();
+
+        // First run adds the column; a second run (a schema that already has
+        // it, same as `open_db` running against an up-to-date database)
+        // must not error even though SQLite has no "IF NOT EXISTS" for this.
+        conn.execute("ALTER TABLE file_cache ADD COLUMN algo_version INTEGER", []).unwrap();
+        let _ = conn.execute("ALTER TABLE file_cache ADD COLUMN algo_version INTEGER", []);
+
+        conn.execute("INSERT INTO file_cache (path, mtime, size, algo_version) VALUES ('x', 1, 1, 1)", [])
+            .unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
     }
