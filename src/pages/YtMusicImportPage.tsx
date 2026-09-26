@@ -8,9 +8,8 @@ import {
   AlertTriangle,
   Ban,
   Check,
-  ChevronLeft,
-  ChevronRight,
   ClipboardCopy,
+  Database,
   Download,
   ExternalLink,
   FileJson,
@@ -46,7 +45,7 @@ import {
 import { buildMatchLog, matchLogToMarkdown, type DecisionState } from "../lib/ytMatchLog";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
 import { Button, Card, CardHeader, cn } from "../components/ui";
-import { LibrarySearchPanel } from "../components/LibrarySearchPanel";
+import { LibrarySearchPanel, type RowVariants } from "../components/LibrarySearchPanel";
 
 function sanitizeFilenamePart(s: string): string {
   return s.replace(/[\\/:*?"<>|]+/g, " ").trim() || "playlist";
@@ -123,6 +122,9 @@ export function YtMusicImportPage({
   indexedCount,
   notify,
   onInspect,
+  indexing,
+  lastIndexedAt,
+  onIndexNow,
 }: {
   /** The whole collection: indexed tracks plus this session's loaded files. */
   files: AudioFile[];
@@ -131,6 +133,11 @@ export function YtMusicImportPage({
   indexedCount: number;
   notify: Notify;
   onInspect: (path: string) => void;
+  /** Whether a whole-library index run is currently in progress. */
+  indexing: boolean;
+  lastIndexedAt?: number | null;
+  /** Kicks off (or re-runs) the whole-library index by hand. */
+  onIndexNow: () => void;
 }) {
   const [ytdlp, setYtdlp] = useState<YtDlpInfo | null>(null);
   const [checkingYtdlp, setCheckingYtdlp] = useState(true);
@@ -237,6 +244,46 @@ export function YtMusicImportPage({
     }
     setMatches(matchPlaylist(playlist.entries, files, tags));
   }, [playlist, files, tags]);
+
+  /**
+   * Fills in channel names for a playlist restored from a saved session.
+   *
+   * Sessions saved before channel-name reading shipped (or a `music.
+   * youtube.com` fetch that happened not to include it for some entries)
+   * leave rows showing "Unknown artist" forever, since nothing else ever
+   * re-fetches the playlist. This does that quietly, once, whenever a
+   * restored/resumed playlist has entries with no artist and no uploader —
+   * decisions already made are untouched, only the missing metadata is
+   * filled in.
+   */
+  const reconciledUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!playlist || !fetchedUrl) return;
+    const needsChannel = playlist.entries.some((e) => !e.artist?.trim() && !e.uploader?.trim());
+    if (!needsChannel || reconciledUrlRef.current === fetchedUrl) return;
+    reconciledUrlRef.current = fetchedUrl;
+    void (async () => {
+      try {
+        const fresh = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: fetchedUrl });
+        const byId = new Map(fresh.entries.map((e) => [e.videoId, e]));
+        let filled = 0;
+        const merged = playlist.entries.map((e) => {
+          if (e.artist?.trim() || e.uploader?.trim()) return e;
+          const f = byId.get(e.videoId);
+          if (!f || (!f.artist?.trim() && !f.uploader?.trim())) return e;
+          filled++;
+          return { ...e, artist: f.artist, uploader: f.uploader };
+        });
+        if (filled > 0) {
+          setPlaylist((prev) => (prev ? { ...prev, entries: merged } : prev));
+          notify(`Filled in the YouTube channel name for ${filled} track(s)`, "info", { silent: true });
+        }
+      } catch {
+        // Best-effort — a saved session still works fine without this, it
+        // just keeps showing "Unknown artist" for whichever rows it is.
+      }
+    })();
+  }, [playlist, fetchedUrl, notify]);
 
   const refreshYtdlp = async () => {
     setCheckingYtdlp(true);
@@ -372,6 +419,22 @@ export function YtMusicImportPage({
   const matchedList = resolved.filter((r): r is { m: EntryMatch; path: string } => !!r.path);
   const missingList = resolved.filter((r) => !r.path);
 
+  /**
+   * The focused row's other matcher-found candidates, for the "Other
+   * versions" list in the search dock — this replaced the row's own cycling
+   * arrows, so a track with several mixes/remixes still has somewhere to
+   * pick the right one from.
+   */
+  const focusedVariants: RowVariants | null = (() => {
+    if (!focusedId || !matches) return null;
+    const m = matches.find((mm) => mm.entry.videoId === focusedId);
+    if (!m) return null;
+    const shown = shownCandidate(m);
+    const rest = liveCandidates(m).filter((c) => c.path !== shown?.path);
+    if (!rest.length) return null;
+    return { videoId: focusedId, rowLabel: `row ${m.entry.index + 1}`, candidates: rest };
+  })();
+
   // --- Decision actions -----------------------------------------------------
   const setOverride = (videoId: string, path: string) =>
     setOverrides((prev) => ({ ...prev, [videoId]: path }));
@@ -401,17 +464,38 @@ export function YtMusicImportPage({
     });
   };
 
+  /**
+   * Jumps focus to the next row that still needs a decision — confirming,
+   * denying or marking a row missing moves straight on to the next one that
+   * isn't resolved yet, so working through a playlist is "keep clicking"
+   * without having to find the next row by hand. Wraps around, and does
+   * nothing if everything is already settled.
+   */
+  const advanceFocus = (afterId: string) => {
+    if (!matches?.length) return;
+    const startIdx = matches.findIndex((m) => m.entry.videoId === afterId);
+    for (let step = 1; step <= matches.length; step++) {
+      const m = matches[(startIdx + step + matches.length) % matches.length];
+      if (effectiveStatus(m) !== "matched") {
+        setFocusedId(m.entry.videoId);
+        return;
+      }
+    }
+  };
+
   const confirmMatch = (m: EntryMatch) => {
     const shown = shownCandidate(m);
     if (shown) {
       setOverride(m.entry.videoId, shown.path);
       logDecision("Confirmed", m);
+      advanceFocus(m.entry.videoId);
     }
   };
 
   /** Rejects the candidate on screen. The next best takes its place; when
    * none is left the entry falls through to "missing", which is how the
-   * deny button doubles as "this isn't in my collection". */
+   * deny button doubles as "this isn't in my collection". Either way,
+   * focus moves on to the next row that needs a decision. */
   const denyMatch = (m: EntryMatch) => {
     const shown = shownCandidate(m);
     if (!shown) return;
@@ -429,32 +513,36 @@ export function YtMusicImportPage({
       delete next[id];
       return next;
     });
+    advanceFocus(id);
   };
 
-  const skipEntry = (m: EntryMatch) => {
-    setOverride(m.entry.videoId, "");
-    logDecision("Marked missing", m);
-  };
-
-  const cycleCandidate = (m: EntryMatch, delta: number) => {
-    const live = liveCandidates(m);
-    if (live.length < 2) return;
+  /** Denies one specific candidate — used by the "Other versions" list in
+   * the search dock, where the candidate on offer isn't necessarily the one
+   * currently shown on the row. */
+  const denyCandidatePath = (m: EntryMatch, path: string) => {
     const id = m.entry.videoId;
-    const current = Math.min(candIndex[id] ?? 0, live.length - 1);
-    const next = (current + delta + live.length) % live.length;
-    setCandIndex((prev) => ({ ...prev, [id]: next }));
-    // Stepping to an alternate is an explicit choice, so it replaces any
-    // auto-acceptance — but it still needs confirming, exactly like an
-    // ambiguous suggestion does.
-    setOverrides((prev) => {
-      const nextOv = { ...prev };
-      delete nextOv[id];
-      return nextOv;
-    });
-    logDecision(delta > 0 ? "Next candidate" : "Previous candidate", m, {
-      shownIndex: next + 1,
-      of: live.length,
-    });
+    setDenied((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), path] }));
+    logDecision("Denied", m, { deniedPath: path });
+  };
+
+  /** "I don't have it" — rejects every remaining candidate outright (not
+   * just the one on screen), so the row can never keep showing a
+   * suggestion after you've said you don't own it. */
+  const skipEntry = (m: EntryMatch) => {
+    const id = m.entry.videoId;
+    const allPaths = m.candidates.map((c) => c.path);
+    setDenied((prev) => ({ ...prev, [id]: [...new Set([...(prev[id] ?? []), ...allPaths])] }));
+    setOverride(id, "");
+    logDecision("Marked missing", m);
+    advanceFocus(id);
+  };
+
+  /** Picks one of the matcher's own alternate candidates for a row — the
+   * "Other versions" list in the search dock, replacing the old cycling
+   * arrows on the row itself. */
+  const chooseVariant = (m: EntryMatch, path: string) => {
+    setOverride(m.entry.videoId, path);
+    logDecision("Chose alternate version", m, { path });
   };
 
   const resetEntry = (m: EntryMatch) => {
@@ -679,6 +767,28 @@ export function YtMusicImportPage({
             Rekordbox playlist — matching against {files.length} track{files.length === 1 ? "" : "s"}
             {indexedCount > 0 ? ` (${indexedCount} from your library index)` : ""}
           </p>
+          <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+            <Database className="h-3 w-3" />
+            {indexing ? (
+              <span className="flex items-center gap-1">
+                <Loader2 className="h-3 w-3 animate-spin" /> Indexing your library…
+              </span>
+            ) : indexedCount > 0 ? (
+              <span>
+                Indexed once, always available — updated{" "}
+                {lastIndexedAt ? new Date(lastIndexedAt * 1000).toLocaleString() : "recently"}
+              </span>
+            ) : (
+              <span>Your library isn't indexed yet, so matching only sees files opened this session</span>
+            )}
+            <button
+              onClick={onIndexNow}
+              disabled={indexing}
+              className="text-primary hover:underline disabled:opacity-50"
+            >
+              {indexedCount > 0 ? "Re-index now" : "Index now"}
+            </button>
+          </div>
         </div>
 
         {!checkingYtdlp && !ytdlp?.installed && (
@@ -816,7 +926,6 @@ export function YtMusicImportPage({
                   const status = effectiveStatus(m);
                   const shown = shownCandidate(m);
                   const live = liveCandidates(m);
-                  const shownIndex = Math.min(candIndex[id] ?? 0, Math.max(0, live.length - 1));
                   const want = buildWanted(m.entry);
                   const displayPath = path ?? shown?.path ?? null;
                   const lib = displayPath ? trackLabel(displayPath) : null;
@@ -834,9 +943,16 @@ export function YtMusicImportPage({
                         {m.entry.index + 1}
                       </span>
 
-                      {/* What YouTube has — title on top, artist underneath. */}
+                      {/* What YouTube has — title on top, channel underneath.
+                          There's no reliable per-track artist from a flat
+                          playlist fetch, so the channel name is shown
+                          straight, not hidden behind "Unknown artist". */}
                       <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                        <YouTubePreview videoId={m.entry.videoId} url={m.entry.url} />
+                        <YouTubePreview
+                          videoId={m.entry.videoId}
+                          url={m.entry.url}
+                          durationSecs={m.entry.durationSecs}
+                        />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
                             <span className="truncate text-sm" title={m.entry.title}>
@@ -853,24 +969,8 @@ export function YtMusicImportPage({
                               <ExternalLink className="h-3 w-3" />
                             </button>
                           </div>
-                          <div
-                            className="truncate text-xs text-muted-foreground"
-                            title={
-                              want.artistSource === "channel"
-                                ? `${want.artist} — this is the uploading channel, not a confirmed artist`
-                                : want.artist ?? ""
-                            }
-                          >
-                            {want.artist ? (
-                              <>
-                                {want.artist}
-                                {want.artistSource === "channel" && (
-                                  <span className="ml-1 italic opacity-70">(channel)</span>
-                                )}
-                              </>
-                            ) : (
-                              "Unknown artist"
-                            )}
+                          <div className="truncate text-xs text-muted-foreground" title={m.entry.uploader ?? ""}>
+                            {m.entry.uploader || "No channel name from YouTube"}
                           </div>
                         </div>
                       </div>
@@ -880,7 +980,11 @@ export function YtMusicImportPage({
                       <div className="flex min-w-0 flex-1 items-center gap-2">
                         {displayPath && lib ? (
                           <>
-                            <AudioPreview path={displayPath} compact />
+                            <AudioPreview
+                              path={displayPath}
+                              durationSecs={fileByPath[displayPath]?.durationSecs}
+                              dense
+                            />
                             <button
                               className={cn(
                                 "min-w-0 flex-1 text-left",
@@ -909,106 +1013,70 @@ export function YtMusicImportPage({
 
                       {/*
                         Every slot below has a fixed width and is always
-                        rendered, empty or not. Buttons used to be conditionally
-                        rendered inline, so confirming/denying a match — which
-                        changes which buttons are visible — shifted the arrow
-                        buttons sideways, breaking "just keep clicking" without
-                        moving the mouse. A fixed slot per control keeps every
-                        button's position stable regardless of this row's state.
+                        rendered — a button that doesn't apply to the row's
+                        current state is disabled and dimmed rather than
+                        removed, so nothing here ever shifts sideways or pops
+                        in/out under the mouse.
                       */}
-                      <div className="flex w-44 shrink-0 items-center justify-end gap-1">
-                        <span className="flex w-16 shrink-0 items-center justify-end text-muted-foreground">
-                          {live.length > 1 && (
-                            <>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  cycleCandidate(m, -1);
-                                }}
-                                className="rounded p-0.5 hover:bg-accent hover:text-foreground"
-                                title="Previous candidate"
-                              >
-                                <ChevronLeft className="h-3.5 w-3.5" />
-                              </button>
-                              <span className="min-w-[2.2rem] text-center text-[10px] tabular-nums">
-                                {shownIndex + 1}/{live.length}
-                              </span>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  cycleCandidate(m, 1);
-                                }}
-                                className="rounded p-0.5 hover:bg-accent hover:text-foreground"
-                                title="Next candidate — other mixes and near-misses"
-                              >
-                                <ChevronRight className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          )}
+                      <div className="flex w-28 shrink-0 items-center justify-end gap-1">
+                        <span className="flex w-6 shrink-0 items-center justify-center">
+                          <button
+                            title="Confirm this match"
+                            disabled={!shown || !!path}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              confirmMatch(m);
+                            }}
+                            className="rounded-md border border-primary bg-primary/10 p-1 text-primary hover:bg-primary/20 disabled:pointer-events-none disabled:opacity-30"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                          </button>
                         </span>
 
                         <span className="flex w-6 shrink-0 items-center justify-center">
-                          {shown && !path && (
-                            <button
-                              title="Confirm this match"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                confirmMatch(m);
-                              }}
-                              className="rounded-md border border-primary bg-primary/10 p-1 text-primary hover:bg-primary/20"
-                            >
-                              <Check className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                          <button
+                            title={
+                              live.length > 1
+                                ? "Deny this match — the next candidate takes its place"
+                                : "Deny this match — nothing else fits, so it becomes Missing"
+                            }
+                            disabled={!shown}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              denyMatch(m);
+                            }}
+                            className="rounded-md border border-input p-1 text-muted-foreground hover:border-destructive hover:text-destructive disabled:pointer-events-none disabled:opacity-30"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
                         </span>
 
                         <span className="flex w-6 shrink-0 items-center justify-center">
-                          {shown && (
-                            <button
-                              title={
-                                live.length > 1
-                                  ? "Deny this match — show the next candidate instead"
-                                  : "Deny this match — nothing else fits, so it becomes Missing"
-                              }
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                denyMatch(m);
-                              }}
-                              className="rounded-md border border-input p-1 text-muted-foreground hover:border-destructive hover:text-destructive"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                          <button
+                            title="I don't have it — mark this row missing"
+                            disabled={overrides[id] === ""}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              skipEntry(m);
+                            }}
+                            className="rounded-md border border-input p-1 text-muted-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-30"
+                          >
+                            <Ban className="h-3.5 w-3.5" />
+                          </button>
                         </span>
 
                         <span className="flex w-6 shrink-0 items-center justify-center">
-                          {overrides[id] !== "" && (
-                            <button
-                              title="Mark as missing — I don't have this one"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                skipEntry(m);
-                              }}
-                              className="rounded-md border border-input p-1 text-muted-foreground hover:bg-accent"
-                            >
-                              <Ban className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </span>
-
-                        <span className="flex w-6 shrink-0 items-center justify-center">
-                          {touched(id) && (
-                            <button
-                              title="Reset to the automatic match"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                resetEntry(m);
-                              }}
-                              className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                            >
-                              <RotateCcw className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                          <button
+                            title="Reset to the automatic match"
+                            disabled={!touched(id)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              resetEntry(m);
+                            }}
+                            className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                          </button>
                         </span>
                       </div>
                     </div>
@@ -1077,6 +1145,7 @@ export function YtMusicImportPage({
           height={panelHeight}
           collapsed={panelCollapsed}
           label={trackLabel}
+          variants={focusedVariants}
           onHeightChange={setPanelHeight}
           onCollapsedChange={setPanelCollapsed}
           onPick={(p) => {
@@ -1095,6 +1164,14 @@ export function YtMusicImportPage({
                 path: p,
               },
             });
+          }}
+          onPickVariant={(p) => {
+            const row = matches?.find((m) => m.entry.videoId === focusedId);
+            if (row) chooseVariant(row, p);
+          }}
+          onDenyVariant={(p) => {
+            const row = matches?.find((m) => m.entry.videoId === focusedId);
+            if (row) denyCandidatePath(row, p);
           }}
         />
       )}

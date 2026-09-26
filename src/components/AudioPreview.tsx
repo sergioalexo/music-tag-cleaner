@@ -35,48 +35,58 @@ export function formatDuration(seconds: number): string {
 /**
  * Inline prelisten: play/pause plus a scrub bar to rewind through the track.
  *
- * `compact` drops the scrub bar and the duration readout, leaving just the
- * round play button — for lists (the YouTube-import matcher, the library
- * search panel) where the row is already dense and the only question being
- * asked is "is this the right track?".
+ * The bar and duration are always shown — everywhere this renders, not just
+ * the main Library table — because a row with no way to jump around the
+ * track is a worse tool for "is this the right file?" than one with a bar.
+ *
+ * The trick that keeps this cheap at scale (the YouTube-import matcher and
+ * the library search dock can render hundreds of these at once) is
+ * `durationSecs`: when the caller already knows the track's length — from
+ * the library index or a loaded file's tags — that's used to size the bar
+ * immediately and nothing is read from disk until Play (or a scrub) is
+ * actually pressed. Only when no hint is available does this fall back to
+ * `preload="metadata"` and read the real file up front, which is fine for
+ * the main table since it only ever renders its ~60 visible rows.
  */
-export function AudioPreview({ path, compact = false }: { path: string; compact?: boolean }) {
+export function AudioPreview({
+  path,
+  durationSecs,
+  dense = false,
+}: {
+  path: string;
+  /** Known track length, when the caller already has it (avoids touching
+   * disk just to size the scrub bar). */
+  durationSecs?: number | null;
+  /** Slightly smaller bar, for dense list rows. Never hides it. */
+  dense?: boolean;
+}) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [loadedDuration, setLoadedDuration] = useState(0);
+  const hasHint = durationSecs != null && durationSecs > 0;
 
   useEffect(() => {
-    // Load metadata (duration) up front so the scrub bar works before Play is
-    // ever pressed. `compact` rows don't show a scrub bar or duration, so
-    // there's nothing to preload for — skip it there. This matters at scale:
-    // the library search dock and the YouTube-import matcher can render
-    // hundreds of these at once (one per visible result), and setting `src`
-    // on mount used to make every one of them start reading file metadata
-    // immediately, which is what made typing into the search box feel like
-    // it froze. Non-compact preload is unaffected: preload="metadata" reads
-    // just enough to get duration, not the full file.
-    //
     // This must run on every `path` change, not just mount: the YouTube-import
-    // matcher reuses the same <AudioPreview> element when you cycle candidates
-    // (arrow buttons) or switch matches, so `path` changes without the
-    // component ever unmounting. The old `!el.src` guard only ever set the
-    // source once, so switching candidates kept playing (or silently failed
-    // to play) the previous file.
+    // matcher and the search dock reuse the same <AudioPreview> element as
+    // the row underneath it changes, so `path` changes without the
+    // component ever unmounting.
     const el = audioRef.current;
     if (el) {
       el.pause();
-      if (compact) {
+      if (hasHint) {
+        // A known duration means nothing needs to be read yet — the source
+        // is only attached lazily, on Play or on a scrub.
         el.removeAttribute("src");
       } else {
         el.src = convertFileSrc(path);
       }
     }
-    setReady(!compact);
+    setReady(!hasHint);
     setPlaying(false);
     setTime(0);
-    setDuration(0);
+    setLoadedDuration(0);
     return () => {
       if (audioRef.current) audioRef.current.pause();
       releasePlayback(pause);
@@ -84,9 +94,19 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path]);
 
+  const duration = loadedDuration || durationSecs || 0;
+
   const pause = () => {
     audioRef.current?.pause();
     setPlaying(false);
+  };
+
+  const ensureLoaded = () => {
+    const el = audioRef.current;
+    if (el && !ready) {
+      el.src = convertFileSrc(path);
+      setReady(true);
+    }
   };
 
   const toggle = (e: React.MouseEvent) => {
@@ -97,10 +117,7 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
       pause();
       return;
     }
-    if (!ready) {
-      el.src = convertFileSrc(path);
-      setReady(true);
-    }
+    ensureLoaded();
     takeOverPlayback(pause);
     void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
   };
@@ -109,9 +126,13 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
     e.stopPropagation();
     const el = audioRef.current;
     if (!el) return;
-    el.currentTime = Number(e.target.value);
-    setTime(el.currentTime);
-    // Clicking/dragging the scrub bar auto-starts playback if it's paused.
+    ensureLoaded();
+    const value = Number(e.target.value);
+    // Setting currentTime before metadata has loaded is fine — the webview
+    // queues it and applies it once the file is readable, so this works
+    // even on the very first click before anything has played.
+    el.currentTime = value;
+    setTime(value);
     if (!playing) {
       takeOverPlayback(pause);
       void el.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
@@ -122,9 +143,9 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
     <div className="flex min-w-0 items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
       <audio
         ref={audioRef}
-        preload="metadata"
+        preload={hasHint ? "none" : "metadata"}
         onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+        onLoadedMetadata={(e) => setLoadedDuration(e.currentTarget.duration || 0)}
         onEnded={() => {
           setPlaying(false);
           setTime(0);
@@ -133,15 +154,14 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
       <button
         onClick={toggle}
         className={cn(
-          "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+          "flex shrink-0 items-center justify-center rounded-full",
+          dense ? "h-5 w-5" : "h-6 w-6",
           playing ? "bg-primary text-primary-foreground" : "bg-secondary hover:bg-accent",
         )}
         title={playing ? "Pause" : "Prelisten"}
       >
         {playing ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
       </button>
-      {compact ? null : (
-        <>
       <input
         type="range"
         min={0}
@@ -151,14 +171,20 @@ export function AudioPreview({ path, compact = false }: { path: string; compact?
         onChange={seek}
         onMouseDown={(e) => e.stopPropagation()}
         disabled={!duration}
-        className="h-1 min-w-0 flex-1 cursor-pointer accent-[var(--primary)] disabled:opacity-40"
+        className={cn(
+          "cursor-pointer accent-[var(--primary)] disabled:opacity-40",
+          dense ? "h-1 w-14 min-w-0" : "h-1 min-w-0 flex-1",
+        )}
         title="Scrub — click to play from here"
       />
-      <span className="w-9 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+      <span
+        className={cn(
+          "shrink-0 text-right font-mono text-muted-foreground",
+          dense ? "w-8 text-[10px]" : "w-9 text-[11px]",
+        )}
+      >
         {formatDuration(duration)}
       </span>
-        </>
-      )}
     </div>
   );
 }

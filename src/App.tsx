@@ -149,7 +149,16 @@ export default function App() {
   const filesApi = useFiles(
     settings.recursive,
     notify,
-    (folder) => void update((prev) => ({ ...prev, lastFolder: folder })),
+    (folder) => {
+      void update((prev) => ({ ...prev, lastFolder: folder }));
+      // A folder you open is a folder you plainly care about, so it joins
+      // the library index automatically — the alternative (only indexing
+      // what you separately add in Settings) is exactly why matching
+      // against "your whole library" used to mean "whatever's loaded right
+      // now". `addLibraryRoot` no-ops if it's already a root or a root
+      // already contains it.
+      void addLibraryRoot(folder);
+    },
     settings.lastFolder,
   );
   const tagsApi = useTags();
@@ -158,6 +167,60 @@ export default function App() {
   const imageInfoApi = useImageInfo(filesApi.files, settings.visibleColumns.includes("imageInfo"));
   const analytics = useAnalytics();
   const libraryIndex = useLibraryIndex();
+
+  /** Adds a folder to the indexed roots if it isn't (or isn't already
+   * covered by) one, then kicks off a quiet incremental index run so it
+   * shows up for matching without a trip to Settings. Failures are silent —
+   * this is a convenience on top of manual indexing, not a replacement for
+   * it, and errors there already get their own toast. */
+  const addLibraryRoot = async (folder: string) => {
+    try {
+      const roots = await libraryIndex.getRoots();
+      const normalized = folder.replace(/[\\/]+$/, "").toLowerCase();
+      const alreadyCovered = roots.some((r) => {
+        const rn = r.replace(/[\\/]+$/, "").toLowerCase();
+        return normalized === rn || normalized.startsWith(rn + "\\") || normalized.startsWith(rn + "/");
+      });
+      if (alreadyCovered) {
+        void libraryIndex.runIndex(false);
+        return;
+      }
+      await libraryIndex.setRoots([...roots, folder]);
+      await libraryIndex.runIndex(false);
+    } catch {
+      // Best-effort — the folder is still fully usable this session even if
+      // it never joins the index.
+    }
+  };
+
+  // Keeps the index warm without requiring a trip to Settings: once per
+  // launch, if there's anything to index, bring it up to date in the
+  // background. Incremental (mtime+size), so this is cheap on a library
+  // that hasn't changed since last time — the whole point of "once it's
+  // indexed it's there no matter what" is that this doesn't need a manual
+  // button press every session.
+  const startupIndexRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || startupIndexRef.current) return;
+    startupIndexRef.current = true;
+    void (async () => {
+      try {
+        const roots = await libraryIndex.getRoots();
+        if (roots.length) {
+          void libraryIndex.runIndex(false);
+        } else if (settings.lastFolder) {
+          // First run after upgrading: nothing indexed yet, but there's a
+          // known folder from past sessions — seed the roots from it so
+          // indexing has something to do without asking again.
+          await libraryIndex.setRoots([settings.lastFolder]);
+          void libraryIndex.runIndex(false);
+        }
+      } catch {
+        // Settings' own index card still works for a manual run.
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
   const withTrack = (name: string, fn: () => void) => () => {
     analytics.track(name);
     fn();
@@ -1941,6 +2004,9 @@ This rewrites the genre tag on ${
               tags={wholeCollection.tags}
               indexedCount={libraryIndex.stats?.trackCount ?? 0}
               notify={notify}
+              indexing={libraryIndex.indexing}
+              lastIndexedAt={libraryIndex.stats?.lastIndexedAt ?? null}
+              onIndexNow={() => void libraryIndex.runIndex(false)}
               onInspect={(path) => {
                 const file = filesApi.files.find((f) => f.path === path);
                 if (file) inspect(file);

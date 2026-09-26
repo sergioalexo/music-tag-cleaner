@@ -90,7 +90,18 @@ let mountSeq = 0;
 
 type Status = "idle" | "loading" | "ready" | "unavailable";
 
-export function YouTubePreview({ videoId, url }: { videoId: string; url: string }) {
+export function YouTubePreview({
+  videoId,
+  url,
+  durationSecs,
+}: {
+  videoId: string;
+  url: string;
+  /** The video's length from the playlist fetch, if yt-dlp reported one —
+   * sizes the bar before the embedded player has loaded, exactly like
+   * `AudioPreview`'s `durationSecs` hint. */
+  durationSecs?: number | null;
+}) {
   const mountId = useRef(`yt-preview-${++mountSeq}`).current;
   const hostRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null);
@@ -98,7 +109,10 @@ export function YouTubePreview({ videoId, url }: { videoId: string; url: string 
   const [status, setStatus] = useState<Status>("idle");
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [loadedDuration, setLoadedDuration] = useState(0);
+  const duration = loadedDuration || durationSecs || 0;
+  /** A scrub before the player exists yet — applied once `onReady` fires. */
+  const pendingSeekRef = useRef<number | null>(null);
 
   const stopPolling = () => {
     if (pollRef.current !== null) {
@@ -124,7 +138,8 @@ export function YouTubePreview({ videoId, url }: { videoId: string; url: string 
     setStatus("idle");
     setPlaying(false);
     setTime(0);
-    setDuration(0);
+    setLoadedDuration(0);
+    pendingSeekRef.current = null;
     return () => {
       stopPolling();
       try {
@@ -152,9 +167,13 @@ export function YouTubePreview({ videoId, url }: { videoId: string; url: string 
       playerVars: { controls: 0, disablekb: 1, modestbranding: 1, playsinline: 1, origin: window.location.origin },
       events: {
         onReady: (e) => {
-          setDuration(e.target.getDuration() || 0);
+          setLoadedDuration(e.target.getDuration() || 0);
           setStatus("ready");
           takeOverPlayback(pause);
+          if (pendingSeekRef.current !== null) {
+            e.target.seekTo(pendingSeekRef.current, true);
+            pendingSeekRef.current = null;
+          }
           e.target.playVideo();
         },
         onError: () => {
@@ -209,6 +228,13 @@ export function YouTubePreview({ videoId, url }: { videoId: string; url: string 
     e.stopPropagation();
     const seconds = Number(e.target.value);
     setTime(seconds);
+    if (status === "idle") {
+      // No player yet — create one and apply this scrub once it's ready,
+      // the same lazy-load-on-first-touch behavior as the play button.
+      pendingSeekRef.current = seconds;
+      void createPlayer();
+      return;
+    }
     try {
       playerRef.current?.seekTo(seconds, true);
       if (!playing) {
@@ -251,33 +277,30 @@ export function YouTubePreview({ videoId, url }: { videoId: string; url: string 
         )}
       </button>
       {/*
-        The scrub bar only appears once the player has actually loaded
-        (`ready`) rather than being reserved space in every idle row — a
-        row starts as just a play button, exactly like the local-file
-        AudioPreview does, and only grows once you've pressed it. Fixed
-        (not flex-1) widths here on purpose: this preview sits as a plain
-        flex item next to the row's title/artist text, which is what
-        shrinks to make room — an unbounded flex-1 range here would fight
-        it for space instead.
+        The bar is always shown, exactly like the local-file AudioPreview —
+        sized from `durationSecs` (yt-dlp's reported length) before the
+        embedded player has even been created, so it looks and behaves like
+        every other row instead of only growing in once you've pressed Play.
+        Disabled until there's a duration to scrub against (a handful of
+        entries have none). Fixed (not flex-1) width on purpose: this
+        preview sits as a plain flex item next to the row's title/artist
+        text, which is what shrinks to make room.
       */}
-      {status === "ready" && (
-        <>
-          <input
-            type="range"
-            min={0}
-            max={duration || 0}
-            step={0.1}
-            value={time}
-            onChange={seek}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="h-1 w-16 shrink-0 cursor-pointer accent-[var(--primary)]"
-            title="Scrub — click to play from here"
-          />
-          <span className="w-9 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
-            {formatDuration(duration)}
-          </span>
-        </>
-      )}
+      <input
+        type="range"
+        min={0}
+        max={duration || 0}
+        step={0.1}
+        value={time}
+        onChange={seek}
+        onMouseDown={(e) => e.stopPropagation()}
+        disabled={!duration || status === "unavailable"}
+        className="h-1 w-16 shrink-0 cursor-pointer accent-[var(--primary)] disabled:opacity-40"
+        title="Scrub — click to play from here"
+      />
+      <span className="w-9 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+        {formatDuration(duration)}
+      </span>
     </div>
   );
 }

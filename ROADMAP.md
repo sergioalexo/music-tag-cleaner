@@ -1867,6 +1867,62 @@ browser (every Tauri `invoke` throws on mount), so the UI changes above are
 unverified beyond code review + automated tests until exercised in
 `npm run tauri dev`.
 
+### 53. YT-import matcher: always-on scrub bar, library-style search dock, auto-indexing, sticker artist fix — v0.13.3
+
+A second round of feedback from real use of the matcher:
+
+- **The scrub bar is always visible now**, on both sides of a row (local
+  file and YouTube), instead of only appearing after Play is pressed
+  (YouTube) or not existing at all (`compact` local-file rows). `AudioPreview`
+  and `YouTubePreview` both take an optional `durationSecs` hint — the
+  library index, a loaded file's tags, and yt-dlp's playlist fetch all
+  already know a track's length, so the bar sizes itself immediately and
+  nothing is read from disk (or requested from YouTube) until Play or a
+  scrub is actually pressed. This is what keeps rendering hundreds of rows
+  cheap; only the *always-visible bar* changed, not the lazy-load rule that
+  fixed the original freeze.
+- **The search dock now looks and works like the Library table** —
+  title/artist, album, genre, year and format columns, using the shared
+  `AudioPreview` player — instead of a plain two-line result. Same debounced
+  search, same result cap.
+- **Removed the cycling arrows.** Alternate mixes/candidates the matcher
+  found now show up automatically in the search dock, under "Other versions
+  for row N", each with its own player and a one-click Match — picking one
+  is logged as `corrected`, same as before. Denying a specific alternate
+  there removes it from the running without touching the row's current pick.
+- **Confirm / Deny / "I don't have it" now auto-advance** to the next row
+  that still needs a decision, so working through a playlist is "keep
+  clicking" without hunting for the next unresolved row. Reset doesn't
+  advance (it's undoing, not deciding).
+- **"I don't have it" actually clears the row now.** It used to only set an
+  override, but the shown candidate stayed on screen because it was still
+  the un-rejected top pick — `skipEntry` now denies every remaining
+  candidate too, so the row reads "Not found" with nothing shown, exactly
+  like a real deny-everything.
+- **Every row button is always rendered** (disabled + dimmed when it doesn't
+  apply) instead of appearing/disappearing — closes the last case of a
+  control shifting or popping under the mouse.
+- **"Unknown artist" for restored sessions.** A session saved before channel
+  names were read (or a fetch that happened not to include one for some
+  entries) never had anything to re-check it against, so it showed "Unknown
+  artist" forever. Restoring/resuming a playlist now quietly re-fetches it
+  once in the background if any entries are missing both artist and channel,
+  and fills in whatever the fresh fetch has — decisions already made are
+  untouched. The row itself now shows the channel name directly under the
+  title rather than folding it into an "artist" label.
+- **Matching no longer needs the whole library loaded first.** Opening a
+  folder now registers it as an indexed root and kicks off a quiet
+  incremental re-index in the background (`App.tsx`'s `addLibraryRoot`), and
+  the app does one incremental index pass on startup if any roots are
+  configured — indexing is mtime+size incremental, so a library that hasn't
+  changed costs almost nothing. The import page shows when the index was
+  last updated and an Index/Re-index button, so a track indexed in a past
+  session is there without reopening its folder.
+
+Type-checked, `npm test` (114 TS) and `npm run build` all pass. Rust is
+untouched this round, so `cargo test` wasn't re-run. **Not yet verified
+against the real app** — same `npm run tauri dev` caveat as always.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
