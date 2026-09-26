@@ -1,4 +1,4 @@
-import type { Capitalization, CharReplacement } from "../types";
+import { basename, type Capitalization, type CharReplacement, type PendingChange, type TagData } from "../types";
 
 export const DEFAULT_REPLACEMENTS: CharReplacement[] = [
   { from: "&", to: "N", enabled: true },
@@ -267,4 +267,54 @@ export function formatTrackId(n: number, digits = 6): string {
   const max = 10 ** width;
   const value = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
   return String(value % max).padStart(width, "0");
+}
+
+/**
+ * Rows for the "move Track Number IDs into Track ID" migration preview.
+ *
+ * Before v4 (see ROADMAP.md item 9), "Generate IDs" wrote its sequential id
+ * into Track Number rather than the private Track ID field, because Track
+ * ID didn't exist yet. Those libraries are left with playlist-order data
+ * (TRCK) doubling as an id — this offers to move it. A file only qualifies
+ * when Track Number itself looks like a generated id (exactly `digits`
+ * digits, via `isUid`) *and* it doesn't already have a real Track ID: a
+ * file that's already been migrated, or never had this problem, is left
+ * untouched either way.
+ */
+export function buildTrackIdMigrationPreview(
+  paths: string[],
+  map: Record<string, TagData>,
+  digits: number,
+): PendingChange[] {
+  const rows: PendingChange[] = [];
+  for (const path of paths) {
+    const tags = map[path];
+    if (!tags) continue;
+    const trackNumber = (tags.trackNumber ?? "").trim();
+    if (!isUid(trackNumber, digits) || isUid(tags.trackId, digits)) continue;
+    const filename = basename(path);
+    rows.push({
+      id: `${path}::trackid-migrate::trackId`,
+      path,
+      filename,
+      field: "trackId",
+      before: tags.trackId ?? "",
+      after: trackNumber,
+      include: true,
+      changed: true,
+      kind: "update",
+    });
+    rows.push({
+      id: `${path}::trackid-migrate::trackNumber`,
+      path,
+      filename,
+      field: "trackNumber",
+      before: trackNumber,
+      after: "",
+      include: true,
+      changed: true,
+      kind: "remove",
+    });
+  }
+  return rows;
 }

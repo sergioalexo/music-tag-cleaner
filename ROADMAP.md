@@ -2029,8 +2029,13 @@ must never lock someone out of editing their own files.
 
 ## Backlog (unscheduled)
 
-- Optional one-click "move Track Number ids into Track ID" for pre-v4
-  libraries (use `isUid()` to pick which Track Number values are app ids).
+- ~~Optional one-click "move Track Number ids into Track ID" for pre-v4
+  libraries~~ — done 2026-09-26: `buildTrackIdMigrationPreview()`
+  (`standardize.ts`) scans every loaded file for a Track Number that
+  `isUid()` says looks like a generated id and has no real Track ID yet,
+  and offers to move it over (clearing Track Number) through the same
+  Preview/Apply flow as Standardize — nothing writes until reviewed.
+  "Move IDs from Track Number" button on the Settings → Track IDs card.
 - ~~`useImageInfo.fetchOne` fires on every row `onMouseEnter`~~ — done
   2026-09-25: a 150ms hover-dwell debounce (`HOVER_DWELL_MS`/`dwellRef` in
   `useImageInfo.ts`) now keeps only the most recently hovered row's request,

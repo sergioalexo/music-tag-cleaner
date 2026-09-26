@@ -26,6 +26,7 @@ import {
   applyCapitalization,
   applyReplacements,
   buildRenameStem,
+  buildTrackIdMigrationPreview,
   formatTrackId,
   isUid,
   removeCharsFrom,
@@ -835,6 +836,35 @@ export default function App() {
       notify(String(e), "error");
     } finally {
       setProgress(null);
+      setBusy(false);
+    }
+  };
+
+  /**
+   * "Move Track Number IDs into Track ID" — a one-off cleanup for a library
+   * that used Generate IDs before v4, when it wrote into Track Number
+   * because Track ID didn't exist yet (see ROADMAP.md item 9). Scans every
+   * *loaded* file (not just the selection — this is meant to be
+   * comprehensive) via the same preview/apply flow as Standardize, so
+   * nothing is written until the user reviews and applies it.
+   */
+  const runTrackIdMigration = async () => {
+    const paths = filesApi.files.map((f) => f.path);
+    if (!paths.length) return notify("No files loaded", "info");
+    setBusy(true);
+    try {
+      const { map, errors } = await tagsApi.read(paths);
+      errors.forEach((e) => notify(e, "error"));
+      const rows = buildTrackIdMigrationPreview(paths, map, settingsRef.current.trackIdDigits);
+      setTagsMap(map);
+      setPreviewMode("trackIdMigration");
+      setPending(rows);
+      if (!rows.length) {
+        notify("No Track Number values look like a pre-v4 generated ID", "info");
+      }
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
       setBusy(false);
     }
   };
@@ -1943,6 +1973,7 @@ This rewrites the genre tag on ${
               collectionGenreGroups={collectionGenreGroups}
               libraryIndex={libraryIndex}
               onMergeGenreVariants={mergeGenreVariants}
+              onRunTrackIdMigration={runTrackIdMigration}
               checkOllama={ai.check}
               notify={notify}
             />

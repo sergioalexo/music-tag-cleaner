@@ -4,6 +4,7 @@ import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowRightLeft,
   Download,
   FolderOpen,
   Library,
@@ -54,6 +55,9 @@ interface Props {
   libraryIndex: LibraryIndexApi;
   /** Offers to retag tracks using a non-canonical spelling to the canonical one. */
   onMergeGenreVariants: (variants: string[], canonical: string) => void;
+  /** One-off cleanup for a pre-v4 library: offers to move an id sitting in
+   * Track Number (isUid()) over to Track ID and clear it. */
+  onRunTrackIdMigration: () => void;
   checkOllama: (url: string) => Promise<OllamaStatus>;
   notify: Notify;
 }
@@ -371,6 +375,7 @@ export function SettingsPage({
   collectionGenreGroups,
   libraryIndex,
   onMergeGenreVariants,
+  onRunTrackIdMigration,
   checkOllama,
   notify,
 }: Props) {
@@ -1274,6 +1279,15 @@ export function SettingsPage({
               checked={settings.strictFilenames}
               onChange={(v) => set("strictFilenames", v)}
             />
+          </Row>
+          <Row
+            label="Pre-v4 IDs"
+            hint="Before Track ID existed, Generate IDs wrote its number into Track Number instead — offers to move any that still look like one over, clearing Track Number"
+          >
+            <Button variant="secondary" size="sm" onClick={onRunTrackIdMigration}>
+              <ArrowRightLeft />
+              Move IDs from Track Number
+            </Button>
           </Row>
         </div>
       </Card>

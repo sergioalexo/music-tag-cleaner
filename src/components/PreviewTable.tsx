@@ -55,7 +55,9 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
                     ? "Preview — Clear Fields"
                     : mode === "history"
                       ? "Session Changes"
-                      : "Preview — Standardize"}
+                      : mode === "trackIdMigration"
+                        ? "Preview — Move Track Number IDs to Track ID"
+                        : "Preview — Standardize"}
           </h2>
           <p className="text-xs text-muted-foreground">
             {readOnly

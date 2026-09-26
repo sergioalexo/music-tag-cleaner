@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { CharReplacement } from "../types";
+import type { CharReplacement, TagData } from "../types";
 import {
   applyCapitalization,
   applyReplacements,
   buildRenameStem,
+  buildTrackIdMigrationPreview,
   formatTrackId,
   hasWeirdChars,
   isUid,
@@ -13,6 +14,10 @@ import {
   sanitizeForFilename,
   sanitizeForFilenameStrict,
 } from "./standardize";
+
+function tagData(partial: Partial<TagData>): TagData {
+  return { hasCoverArt: false, allFields: {}, ...partial };
+}
 
 describe("applyReplacements", () => {
   const rule = (from: string, to: string, opts: Partial<CharReplacement> = {}): CharReplacement => ({
@@ -273,5 +278,56 @@ describe("formatTrackId", () => {
     expect(formatTrackId(-5, 6)).toBe("000000");
     expect(formatTrackId(NaN, 6)).toBe("000000");
     expect(formatTrackId(3.7, 6)).toBe("000003");
+  });
+});
+
+describe("buildTrackIdMigrationPreview", () => {
+  it("moves a Track Number that looks like a generated id into Track ID, clearing Track Number", () => {
+    const map = { "/a.mp3": tagData({ trackNumber: "000123", trackId: "" }) };
+    const rows = buildTrackIdMigrationPreview(["/a.mp3"], map, 6);
+    expect(rows).toEqual([
+      {
+        id: "/a.mp3::trackid-migrate::trackId",
+        path: "/a.mp3",
+        filename: "a.mp3",
+        field: "trackId",
+        before: "",
+        after: "000123",
+        include: true,
+        changed: true,
+        kind: "update",
+      },
+      {
+        id: "/a.mp3::trackid-migrate::trackNumber",
+        path: "/a.mp3",
+        filename: "a.mp3",
+        field: "trackNumber",
+        before: "000123",
+        after: "",
+        include: true,
+        changed: true,
+        kind: "remove",
+      },
+    ]);
+  });
+
+  it("skips a file whose Track Number is a real playlist position, not a generated id", () => {
+    const map = { "/a.mp3": tagData({ trackNumber: "3", trackId: "" }) };
+    expect(buildTrackIdMigrationPreview(["/a.mp3"], map, 6)).toEqual([]);
+  });
+
+  it("skips a file that already has a real Track ID — already migrated, or never had the problem", () => {
+    const map = { "/a.mp3": tagData({ trackNumber: "000123", trackId: "000999" }) };
+    expect(buildTrackIdMigrationPreview(["/a.mp3"], map, 6)).toEqual([]);
+  });
+
+  it("skips a file with no tags loaded", () => {
+    expect(buildTrackIdMigrationPreview(["/missing.mp3"], {}, 6)).toEqual([]);
+  });
+
+  it("respects a non-default digit width", () => {
+    const map = { "/a.mp3": tagData({ trackNumber: "12345", trackId: "" }) };
+    expect(buildTrackIdMigrationPreview(["/a.mp3"], map, 5)).toHaveLength(2);
+    expect(buildTrackIdMigrationPreview(["/a.mp3"], map, 6)).toEqual([]);
   });
 });

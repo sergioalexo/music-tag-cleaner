@@ -314,7 +314,7 @@ export const TRANSLITERATE_SCRIPTS = [
   { id: "Chinese/Japanese/Korean", label: "Chinese / Japanese / Korean", hint: "" },
 ] as const;
 
-export type PreviewMode = "ai" | "standardize" | "genre" | "clear" | "history";
+export type PreviewMode = "ai" | "standardize" | "genre" | "clear" | "history" | "trackIdMigration";
 
 /** Fields the Clear Fields action can target. */
 export const CLEARABLE_FIELDS = [
