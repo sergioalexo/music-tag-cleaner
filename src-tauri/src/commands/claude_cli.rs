@@ -85,8 +85,25 @@ fn on_path() -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     if let Ok(appdata) = std::env::var("APPDATA") {
+        let npm_dir = PathBuf::from(&appdata).join("npm");
+        // `claude.cmd` is a one-line shim that just execs the real binary
+        // below. Resolve straight to that binary instead of the shim: Rust's
+        // Command hardens batch-file (.bat/.cmd) argument handling (the
+        // CVE-2024-24576 fix) and outright refuses some arguments — notably
+        // an empty string, which `run_prompt` passes for `--allowedTools` —
+        // with "batch file arguments are invalid". Spawning the real .exe
+        // sidesteps that entirely and avoids cmd.exe re-parsing our args.
+        let bundled = npm_dir
+            .join("node_modules")
+            .join("@anthropic-ai")
+            .join("claude-code")
+            .join("bin")
+            .join("claude.exe");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
         for name in ["claude.cmd", "claude.exe"] {
-            let p = PathBuf::from(&appdata).join("npm").join(name);
+            let p = npm_dir.join(name);
             if p.is_file() {
                 return Some(p);
             }
@@ -240,6 +257,100 @@ fn emit_usage(app: &AppHandle, envelope: &Value, tracks: usize) {
             "songs": tracks,
         }),
     );
+}
+
+/// Runs the official installer non-interactively (`irm .../install.ps1 | iex`
+/// on Windows, the equivalent curl script elsewhere). This is the same
+/// installer documented for manual setup — it drops `claude` into
+/// `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows), which
+/// `find_claude()` already checks, so a re-check right after this succeeds
+/// picks it up with no PATH edits needed. It never signs the user in — that
+/// step is inherently interactive (opens a browser), see `open_claude_login`.
+#[tauri::command]
+pub async fn install_claude_cli() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "irm https://claude.ai/install.ps1 | iex",
+            ]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("curl -fsSL https://claude.ai/install.sh | bash");
+            c
+        };
+        hide_console(&mut cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Could not run the installer: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("unknown error")
+                .trim()
+                .to_string();
+            return Err(format!("Install failed: {detail}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "The installer task panicked".to_string())?
+}
+
+/// Opens a normal, visible terminal running the `claude` binary so the user
+/// can complete the interactive `/login` flow (it opens a browser for
+/// OAuth) — that step can't be driven headlessly from here.
+#[tauri::command]
+pub async fn open_claude_login() -> Result<(), String> {
+    let exe = find_claude()
+        .ok_or_else(|| "No Claude CLI found — install it first.".to_string())?;
+    open_terminal_running(&exe)
+}
+
+#[cfg(target_os = "windows")]
+fn open_terminal_running(exe: &PathBuf) -> Result<(), String> {
+    // A plain `cmd /K <exe>` always gets its own console window (this app
+    // has no console of its own), and `/K` keeps it open after `claude`
+    // exits so any login error stays readable instead of flashing shut.
+    Command::new("cmd")
+        .arg("/K")
+        .arg(exe)
+        .spawn()
+        .map_err(|e| format!("Could not open a terminal: {e}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_terminal_running(exe: &PathBuf) -> Result<(), String> {
+    let escaped = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .map_err(|e| format!("Could not open a terminal: {e}"))?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_terminal_running(exe: &PathBuf) -> Result<(), String> {
+    Command::new("x-terminal-emulator")
+        .arg("-e")
+        .arg(exe)
+        .spawn()
+        .map_err(|e| format!("Could not open a terminal: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]

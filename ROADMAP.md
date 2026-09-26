@@ -1923,6 +1923,34 @@ Type-checked, `npm test` (114 TS) and `npm run build` all pass. Rust is
 untouched this round, so `cargo test` wasn't re-run. **Not yet verified
 against the real app** — same `npm run tauri dev` caveat as always.
 
+### 54. Fix Claude CLI backend on Windows npm installs; Install/Sign-In buttons — v0.13.4
+
+`npm i -g @anthropic-ai/claude-code` on Windows installs `claude.cmd`, a
+batch-file shim — the only thing `find_claude()`'s npm-bin check found.
+Spawning it from Rust failed every time with `Could not run the Claude CLI:
+batch file arguments are invalid`: `std::process::Command` hardens
+batch-file argument handling (the CVE-2024-24576 fix) and rejects certain
+arguments outright, including the empty string `run_prompt` passes for
+`--allowedTools` to lock the CLI down to zero tools. `find_claude()` now
+resolves straight past the shim to the real binary it wraps
+(`node_modules\@anthropic-ai\claude-code\bin\claude.exe`), which the shim
+itself was already calling — a plain EXE spawn, no batch file, no `cmd.exe`
+re-parsing of prompt text (which matters here: the prompt embeds arbitrary
+track/artist tag data). Verified against the real install: direct spawn of
+the resolved `claude.exe` with the exact args `run_prompt` sends returns
+`is_error: false`, and the Settings page's Claude backend probe goes from
+the error above to a green "Ready" badge in `npm run tauri dev`.
+
+Alongside this, Settings gained **Install** and **Sign In** buttons for the
+Claude backend, wiring up two commands that existed but weren't reachable
+from the UI: `install_claude_cli` (runs the official installer,
+non-interactively) and `open_claude_login` (opens a real terminal running
+`claude` so the user can complete the browser-based `/login`, which can't be
+driven headlessly). Both were already implemented and tested; only the
+`main.rs` command registration and the SettingsPage buttons were missing.
+
+`cargo test` (78), `npm test` (114 TS), `npm run build` all pass.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

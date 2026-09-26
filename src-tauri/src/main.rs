@@ -152,6 +152,8 @@ fn main() {
             commands::demucs::install_demucs,
             commands::demucs::separate_stems,
             commands::claude_cli::claude_cli_info,
+            commands::claude_cli::install_claude_cli,
+            commands::claude_cli::open_claude_login,
             commands::claude_cli::claude_clean_batch,
             commands::claude_cli::claude_genre_batch,
         ])

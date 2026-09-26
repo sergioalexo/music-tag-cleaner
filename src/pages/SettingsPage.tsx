@@ -14,6 +14,7 @@ import {
   PlugZap,
   RefreshCw,
   Sparkles,
+  Terminal,
   Upload,
   X,
 } from "lucide-react";
@@ -382,6 +383,8 @@ export function SettingsPage({
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [claudeCli, setClaudeCli] = useState<ClaudeCliInfo | null>(null);
   const [checkingClaude, setCheckingClaude] = useState(false);
+  const [installingClaude, setInstallingClaude] = useState(false);
+  const [signingInClaude, setSigningInClaude] = useState(false);
   const [testing, setTesting] = useState(false);
   const [url, setUrl] = useState(settings.ollamaUrl);
   const [promptOpen, setPromptOpen] = useState(false);
@@ -546,6 +549,34 @@ export function SettingsPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.aiBackend]);
 
+  /** Runs the official installer (same one the docs tell you to run by hand). */
+  const installClaude = async () => {
+    setInstallingClaude(true);
+    try {
+      await invoke("install_claude_cli");
+      notify("Claude CLI installed", "success");
+      await checkClaude();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setInstallingClaude(false);
+    }
+  };
+
+  /** Opens a real terminal running `claude` so the user can finish the
+   *  browser-based `/login` themselves — that step can't be automated. */
+  const signInClaude = async () => {
+    setSigningInClaude(true);
+    try {
+      await invoke("open_claude_login");
+      notify("Opened a terminal — sign in there, then Re-check", "info");
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setSigningInClaude(false);
+    }
+  };
+
   const test = async (u: string) => {
     setTesting(true);
     const result = await checkOllama(u);
@@ -623,19 +654,37 @@ export function SettingsPage({
                       </Badge>
                     </span>
                     <p className="text-muted-foreground">{claudeCli.error}</p>
-                    {!claudeCli.found && (
+                    {!claudeCli.found ? (
                       <p className="text-muted-foreground">
-                        Install it with{" "}
-                        <span className="font-mono">npm i -g @anthropic-ai/claude-code</span>, then
-                        run <span className="font-mono">claude</span> once to log in.
+                        Click Install below, or run{" "}
+                        <span className="font-mono">npm i -g @anthropic-ai/claude-code</span>{" "}
+                        yourself — either way, sign in afterwards.
+                      </p>
+                    ) : (
+                      <p className="text-muted-foreground">
+                        Click Sign In below and complete the login in the terminal that opens.
                       </p>
                     )}
                   </div>
                 )}
-                <Button variant="ghost" size="sm" className="mt-2" onClick={checkClaude} disabled={checkingClaude}>
-                  <PlugZap />
-                  Re-check
-                </Button>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button variant="ghost" size="sm" onClick={checkClaude} disabled={checkingClaude}>
+                    <PlugZap className={checkingClaude ? "animate-pulse" : ""} />
+                    Re-check
+                  </Button>
+                  {claudeCli && !claudeCli.found && (
+                    <Button size="sm" onClick={installClaude} disabled={installingClaude}>
+                      {installingClaude ? <Loader2 className="animate-spin" /> : <Download />}
+                      {installingClaude ? "Installing…" : "Install"}
+                    </Button>
+                  )}
+                  {claudeCli && claudeCli.found && !claudeCli.loggedIn && (
+                    <Button size="sm" onClick={signInClaude} disabled={signingInClaude}>
+                      {signingInClaude ? <Loader2 className="animate-spin" /> : <Terminal />}
+                      Sign In
+                    </Button>
+                  )}
+                </div>
               </div>
               <Row
                 label="Model"
