@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
@@ -13,6 +13,7 @@ import {
   Download,
   ExternalLink,
   FileJson,
+  FileUp,
   Link2,
   ListMusic,
   Loader2,
@@ -44,6 +45,7 @@ import {
   type MatchCandidate,
 } from "../lib/ytMatch";
 import { buildMatchLog, matchLogToMarkdown, type DecisionState } from "../lib/ytMatchLog";
+import { parseImportInput, shortHash } from "../lib/ytListInput";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
 import { Button, Card, CardHeader, cn } from "../components/ui";
 import { LibrarySearchPanel, type RowVariants } from "../components/LibrarySearchPanel";
@@ -72,6 +74,12 @@ interface SessionPayload {
   denied: Record<string, string[]>;
   candIndex: Record<string, number>;
   fromSearch: Record<string, boolean>;
+  /** The raw text pasted into the import box that produced `entries` —
+   * absent on a session saved before list-import shipped (C5), in which
+   * case the textarea falls back to the single playlist URL. Lets Re-match
+   * and re-fetch work for a mixed playlist/video/text-line import, and
+   * refills the textarea on restore. */
+  sourceText?: string;
 }
 
 /**
@@ -145,10 +153,20 @@ export function YtMusicImportPage({
   const [installing, setInstalling] = useState(false);
   const [installProgress, setInstallProgress] = useState<{ downloaded: number; total: number } | null>(null);
 
-  const [url, setUrl] = useState("");
+  /** The multi-line import box: a playlist URL, video links, and/or typed
+   * song names, one per line — see `parseImportInput`. */
+  const [sourceText, setSourceText] = useState("");
   const [fetching, setFetching] = useState(false);
   const [playlist, setPlaylist] = useState<PlaylistFetchResult | null>(null);
   const [fetchedUrl, setFetchedUrl] = useState("");
+  /** The saved-session key for the current playlist — a single playlist
+   * URL uses `sessionKeyFor` unchanged (C5: existing sessions must restore
+   * the same way they always did); a mixed/list import hashes the input. */
+  const [importKey, setImportKey] = useState<string | null>(null);
+  /** The exact text that produced the current `playlist`, for persistence —
+   * kept separate from the live `sourceText` so editing the box afterward
+   * without re-fetching can never desync what gets saved. */
+  const importedTextRef = useRef("");
   const [matches, setMatches] = useState<EntryMatch[] | null>(null);
   const [exporting, setExporting] = useState(false);
 
@@ -253,15 +271,19 @@ export function YtMusicImportPage({
         if (!saved) return;
         const payload = JSON.parse(saved.payload) as SessionPayload;
         if (!payload.entries?.length) return;
+        const text = payload.sourceText ?? saved.url;
         setPlaylist({ title: saved.title, entries: payload.entries });
         setFetchedUrl(saved.url);
-        setUrl(saved.url);
+        setSourceText(text);
+        importedTextRef.current = text;
+        setImportKey(saved.key);
         setOverrides(payload.overrides ?? {});
         setDenied(payload.denied ?? {});
         setCandIndex(payload.candIndex ?? {});
         setFromSearch(payload.fromSearch ?? {});
         setResumedFrom(saved);
-        void runEnrichment(payload.entries.map((e) => e.videoId));
+        const enrichable = payload.entries.filter((e) => e.source !== "text").map((e) => e.videoId);
+        if (enrichable.length) void runEnrichment(enrichable);
       } catch {
         // Nothing to restore is the normal case on a first run.
       }
@@ -414,8 +436,20 @@ export function YtMusicImportPage({
     }
   };
 
-  const fetchPlaylist = async () => {
-    const trimmed = url.trim();
+  /**
+   * Parses the (possibly multi-line) import box and fetches everything it
+   * names: a playlist URL via the existing flat-playlist fetch, a bare
+   * video link as its own entry (enriched the same way as a playlist
+   * track), and a typed song name as a text entry that only ever goes
+   * through the matcher — never YouTube (see `ParsedImportItem`).
+   *
+   * A single playlist URL and nothing else — the original, pre-C behavior —
+   * keeps the exact same session key (`sessionKeyFor`) so a session saved
+   * before this feature shipped restores unchanged (C5). Anything else gets
+   * a `list:`-prefixed key hashed from the input text.
+   */
+  const runImport = async () => {
+    const trimmed = sourceText.trim();
     if (!trimmed) return;
     setFetching(true);
     setPlaylist(null);
@@ -427,30 +461,78 @@ export function YtMusicImportPage({
     setFromSearch({});
     const fetchStarted = Date.now();
     try {
-      const result = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: trimmed });
-      setPlaylist(result);
-      setFetchedUrl(trimmed);
+      const items = parseImportInput(trimmed);
+      if (!items.length) {
+        notify("Nothing to import — paste a link, playlist URL, or song names", "info");
+        return;
+      }
+
+      let title = "";
+      let firstPlaylistUrl = "";
+      const entries: PlaylistEntry[] = [];
+      const seen = new Set<string>();
+      let idx = 0;
+
+      for (const item of items) {
+        if (item.kind === "playlist") {
+          if (!firstPlaylistUrl) firstPlaylistUrl = item.url;
+          const result = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: item.url });
+          if (!title) title = result.title;
+          for (const e of result.entries) {
+            if (seen.has(e.videoId)) continue;
+            seen.add(e.videoId);
+            entries.push({ ...e, index: idx++, source: "youtube" });
+          }
+        } else if (item.kind === "video") {
+          if (seen.has(item.videoId)) continue;
+          seen.add(item.videoId);
+          entries.push({ index: idx++, videoId: item.videoId, url: item.url, title: item.url, source: "youtube" });
+        } else {
+          const videoId = `text:${shortHash(item.line)}`;
+          if (seen.has(videoId)) continue;
+          seen.add(videoId);
+          entries.push({ index: idx++, videoId, url: "", title: item.line, source: "text", metaStatus: "done" });
+        }
+      }
+
+      if (!entries.length) throw new Error("Nothing recognizable to import — check the pasted text");
+
+      // A lone playlist or video link — the original, pre-list-import
+      // behavior — keeps the exact same key `sessionKeyFor` always produced
+      // for it, so a session saved before this feature shipped is still
+      // found (C5). Anything else (a mix, several links, or typed text) is
+      // new territory and gets a key hashed from the whole input.
+      const singleUrlItem =
+        items.length === 1 && (items[0].kind === "playlist" || items[0].kind === "video") ? items[0] : null;
+      if (!title) title = `Pasted list (${entries.length} track${entries.length === 1 ? "" : "s"})`;
+      const key = singleUrlItem ? sessionKeyFor(singleUrlItem.url) : `list:${shortHash(trimmed)}`;
+
+      setPlaylist({ title, entries });
+      setFetchedUrl(singleUrlItem?.url ?? firstPlaylistUrl);
+      setImportKey(key);
+      importedTextRef.current = trimmed;
+
       // Matching is driven by the effect above, so it happens here too.
-      const noArtist = result.entries.filter((e) => !buildWanted(e).artist).length;
-      notify(`Fetched ${result.entries.length} track(s) from "${result.title}"`, "success", {
+      const noArtist = entries.filter((e) => e.source !== "text" && !buildWanted(e).artist).length;
+      notify(`Fetched ${entries.length} track(s)${title ? ` from "${title}"` : ""}`, "success", {
         details: {
-          url: trimmed,
-          title: result.title,
-          trackCount: result.entries.length,
+          itemCount: items.length,
+          title,
+          trackCount: entries.length,
           entriesWithNoIdentifiableArtist: noArtist,
           fetchMs: Date.now() - fetchStarted,
         },
       });
-      void runEnrichment(result.entries.map((e) => e.videoId));
 
-      // Re-fetching a playlist that was matched before restores every
-      // decision made last time. The matcher has just re-run against the
-      // (possibly larger) collection, and these decisions are layered on
-      // top — so newly-acquired tracks get matched while past confirmations
-      // and denials stand.
-      const saved = await invoke<ImportSession | null>("load_import_session", {
-        key: sessionKeyFor(trimmed),
-      });
+      const enrichableIds = entries.filter((e) => e.source !== "text").map((e) => e.videoId);
+      if (enrichableIds.length) void runEnrichment(enrichableIds);
+
+      // Re-importing something matched before restores every decision made
+      // last time. The matcher has just re-run against the (possibly
+      // larger) collection, and these decisions are layered on top — so
+      // newly-acquired tracks get matched while past confirmations and
+      // denials stand.
+      const saved = await invoke<ImportSession | null>("load_import_session", { key });
       if (saved) {
         try {
           const payload = JSON.parse(saved.payload) as SessionPayload;
@@ -469,9 +551,24 @@ export function YtMusicImportPage({
         }
       }
     } catch (e) {
-      notify(String(e), "error", { details: { url: trimmed } });
+      notify(String(e), "error", { details: { input: trimmed } });
     } finally {
       setFetching(false);
+    }
+  };
+
+  const loadListFile = async () => {
+    const picked = await openDialog({
+      title: "Load a Track List",
+      multiple: false,
+      filters: [{ name: "Text or CSV", extensions: ["txt", "csv"] }],
+    });
+    if (!picked || typeof picked !== "string") return;
+    try {
+      const contents = await invoke<string>("read_text_file", { path: picked });
+      setSourceText(contents);
+    } catch (e) {
+      notify(String(e), "error");
     }
   };
 
@@ -714,8 +811,6 @@ export function YtMusicImportPage({
     (candIndex[videoId] ?? 0) !== 0;
 
   // --- Session persistence --------------------------------------------------
-  const sessionKey = fetchedUrl ? sessionKeyFor(fetchedUrl) : null;
-
   const buildPayload = (): SessionPayload => ({
     version: 1,
     entries: playlist?.entries ?? [],
@@ -723,13 +818,14 @@ export function YtMusicImportPage({
     denied,
     candIndex,
     fromSearch,
+    sourceText: importedTextRef.current,
   });
 
   const persist = async (quiet: boolean) => {
-    if (!sessionKey || !playlist) return;
+    if (!importKey || !playlist) return;
     try {
       await invoke("save_import_session", {
-        key: sessionKey,
+        key: importKey,
         title: playlist.title,
         url: fetchedUrl,
         payload: JSON.stringify(buildPayload()),
@@ -744,15 +840,15 @@ export function YtMusicImportPage({
   // one is a sqlite write, so they are coalesced rather than written per
   // click. The explicit Save button exists for reassurance, not necessity.
   useEffect(() => {
-    if (!sessionKey || !matches) return;
+    if (!importKey || !matches) return;
     const t = setTimeout(() => void persist(true), 600);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overrides, denied, candIndex, fromSearch, sessionKey, matches]);
+  }, [overrides, denied, candIndex, fromSearch, importKey, matches]);
 
   const forgetSession = async () => {
-    if (!sessionKey) return;
-    await invoke("delete_import_session", { key: sessionKey });
+    if (!importKey) return;
+    await invoke("delete_import_session", { key: importKey });
     setResumedFrom(null);
     setOverrides({});
     setDenied({});
@@ -793,6 +889,7 @@ export function YtMusicImportPage({
   const closePlaylist = () => {
     setPlaylist(null);
     setFetchedUrl("");
+    setImportKey(null);
     setResumedFrom(null);
   };
 
@@ -810,7 +907,7 @@ export function YtMusicImportPage({
       .map(({ m }) => {
         const w = buildWanted(m.entry);
         const label = w.artist ? `${w.artist} - ${w.title}` : w.title;
-        return `${label} ${m.entry.url}`;
+        return m.entry.url ? `${label} ${m.entry.url}` : label;
       })
       .join("\n");
     await navigator.clipboard.writeText(text);
@@ -840,6 +937,10 @@ export function YtMusicImportPage({
    * back to the channel name or a title split.
    */
   const metaLine = (entry: PlaylistEntry): { text: string; muted: boolean } => {
+    // A typed song name (no YouTube link at all) is only ever matched
+    // against the local collection — there's nothing to look up on YouTube
+    // for it, so it gets no second line rather than a misleading status.
+    if (entry.source === "text") return { text: "", muted: true };
     if (entry.metaStatus === "failed") return { text: "Artist unknown on YouTube", muted: true };
     if (entry.metaStatus !== "done") return { text: "Loading from YouTube Music…", muted: true };
     const want = buildWanted(entry);
@@ -1013,19 +1114,38 @@ export function YtMusicImportPage({
         )}
 
         <Card>
-          <CardHeader title="Playlist" hint="A public YouTube Music or YouTube playlist URL" />
-          <div className="flex gap-2 px-5 py-3">
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && fetchPlaylist()}
-              placeholder="https://music.youtube.com/playlist?list=…"
-              className="h-9 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          <CardHeader
+            title="Playlist or List"
+            hint="A YouTube Music/YouTube playlist link, video links, or typed song names — one per line"
+          />
+          <div className="flex flex-col gap-2 px-5 py-3">
+            <textarea
+              value={sourceText}
+              onChange={(e) => setSourceText(e.target.value)}
+              onKeyDown={(e) => (e.key === "Enter" && (e.metaKey || e.ctrlKey)) && runImport()}
+              placeholder={
+                "Paste a YouTube / YouTube Music playlist, video links (one per line),\n" +
+                "or just song names:\n" +
+                "Flo Rida - Low\n" +
+                "Bad Romance by Lady Gaga"
+              }
+              rows={4}
+              className="min-h-20 flex-1 resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
             />
-            <Button onClick={fetchPlaylist} disabled={fetching || !url.trim() || !ytdlp?.installed}>
-              {fetching ? <Loader2 className="animate-spin" /> : <Search />}
-              {fetching ? "Fetching…" : "Fetch Playlist"}
-            </Button>
+            <div className="flex items-center justify-between gap-2">
+              <Button variant="secondary" size="sm" onClick={loadListFile} disabled={fetching}>
+                <FileUp />
+                Load .txt / .csv
+              </Button>
+              <Button
+                onClick={runImport}
+                disabled={fetching || !sourceText.trim() || !ytdlp?.installed}
+                title="Ctrl/Cmd+Enter also works"
+              >
+                {fetching ? <Loader2 className="animate-spin" /> : <Search />}
+                {fetching ? "Fetching…" : "Fetch"}
+              </Button>
+            </div>
           </div>
         </Card>
 
@@ -1152,29 +1272,34 @@ export function YtMusicImportPage({
                           metadata (artist • album • year) underneath. Never a
                           channel name or a guess split out of the title. */}
                       <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                        <YouTubePreview
-                          videoId={m.entry.videoId}
-                          url={m.entry.url}
-                          durationSecs={m.entry.durationSecs}
-                        />
+                        {m.entry.source !== "text" && (
+                          <YouTubePreview
+                            videoId={m.entry.videoId}
+                            url={m.entry.url}
+                            durationSecs={m.entry.durationSecs}
+                          />
+                        )}
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
                             <span className="truncate text-sm" title={m.entry.title}>
                               {want.title}
                             </span>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void openUrl(m.entry.url);
-                              }}
-                              className="shrink-0 text-muted-foreground hover:text-primary"
-                              title="Open on YouTube Music"
-                            >
-                              <ExternalLink className="h-3 w-3" />
-                            </button>
+                            {m.entry.source !== "text" && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void openUrl(m.entry.url);
+                                }}
+                                className="shrink-0 text-muted-foreground hover:text-primary"
+                                title="Open on YouTube Music"
+                              >
+                                <ExternalLink className="h-3 w-3" />
+                              </button>
+                            )}
                           </div>
                           {(() => {
                             const meta = metaLine(m.entry);
+                            if (!meta.text) return null;
                             return (
                               <div className={cn("truncate text-xs", meta.muted && "text-muted-foreground")}>
                                 {meta.text}
@@ -1330,13 +1455,15 @@ export function YtMusicImportPage({
                             <span className="text-muted-foreground">{w.artist ? `${w.artist} — ` : ""}</span>
                             {w.title}
                           </span>
-                          <button
-                            onClick={() => void openUrl(m.entry.url)}
-                            className="shrink-0 font-mono text-[10px] text-primary hover:underline"
-                            title="Open on YouTube Music"
-                          >
-                            {m.entry.url}
-                          </button>
+                          {m.entry.url && (
+                            <button
+                              onClick={() => void openUrl(m.entry.url)}
+                              className="shrink-0 font-mono text-[10px] text-primary hover:underline"
+                              title="Open on YouTube Music"
+                            >
+                              {m.entry.url}
+                            </button>
+                          )}
                         </li>
                       );
                     })}
