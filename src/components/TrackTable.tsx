@@ -32,6 +32,7 @@ import {
 import type { AudioFile, CueData, PendingChange, PreviewMode, RowHeight, TagData } from "../types";
 import { basename, FIELD_LABELS, formatBytes, KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
+import type { Notify } from "../hooks/useFiles";
 import { hasWeirdChars, markWeird } from "../lib/standardize";
 import { internalDrag } from "../lib/internalDrag";
 import { matchesTerms, parseQuery } from "../lib/trackSearch";
@@ -225,6 +226,10 @@ interface Props {
   onPendingChange: (rows: PendingChange[]) => void;
   /** Which action the current `pending` belongs to — drives the Clear Fields add-a-column boxes. */
   previewMode: PreviewMode;
+  notify: Notify;
+  /** D2 diagnostic switch for the horizontal-wheel bug (ROADMAP item 42) —
+   * logs every wheel event's raw fields to the Logs page when on. */
+  logWheelEvents: boolean;
 }
 
 /**
@@ -404,6 +409,8 @@ export function TrackTable({
   pending,
   onPendingChange,
   previewMode,
+  notify,
+  logWheelEvents,
 }: Props) {
   // Local mirror of the persisted widths so a drag can update at pointer speed
   // without a settings write per frame; re-synced when the prop changes from
@@ -1095,18 +1102,53 @@ export function TrackTable({
   // because something between the cursor and the scroller stopped propagation
   // or retargeted the event, and reading the ref late can't go stale if the
   // table remounts under a listener installed once at mount.
+  // D2 diagnostic: logs every wheel event's raw fields plus which guard (if
+  // any) made this handler give up on it, so a real repro from the owner's
+  // hardware can be compared against the guesses three prior fixes made
+  // blind. Throttled to ~20/s — a fast tilt-wheel burst is much faster than
+  // that, and the Logs page would otherwise drown in near-duplicate entries.
+  const lastWheelLogRef = useRef(0);
+  const logWheel = useCallback(
+    (e: WheelEvent, el: HTMLDivElement | null, guard: string, extra?: Record<string, unknown>) => {
+      if (!logWheelEvents) return;
+      const now = performance.now();
+      if (now - lastWheelLogRef.current < 50) return;
+      lastWheelLogRef.current = now;
+      const target = e.target as HTMLElement | null;
+      notify(`wheel: ${guard}`, "info", {
+        silent: true,
+        details: {
+          guard,
+          deltaX: e.deltaX,
+          deltaY: e.deltaY,
+          deltaMode: e.deltaMode,
+          shiftKey: e.shiftKey,
+          wheelDeltaX: (e as unknown as { wheelDeltaX?: number }).wheelDeltaX,
+          targetTag: target?.tagName ?? null,
+          targetClass: target?.className ?? null,
+          hasFocus: document.hasFocus(),
+          scrollLeftBefore: el?.scrollLeft ?? null,
+          scrollWidth: el?.scrollWidth ?? null,
+          clientWidth: el?.clientWidth ?? null,
+          ...extra,
+        },
+      });
+    },
+    [logWheelEvents, notify],
+  );
+
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
       const el = scrollRef.current;
-      if (!el) return;
+      if (!el) return logWheel(e, el, "no scrollRef");
       const target = e.target;
-      if (!(target instanceof Node) || !el.contains(target)) return;
+      if (!(target instanceof Node) || !el.contains(target)) return logWheel(e, el, "target outside scroller");
       // deltaMode 1 is lines, 2 is pages; both need scaling to pixels.
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientWidth : 1;
       const raw = e.deltaX !== 0 ? e.deltaX : e.shiftKey ? e.deltaY : 0;
-      if (raw === 0) return;
+      if (raw === 0) return logWheel(e, el, "raw delta is 0");
       const max = el.scrollWidth - el.clientWidth;
-      if (max <= 0) return;
+      if (max <= 0) return logWheel(e, el, "nothing to scroll (scrollWidth <= clientWidth)");
 
       // Claim the gesture *before* deciding whether it actually moves
       // anything. Letting even one event of a burst fall through to the
@@ -1119,12 +1161,14 @@ export function TrackTable({
       e.preventDefault();
 
       const next = Math.max(0, Math.min(max, el.scrollLeft + raw * unit));
-      if (next === el.scrollLeft) return;
+      if (next === el.scrollLeft) return logWheel(e, el, "already at the edge");
+      const before = el.scrollLeft;
       el.scrollLeft = next;
+      logWheel(e, el, "applied", { scrollLeftAfter: el.scrollLeft, scrollLeftBefore: before });
     };
     window.addEventListener("wheel", onWheel, { passive: false, capture: true });
     return () => window.removeEventListener("wheel", onWheel, true);
-  }, []);
+  }, [logWheel]);
 
   // Resizing ends in a mouseup on the header, which would otherwise also fire a
   // click there and toggle sort right after — this flag suppresses that one click.

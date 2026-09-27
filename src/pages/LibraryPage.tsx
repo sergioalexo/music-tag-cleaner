@@ -32,6 +32,7 @@ import type {
   Settings,
   TagData,
 } from "../types";
+import type { Notify } from "../hooks/useFiles";
 import { KEPT_FIELD_KEYS } from "../types";
 import type { ImageInfo as ImgInfo } from "../hooks/useImageInfo";
 import { buildTrackGroups, trackIdFormats } from "../lib/trackGroups";
@@ -121,6 +122,9 @@ interface Props {
   onFetchImageInfo: (path: string) => void;
   onSetCoverArt: (file: AudioFile) => void;
   onRemoveCoverArt: (file: AudioFile) => void;
+  notify: Notify;
+  /** D2 diagnostic switch (ROADMAP item 42) — see TrackTable's wheel handler. */
+  logWheelEvents: boolean;
 }
 
 export function LibraryPage({
@@ -182,6 +186,8 @@ export function LibraryPage({
   onFetchImageInfo,
   onSetCoverArt,
   onRemoveCoverArt,
+  notify,
+  logWheelEvents,
 }: Props) {
   const selectedCount = filesApi.selectedPaths.length;
   const noSel = busy || selectedCount === 0;
@@ -650,6 +656,8 @@ export function LibraryPage({
             pending={inlinePreview ? pending : null}
             onPendingChange={onPendingChange}
             previewMode={previewMode}
+            notify={notify}
+            logWheelEvents={logWheelEvents}
           />
         )}
       </div>

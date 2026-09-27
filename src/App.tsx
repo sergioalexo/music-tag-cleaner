@@ -290,6 +290,11 @@ export default function App() {
     null,
   );
   const [inspected, setInspected] = useState<{ file: AudioFile; tags: TagData } | null>(null);
+  /** D2 diagnostic switch for the horizontal-wheel bug (ROADMAP item 42) —
+   * in-memory only, off by default, toggled from the Logs page. Not a
+   * setting: it exists to collect evidence for a bug that's resisted three
+   * blind fixes, not as a feature anyone should leave on. */
+  const [logWheelEvents, setLogWheelEvents] = useState(false);
   // Tracks the AI could not identify from tags or filename — flagged for manual edit.
   const [unresolved, setUnresolved] = useState<Set<string>>(new Set());
   /** Open manual-AI session: the tracks and tags the copy/paste dialog works on. */
@@ -1986,6 +1991,8 @@ This rewrites the genre tag on ${
               }
               shortcuts={settings.shortcuts}
               onTrack={analytics.track}
+              notify={notify}
+              logWheelEvents={logWheelEvents}
             />
           ) : page === "duplicates" ? (
             <DuplicatesPage
@@ -2048,6 +2055,8 @@ This rewrites the genre tag on ${
               onClear={() => setLogs([])}
               actionCounts={analytics.counts}
               onResetActionCounts={analytics.reset}
+              logWheelEvents={logWheelEvents}
+              onToggleLogWheelEvents={setLogWheelEvents}
             />
           ) : (
             <SettingsPage

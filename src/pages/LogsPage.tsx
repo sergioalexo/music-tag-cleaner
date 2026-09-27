@@ -9,6 +9,9 @@ interface Props {
   onClear: () => void;
   actionCounts: ActionCounts;
   onResetActionCounts: () => void;
+  /** D2 diagnostic switch for the horizontal-wheel bug (ROADMAP item 42). */
+  logWheelEvents: boolean;
+  onToggleLogWheelEvents: (on: boolean) => void;
 }
 
 const KIND_ICON = {
@@ -27,7 +30,14 @@ function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-export function LogsPage({ logs, onClear, actionCounts, onResetActionCounts }: Props) {
+export function LogsPage({
+  logs,
+  onClear,
+  actionCounts,
+  onResetActionCounts,
+  logWheelEvents,
+  onToggleLogWheelEvents,
+}: Props) {
   const [filter, setFilter] = useState<"all" | "error">("all");
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -84,6 +94,26 @@ export function LogsPage({ logs, onClear, actionCounts, onResetActionCounts }: P
           </Button>
         </div>
       </div>
+
+      <Card className="flex items-center justify-between gap-4 p-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Log wheel events</div>
+          <p className="text-xs text-muted-foreground">
+            Diagnostic for the library table's sideways-scroll bug — logs every wheel event's raw
+            fields (silently, expand a row below to see them) while tilting the mouse wheel over the
+            table. Turn on, reproduce the problem, then Copy All here.
+          </p>
+        </div>
+        <label className="flex shrink-0 items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            className="accent-[var(--primary)]"
+            checked={logWheelEvents}
+            onChange={(e) => onToggleLogWheelEvents(e.target.checked)}
+          />
+          {logWheelEvents ? "On" : "Off"}
+        </label>
+      </Card>
 
       <div className="flex gap-1">
         <button
