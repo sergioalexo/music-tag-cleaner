@@ -36,6 +36,7 @@ function entry(
   durationSecs?: number,
   uploader?: string,
   artist?: string,
+  artists?: string[],
 ): PlaylistEntry {
   return {
     index,
@@ -45,6 +46,7 @@ function entry(
     durationSecs,
     uploader,
     artist,
+    artists,
   };
 }
 
@@ -67,7 +69,7 @@ describe("parseSearchableBackup", () => {
 });
 
 describe("splitArtistTitle", () => {
-  it("splits on a dash and strips official-video noise", () => {
+  it("splits on a dash (with surrounding whitespace) and strips official-video noise", () => {
     expect(splitArtistTitle("Fred again.. - Delilah (Official Video)")).toEqual({
       artist: "Fred again..",
       title: "Delilah",
@@ -77,31 +79,49 @@ describe("splitArtistTitle", () => {
   it("leaves an unsplittable title whole", () => {
     expect(splitArtistTitle("Delilah")).toEqual({ artist: null, title: "Delilah" });
   });
+
+  it("never splits inside a hyphenated name that has no surrounding spaces", () => {
+    expect(splitArtistTitle("Jay-Z")).toEqual({ artist: null, title: "Jay-Z" });
+    expect(splitArtistTitle("T-Pain")).toEqual({ artist: null, title: "T-Pain" });
+    expect(splitArtistTitle("Ne-Yo")).toEqual({ artist: null, title: "Ne-Yo" });
+  });
+
+  it("splits a real 'Artist - Title' even when the artist itself is hyphenated", () => {
+    expect(splitArtistTitle("A-ha - Take On Me")).toEqual({ artist: "A-ha", title: "Take On Me" });
+  });
+
+  it("no longer treats a colon as a separator", () => {
+    expect(splitArtistTitle("Chapter 1: Intro")).toEqual({ artist: null, title: "Chapter 1: Intro" });
+  });
 });
 
-describe("buildWanted — artist source priority", () => {
-  it("prefers structured metadata over the title split and the channel", () => {
+describe("buildWanted — artist only ever comes from real metadata", () => {
+  it("uses artists[0] when several artists are present — features are already in the title", () => {
+    const w = buildWanted(entry(0, "Low (feat. T-Pain)", undefined, undefined, undefined, ["Flo Rida", "T-Pain"]));
+    expect(w.artist).toBe("Flo Rida");
+    expect(w.title).toBe("Low (feat. T-Pain)");
+  });
+
+  it("falls back to the legacy structured artist field when artists[] is absent", () => {
     const w = buildWanted(entry(0, "Some Video Title", undefined, "Some Channel - Topic", "Real Artist"));
     expect(w.artist).toBe("Real Artist");
-    expect(w.artistSource).toBe("metadata");
   });
 
-  it("falls back to splitting the title when there's no metadata artist", () => {
-    const w = buildWanted(entry(0, "Boris Brejcha - Gravity", undefined, "Some Channel"));
-    expect(w.artist).toBe("Boris Brejcha");
-    expect(w.artistSource).toBe("title");
-  });
-
-  it("falls back to the uploading channel, flagged as a guess, when the title has no split", () => {
-    const w = buildWanted(entry(0, "Gravity", undefined, "Boris Brejcha - Topic"));
-    expect(w.artist).toBe("Boris Brejcha");
-    expect(w.artistSource).toBe("channel");
-  });
-
-  it("has no artist at all when nothing is available", () => {
-    const w = buildWanted(entry(0, "Gravity"));
+  it("never derives the artist by splitting the title", () => {
+    const w = buildWanted(entry(0, "Boris Brejcha - Gravity"));
     expect(w.artist).toBeNull();
-    expect(w.artistSource).toBeNull();
+    expect(w.title).toBe("Boris Brejcha - Gravity");
+  });
+
+  it("never derives the artist from the uploading channel", () => {
+    const w = buildWanted(entry(0, "Gravity", undefined, "Boris Brejcha - Topic"));
+    expect(w.artist).toBeNull();
+  });
+
+  it("has no artist at all, and the title is unchanged (not mangled by a bad split), when nothing is available", () => {
+    const w = buildWanted(entry(0, "Low (feat. T-Pain)"));
+    expect(w.artist).toBeNull();
+    expect(w.title).toBe("Low (feat. T-Pain)");
   });
 });
 
@@ -228,6 +248,18 @@ describe("matchPlaylist", () => {
     expect(m.status).toBe("matched");
     expect(m.candidates[0].path).toBe("C:/music/gravity.mp3");
     expect(m.candidates[0].via).toBe("tags");
+  });
+
+  it("matches on real artists[] metadata, keeping the feature in the title rather than splitting it out", () => {
+    const f = file("C:/music/Flo Rida - Low.mp3", 200);
+    const tags = { [f.path]: tag({ artist: "Flo Rida", title: "Low (feat. T-Pain)" }) };
+    const [m] = matchPlaylist(
+      [entry(0, "Low (feat. T-Pain)", 200, undefined, undefined, ["Flo Rida", "T-Pain"])],
+      [f],
+      tags,
+    );
+    expect(m.status).toBe("matched");
+    expect(m.candidates[0].path).toBe(f.path);
   });
 
   it("does not confuse two different remixes of the same track", () => {

@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import type {
   AudioFile,
+  EntryMeta,
   ImportSession,
   ImportSessionSummary,
   PlaylistEntry,
@@ -165,6 +166,10 @@ export function YtMusicImportPage({
   /** The saved session this run was resumed from, if any. */
   const [resumedFrom, setResumedFrom] = useState<ImportSession | null>(null);
   const [rematching, setRematching] = useState(false);
+  /** `{done, total}` while `enrich_ytmusic_entries` is fetching real YouTube
+   * Music metadata for the current playlist; null when nothing is running. */
+  const [enrichProgress, setEnrichProgress] = useState<{ done: number; total: number } | null>(null);
+  const enrichRunRef = useRef<{ cancel: () => void } | null>(null);
 
   // --- Bottom library-search dock.
   const [panelHeight, setPanelHeight] = useState(180);
@@ -224,10 +229,12 @@ export function YtMusicImportPage({
         setCandIndex(payload.candIndex ?? {});
         setFromSearch(payload.fromSearch ?? {});
         setResumedFrom(saved);
+        void runEnrichment(payload.entries.map((e) => e.videoId));
       } catch {
         // Nothing to restore is the normal case on a first run.
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
@@ -246,44 +253,98 @@ export function YtMusicImportPage({
   }, [playlist, files, tags]);
 
   /**
-   * Fills in channel names for a playlist restored from a saved session.
+   * Fetches real per-track YouTube Music metadata (artist/album/year) for a
+   * freshly-fetched or restored playlist — never guessed from the title or
+   * the uploading channel, per the owner's "no guessing" rule.
    *
-   * Sessions saved before channel-name reading shipped (or a `music.
-   * youtube.com` fetch that happened not to include it for some entries)
-   * leave rows showing "Unknown artist" forever, since nothing else ever
-   * re-fetches the playlist. This does that quietly, once, whenever a
-   * restored/resumed playlist has entries with no artist and no uploader —
-   * decisions already made are untouched, only the missing metadata is
-   * filled in.
+   * Cache hits paint instantly via `cached_ytmusic_meta` (no network); only
+   * misses go through `enrich_ytmusic_entries`, which fetches 4 at a time
+   * and emits each result as it lands. Results are buffered and flushed into
+   * `playlist.entries` every 250ms rather than per-event, so a 90-track
+   * playlist doesn't re-run matching 90 times in a few seconds.
+   *
+   * Superseded automatically if the owner fetches another playlist mid-run —
+   * `enrichRunRef` cancels the previous run (both locally and via the Rust
+   * `cancel_ytmusic_enrich` command) before starting a new one.
    */
-  const reconciledUrlRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!playlist || !fetchedUrl) return;
-    const needsChannel = playlist.entries.some((e) => !e.artist?.trim() && !e.uploader?.trim());
-    if (!needsChannel || reconciledUrlRef.current === fetchedUrl) return;
-    reconciledUrlRef.current = fetchedUrl;
-    void (async () => {
-      try {
-        const fresh = await invoke<PlaylistFetchResult>("fetch_ytmusic_playlist", { url: fetchedUrl });
-        const byId = new Map(fresh.entries.map((e) => [e.videoId, e]));
-        let filled = 0;
-        const merged = playlist.entries.map((e) => {
-          if (e.artist?.trim() || e.uploader?.trim()) return e;
-          const f = byId.get(e.videoId);
-          if (!f || (!f.artist?.trim() && !f.uploader?.trim())) return e;
-          filled++;
-          return { ...e, artist: f.artist, uploader: f.uploader };
-        });
-        if (filled > 0) {
-          setPlaylist((prev) => (prev ? { ...prev, entries: merged } : prev));
-          notify(`Filled in the YouTube channel name for ${filled} track(s)`, "info", { silent: true });
-        }
-      } catch {
-        // Best-effort — a saved session still works fine without this, it
-        // just keeps showing "Unknown artist" for whichever rows it is.
+  const runEnrichment = async (videoIds: string[]) => {
+    enrichRunRef.current?.cancel();
+    let cancelled = false;
+    enrichRunRef.current = {
+      cancel: () => {
+        cancelled = true;
+        void invoke("cancel_ytmusic_enrich");
+      },
+    };
+
+    setPlaylist((prev) =>
+      prev ? { ...prev, entries: prev.entries.map((e) => ({ ...e, metaStatus: "pending" })) } : prev,
+    );
+
+    const pending = new Map<string, EntryMeta>();
+    const flush = () => {
+      if (cancelled || !pending.size) return;
+      const updates = new Map(pending);
+      pending.clear();
+      setPlaylist((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          entries: prev.entries.map((e) => {
+            const m = updates.get(e.videoId);
+            if (!m) return e;
+            if (m.error) return { ...e, metaStatus: "failed" };
+            return {
+              ...e,
+              title: m.title?.trim() || e.title,
+              artists: m.artists,
+              album: m.album ?? null,
+              year: m.year ?? null,
+              durationSecs: e.durationSecs ?? m.durationSecs ?? null,
+              metaStatus: "done",
+            };
+          }),
+        };
+      });
+    };
+
+    const unlistenMeta = await listen<EntryMeta>("ytmusic-entry-meta", (e) => {
+      pending.set(e.payload.videoId, e.payload);
+    });
+    const unlistenProgress = await listen<{ done: number; total: number }>(
+      "ytmusic-enrich-progress",
+      (e) => {
+        if (!cancelled) setEnrichProgress(e.payload);
+      },
+    );
+    const interval = window.setInterval(flush, 250);
+
+    try {
+      const cached = await invoke<EntryMeta[]>("cached_ytmusic_meta", { videoIds });
+      if (cancelled) return;
+      for (const m of cached) pending.set(m.videoId, m);
+      flush();
+      const cachedIds = new Set(cached.map((m) => m.videoId));
+      const misses = videoIds.filter((id) => !cachedIds.has(id));
+      if (misses.length && !cancelled) {
+        setEnrichProgress({ done: 0, total: misses.length });
+        await invoke("enrich_ytmusic_entries", { videoIds: misses });
       }
-    })();
-  }, [playlist, fetchedUrl, notify]);
+    } catch (e) {
+      if (!cancelled) notify(String(e), "error", { details: { action: "enrich_ytmusic_entries" } });
+    } finally {
+      flush();
+      window.clearInterval(interval);
+      unlistenMeta();
+      unlistenProgress();
+      if (!cancelled) {
+        setEnrichProgress(null);
+        enrichRunRef.current = null;
+      }
+    }
+  };
+
+  useEffect(() => () => enrichRunRef.current?.cancel(), []);
 
   const refreshYtdlp = async () => {
     setCheckingYtdlp(true);
@@ -348,6 +409,7 @@ export function YtMusicImportPage({
           fetchMs: Date.now() - fetchStarted,
         },
       });
+      void runEnrichment(result.entries.map((e) => e.videoId));
 
       // Re-fetching a playlist that was matched before restores every
       // decision made last time. The matcher has just re-run against the
@@ -662,7 +724,14 @@ export function YtMusicImportPage({
 
   const copyMissingLinks = async () => {
     if (!missingList.length) return;
-    await navigator.clipboard.writeText(missingList.map(({ m }) => m.entry.url).join("\n"));
+    const text = missingList
+      .map(({ m }) => {
+        const w = buildWanted(m.entry);
+        const label = w.artist ? `${w.artist} - ${w.title}` : w.title;
+        return `${label} ${m.entry.url}`;
+      })
+      .join("\n");
+    await navigator.clipboard.writeText(text);
     notify(`Copied ${missingList.length} link(s) to the clipboard`, "success", {
       details: missingListDetails(),
     });
@@ -680,6 +749,23 @@ export function YtMusicImportPage({
     notify(`Copied ${missingList.length} title(s) to the clipboard`, "success", {
       details: missingListDetails(),
     });
+  };
+
+  /**
+   * The second line under a row's YouTube title: real metadata only, never a
+   * guess. `pending`/no status yet shows a loading hint; a failed fetch or a
+   * successful one with no artist both say so plainly rather than falling
+   * back to the channel name or a title split.
+   */
+  const metaLine = (entry: PlaylistEntry): { text: string; muted: boolean } => {
+    if (entry.metaStatus === "failed") return { text: "Artist unknown on YouTube", muted: true };
+    if (entry.metaStatus !== "done") return { text: "Loading from YouTube Music…", muted: true };
+    const want = buildWanted(entry);
+    const parts = [want.artist, entry.album?.trim() || null, entry.year ? String(entry.year) : null].filter(
+      (p): p is string => !!p,
+    );
+    if (!parts.length) return { text: "Artist unknown on YouTube", muted: true };
+    return { text: parts.join(" • "), muted: false };
   };
 
   const decisionState = (): DecisionState => ({ overrides, denied, fromSearch });
@@ -824,6 +910,26 @@ export function YtMusicImportPage({
           </Card>
         )}
 
+        {!checkingYtdlp && ytdlp?.installed && ytdlp.stale && (
+          <Card className="p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-sm font-medium">
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+                  Your yt-dlp is from {ytdlp.version?.slice(0, 7)} — YouTube often breaks old versions
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Update it for reliable playlist fetching and metadata (also available on the Components page).
+                </p>
+              </div>
+              <Button size="sm" variant="secondary" onClick={installYtdlp} disabled={installing}>
+                {installing ? <Loader2 className="animate-spin" /> : <Download />}
+                {installing ? "Updating…" : "Update yt-dlp"}
+              </Button>
+            </div>
+          </Card>
+        )}
+
         <Card>
           <CardHeader title="Playlist" hint="A public YouTube Music or YouTube playlist URL" />
           <div className="flex gap-2 px-5 py-3">
@@ -890,6 +996,23 @@ export function YtMusicImportPage({
               </div>
             </div>
 
+            {enrichProgress && (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                <span className="shrink-0">
+                  Reading track details from YouTube Music — {enrichProgress.done} / {enrichProgress.total}
+                </span>
+                <div className="h-1 flex-1 overflow-hidden rounded-full bg-secondary">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{
+                      width: `${enrichProgress.total > 0 ? (enrichProgress.done / enrichProgress.total) * 100 : 0}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
             {resumedFrom && (
               <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs">
                 <RotateCcw className="h-3.5 w-3.5 shrink-0 text-primary" />
@@ -943,10 +1066,9 @@ export function YtMusicImportPage({
                         {m.entry.index + 1}
                       </span>
 
-                      {/* What YouTube has — title on top, channel underneath.
-                          There's no reliable per-track artist from a flat
-                          playlist fetch, so the channel name is shown
-                          straight, not hidden behind "Unknown artist". */}
+                      {/* What YouTube has — title on top, real YouTube Music
+                          metadata (artist • album • year) underneath. Never a
+                          channel name or a guess split out of the title. */}
                       <div className="flex min-w-0 flex-1 items-center gap-1.5">
                         <YouTubePreview
                           videoId={m.entry.videoId}
@@ -969,9 +1091,14 @@ export function YtMusicImportPage({
                               <ExternalLink className="h-3 w-3" />
                             </button>
                           </div>
-                          <div className="truncate text-xs text-muted-foreground" title={m.entry.uploader ?? ""}>
-                            {m.entry.uploader || "No channel name from YouTube"}
-                          </div>
+                          {(() => {
+                            const meta = metaLine(m.entry);
+                            return (
+                              <div className={cn("truncate text-xs", meta.muted && "text-muted-foreground")}>
+                                {meta.text}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
 

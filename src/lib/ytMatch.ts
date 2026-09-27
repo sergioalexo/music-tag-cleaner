@@ -24,12 +24,6 @@ import type { AudioFile, PlaylistEntry, TagData } from "../types";
  *    best candidate.
  */
 
-/** Strips the trailing " - Topic" YouTube appends to auto-generated-audio
- * upload channel names, so "Rick Astley - Topic" reads as "Rick Astley". */
-function stripTopicSuffix(name: string): string {
-  return name.replace(/\s*-\s*topic\s*$/i, "").trim();
-}
-
 /** Common video-title clutter that has nothing to do with the track's real
  * name — stripped before splitting/comparing so it doesn't drag the score
  * down. Deliberately conservative: only well-known suffixes, not a general
@@ -69,12 +63,17 @@ function tokens(value: string): string[] {
   return n ? n.split(" ") : [];
 }
 
-/** Splits a video title on the first "Artist - Title"-style separator.
- * yt-dlp doesn't give us structured artist/title, so this is the primary
- * signal, not a fallback. */
+/** Splits a video title on an "Artist - Title"-style separator, for the
+ * *matcher's* internal scoring only — never for display or artist
+ * resolution (see `buildWanted`). Requires whitespace around the dash so
+ * hyphenated names survive: "Jay-Z", "A-ha - Take On Me", "T-Pain",
+ * "Ne-Yo" are never split on the hyphen inside the name. Colon is no longer
+ * treated as a separator — it produced too many false splits ("Low (feat.
+ * T-Pain)" style titles have no colon, but plenty of real titles do, e.g.
+ * "Chapter 1: Intro"). */
 export function splitArtistTitle(rawTitle: string): { artist: string | null; title: string } {
   const cleaned = stripTitleNoise(rawTitle);
-  const m = cleaned.match(/^(.{1,80}?)\s*[-–—:]\s*(.{1,120})$/);
+  const m = cleaned.match(/^(.{1,80}?)\s+[-–—]\s+(.{1,120})$/);
   if (m && m[1].trim() && m[2].trim()) {
     return { artist: m[1].trim(), title: m[2].trim() };
   }
@@ -439,17 +438,21 @@ export function buildIdentity(file: AudioFile, tag: TagData | undefined): TrackI
   };
 }
 
-/** Where an entry's displayed artist came from, best confidence first. */
-export type ArtistSource = "metadata" | "title" | "channel" | null;
-
-/** A playlist entry reduced to the same shape, so both sides are comparable. */
+/** A playlist entry reduced to the same shape, so both sides are comparable.
+ *
+ * `artist` only ever comes from real YouTube Music metadata — never derived
+ * by splitting the title or guessed from the uploading channel (the owner's
+ * "no guessing" rule for this whole feature). `title` is the untouched
+ * YouTube title, for display; the split/noise-stripped forms below exist
+ * only to help the *matcher* recognize a library track, never to relabel
+ * anything on screen. */
 export interface WantedEntry {
+  /** `entry.artists[0]`, else the legacy structured `entry.artist` field,
+   * else null. Never the channel name, never split out of the title. */
   artist: string | null;
-  /** How confident `artist` is — a real "channel name" guess is worth
-   * flagging in the UI differently from a parsed/structured artist. */
-  artistSource: ArtistSource;
+  /** The YouTube title exactly as given — what the UI shows. */
   title: string;
-  /** The whole cleaned video title, used when the artist/title split misfired. */
+  /** The title with common video-title clutter stripped, for matching only. */
   raw: string;
   durationSecs?: number | null;
   version: Set<string>;
@@ -461,44 +464,32 @@ export interface WantedEntry {
 }
 
 export function buildWanted(entry: PlaylistEntry): WantedEntry {
-  const split = splitArtistTitle(entry.title);
-  const channelGuess = entry.uploader ? stripTopicSuffix(entry.uploader) : null;
+  // Real metadata only — a title with several artists already names the
+  // features in its own text, so only the credited (first) artist is used
+  // here; comparing against every feature would just as often mismatch a
+  // library file's own guest artist.
+  const metaArtist = entry.artists?.[0]?.trim() || entry.artist?.trim() || null;
+  const artist = metaArtist || null;
 
-  // Prefer real structured metadata (yt-dlp's `artist`/`creator`, when
-  // present) over splitting the title, and both over the uploading channel
-  // — a channel is often the artist, but is also often a label or a
-  // compilation/"Various Artists" channel, so it's the weakest signal and
-  // the only one worth flagging as a guess in the UI.
-  let artist: string | null;
-  let artistSource: ArtistSource;
-  if (entry.artist?.trim()) {
-    artist = entry.artist.trim();
-    artistSource = "metadata";
-  } else if (split.artist) {
-    artist = split.artist;
-    artistSource = "title";
-  } else if (channelGuess) {
-    artist = channelGuess;
-    artistSource = "channel";
-  } else {
-    artist = null;
-    artistSource = null;
-  }
-
+  const title = entry.title;
   const raw = stripTitleNoise(entry.title);
   const rawP = prepare(raw);
+  // The title/artist split still helps the matcher recognize a library track
+  // tagged the plain "Artist / Title" way, even though the split result is
+  // never shown or treated as a confirmed artist — see the module doc.
+  const split = splitArtistTitle(entry.title);
+  const matchTitle = split.title;
   return {
     artist,
-    artistSource,
-    title: split.title,
+    title,
     raw,
     durationSecs: entry.durationSecs,
     version: versionSignature(entry.title),
     // With no artist the combined string *is* the raw title; sharing the
     // object lets the scorer skip a whole duplicate comparison per candidate.
-    combinedP: artist ? prepare(`${artist} ${split.title}`) : rawP,
+    combinedP: artist ? prepare(`${artist} ${matchTitle}`) : rawP,
     rawP,
-    titleP: prepare(split.title),
+    titleP: prepare(matchTitle),
     artistP: prepare(artist ?? ""),
   };
 }

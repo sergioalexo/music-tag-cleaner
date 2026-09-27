@@ -54,6 +54,10 @@ export interface LoggedEntry {
   parsedTitle: string;
   ytUploader: string | null;
   ytDurationSecs: number | null;
+  /** Real YouTube Music metadata, when it was fetched — see `EntryMeta`. */
+  ytArtists: string[];
+  ytAlbum: string | null;
+  ytYear: number | null;
   /** Version qualifier the matcher read out of the title, e.g. ["tale","of","us","remix"]. */
   ytVersion: string[];
   autoStatus: MatchStatus;
@@ -149,6 +153,9 @@ export function buildMatchLog(
       parsedTitle: want.title,
       ytUploader: m.entry.uploader ?? null,
       ytDurationSecs: m.entry.durationSecs ?? null,
+      ytArtists: m.entry.artists ?? [],
+      ytAlbum: m.entry.album ?? null,
+      ytYear: m.entry.year ?? null,
       ytVersion: [...want.version],
       autoStatus: m.status,
       autoScore: m.candidates[0]?.score ?? null,

@@ -439,6 +439,8 @@ export interface YtDlpInfo {
   installed: boolean;
   path?: string | null;
   version?: string | null;
+  /** True when `version` is a `YYYY.MM.DD` release more than ~6 months old. */
+  stale?: boolean;
 }
 
 export interface PlaylistEntry {
@@ -447,13 +449,35 @@ export interface PlaylistEntry {
   url: string;
   title: string;
   durationSecs?: number | null;
-  /** The uploading channel — often the artist, but a guess (label,
-   * compilation channel, "Various Artists"). See `artist` for the stronger
-   * signal, when yt-dlp provides one. */
+  /** The uploading channel — display-only context, never used as the
+   * artist. See `artists`/`EntryMeta` for the real per-track metadata. */
   uploader?: string | null;
   /** Structured artist metadata, when yt-dlp's flat-playlist extractor
-   * includes it for this entry. */
+   * includes it for this entry (rare — usually filled in by `EntryMeta`). */
   artist?: string | null;
+  /** Real per-video metadata (artists/album/year), filled in by
+   * `enrich_ytmusic_entries` / `cached_ytmusic_meta`. Only source of truth
+   * for the displayed artist — never guessed from the title or channel. */
+  artists?: string[];
+  album?: string | null;
+  year?: number | null;
+  metaStatus?: "pending" | "done" | "failed";
+  /** How this entry entered the list — a fetched YouTube link/playlist, or a
+   * typed song name with no link yet. */
+  source?: "youtube" | "text";
+}
+
+/** Mirrors the Rust `EntryMeta` struct (camelCase). One video's real
+ * YouTube Music metadata, from a full (non-flat) per-video extraction. */
+export interface EntryMeta {
+  videoId: string;
+  title?: string | null;
+  artists: string[];
+  album?: string | null;
+  year?: number | null;
+  channel?: string | null;
+  durationSecs?: number | null;
+  error?: string | null;
 }
 
 export interface PlaylistFetchResult {

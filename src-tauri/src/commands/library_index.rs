@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS import_session (
     saved_at INTEGER NOT NULL,
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS yt_entry_meta (
+    video_id TEXT PRIMARY KEY,
+    json TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+);
 ";
 
 /// What the indexer extracts per file. Bump this whenever a row gains a

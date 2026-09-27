@@ -78,6 +78,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(PendingOpen(Mutex::new(initial)))
+        .manage(commands::ytmusic::EnrichCancelFlag::default())
         .invoke_handler(tauri::generate_handler![
             take_opened_files,
             commands::files::scan_folder,
@@ -135,6 +136,9 @@ fn main() {
             commands::ytmusic::ytdlp_info,
             commands::ytmusic::install_ytdlp,
             commands::ytmusic::fetch_ytmusic_playlist,
+            commands::ytmusic::enrich_ytmusic_entries,
+            commands::ytmusic::cached_ytmusic_meta,
+            commands::ytmusic::cancel_ytmusic_enrich,
             commands::ytmusic::save_import_session,
             commands::ytmusic::load_import_session,
             commands::ytmusic::list_import_sessions,

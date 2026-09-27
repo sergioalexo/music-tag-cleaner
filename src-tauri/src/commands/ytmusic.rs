@@ -16,14 +16,24 @@
 //! may populate them), but the matching step this feeds can't assume they
 //! will be — it has to work from `title` and `duration` alone.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Global cancel switch for `enrich_ytmusic_entries` — the owner may fetch a
+/// different playlist while one enrichment run is still in flight, and there
+/// is only ever one such run worth continuing.
+#[derive(Default)]
+pub struct EnrichCancelFlag(pub Arc<AtomicBool>);
 
 #[cfg(target_os = "windows")]
 const YTDLP_EXE: &str = "yt-dlp.exe";
@@ -43,6 +53,43 @@ pub struct YtDlpInfo {
     pub installed: bool,
     pub path: Option<String>,
     pub version: Option<String>,
+    /// True when `version` parses as a `YYYY.MM.DD` release date more than
+    /// ~6 months old. YouTube regularly breaks older extractors, and the
+    /// owner has hit exactly that ("Precondition check failed" from a
+    /// 2024.10.07 copy) — this is a nudge to update, not an error.
+    pub stale: bool,
+}
+
+/// Days from a proleptic-Gregorian civil date to the Unix epoch (1970-01-01 =
+/// day 0). Howard Hinnant's `days_from_civil` — avoids pulling in a date
+/// crate just to compare a yt-dlp version string's age.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = ((m as i64 + 9) % 12) as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Parses a yt-dlp `YYYY.MM.DD` version string and returns true if it is more
+/// than ~6 months (183 days) old. Any unparseable version is treated as not
+/// stale — this is a nudge, not something worth failing loudly over.
+fn version_is_stale(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    let (Some(y), Some(m), Some(d)) = (
+        parts.first().and_then(|s| s.parse::<i64>().ok()),
+        parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        parts.get(2).and_then(|s| s.parse::<u32>().ok()),
+    ) else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now_days = now.as_secs() as i64 / 86400;
+    now_days - days_from_civil(y, m, d) > 183
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -124,15 +171,20 @@ fn ytdlp_version(exe: &PathBuf) -> Option<String> {
 #[tauri::command]
 pub async fn ytdlp_info(app: AppHandle) -> YtDlpInfo {
     tauri::async_runtime::spawn_blocking(move || match find_ytdlp(&app) {
-        Some(exe) => YtDlpInfo {
-            installed: true,
-            version: ytdlp_version(&exe),
-            path: Some(exe.to_string_lossy().to_string()),
-        },
-        None => YtDlpInfo { installed: false, version: None, path: None },
+        Some(exe) => {
+            let version = ytdlp_version(&exe);
+            let stale = version.as_deref().map(version_is_stale).unwrap_or(false);
+            YtDlpInfo {
+                installed: true,
+                version,
+                path: Some(exe.to_string_lossy().to_string()),
+                stale,
+            }
+        }
+        None => YtDlpInfo { installed: false, version: None, path: None, stale: false },
     })
     .await
-    .unwrap_or(YtDlpInfo { installed: false, version: None, path: None })
+    .unwrap_or(YtDlpInfo { installed: false, version: None, path: None, stale: false })
 }
 
 fn emit_install_progress(app: &AppHandle, phase: &str, downloaded: u64, total: u64) {
@@ -247,6 +299,261 @@ fn parse_playlist_json(raw: &str) -> Result<PlaylistFetchResult, String> {
         });
     }
     Ok(PlaylistFetchResult { title, entries })
+}
+
+/// Real per-video YouTube Music metadata, from a *full* (non-flat)
+/// `yt-dlp -j` extraction of a single watch URL. Unlike `PlaylistEntry` (from
+/// `--flat-playlist`, one HTTP round trip for the whole playlist but no real
+/// artist/album), this costs one yt-dlp process per video (~3-4s) but returns
+/// exactly what YouTube Music's own UI shows — confirmed empirically against
+/// `music.youtube.com/watch?v=…` before this was written (see
+/// PLAN-v0.14-yt-import.md). Never guessed from the title or channel name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryMeta {
+    pub video_id: String,
+    /// "track" when yt-dlp gives one (YouTube Music's clean track name),
+    /// else "title" (the video title, which is usually the same thing).
+    pub title: Option<String>,
+    /// The "artists" array when present. `artists[0]` is the credited
+    /// artist; anyone else is a feature, already named in the title.
+    pub artists: Vec<String>,
+    pub album: Option<String>,
+    pub year: Option<i32>,
+    /// The uploading channel/uploader, " - Topic" stripped. Never used as an
+    /// artist by the matcher — display-only context.
+    pub channel: Option<String>,
+    pub duration_secs: Option<f64>,
+    /// Set on failure (network error, private/removed video, yt-dlp error).
+    /// `title`/`artists`/etc. are left empty rather than guessed.
+    pub error: Option<String>,
+}
+
+/// Strips the trailing " - Topic" YouTube appends to auto-generated-audio
+/// upload channel names. Mirrors `stripTopicSuffix` in `src/lib/ytMatch.ts`.
+fn strip_topic_suffix(name: &str) -> String {
+    let trimmed = name.trim();
+    let lower = trimmed.to_lowercase();
+    if let Some(pos) = lower.rfind("- topic") {
+        if pos + "- topic".len() == lower.len() {
+            return trimmed[..pos].trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Parses one `yt-dlp -j --skip-download` video result into `EntryMeta`.
+/// Pure and fixture-tested (no network) — see the tests module.
+fn parse_video_json(raw: &str, video_id: &str) -> EntryMeta {
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return EntryMeta {
+                video_id: video_id.to_string(),
+                error: Some(format!("Could not parse yt-dlp output: {e}")),
+                ..Default::default()
+            };
+        }
+    };
+
+    let title = v["track"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| v["title"].as_str())
+        .map(String::from);
+
+    let artists: Vec<String> = v["artists"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            // Fallback only when the array is absent — split the flat
+            // "artist" string on ", " (yt-dlp's own separator for it).
+            v["artist"]
+                .as_str()
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
+    let album = v["album"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
+
+    let year = v["release_year"].as_i64().map(|y| y as i32).or_else(|| {
+        v["release_date"]
+            .as_str()
+            .or_else(|| v["upload_date"].as_str())
+            .and_then(|s| s.get(0..4))
+            .and_then(|y| y.parse::<i32>().ok())
+    });
+
+    let channel = v["channel"]
+        .as_str()
+        .or_else(|| v["uploader"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(strip_topic_suffix);
+
+    let duration_secs = v["duration"].as_f64();
+
+    EntryMeta { video_id: video_id.to_string(), title, artists, album, year, channel, duration_secs, error: None }
+}
+
+fn fetch_one_video_meta(exe: &PathBuf, video_id: &str) -> EntryMeta {
+    let url = format!("https://music.youtube.com/watch?v={video_id}");
+    let mut cmd = Command::new(exe);
+    cmd.args(["-j", "--skip-download", "--no-warnings", "--no-playlist", &url]);
+    hide_console(&mut cmd);
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return EntryMeta {
+                video_id: video_id.to_string(),
+                error: Some(format!("Could not run yt-dlp: {e}")),
+                ..Default::default()
+            };
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("yt-dlp failed")
+            .trim()
+            .to_string();
+        return EntryMeta { video_id: video_id.to_string(), error: Some(msg), ..Default::default() };
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    parse_video_json(&raw, video_id)
+}
+
+fn read_cached_meta(conn: &Connection, video_id: &str) -> Option<EntryMeta> {
+    conn.query_row(
+        "SELECT json FROM yt_entry_meta WHERE video_id = ?1",
+        rusqlite::params![video_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|j| serde_json::from_str(&j).ok())
+}
+
+fn cache_meta(conn: &Connection, meta: &EntryMeta) -> Result<(), String> {
+    let json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    conn.execute(
+        "INSERT OR REPLACE INTO yt_entry_meta (video_id, json, fetched_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![meta.video_id, json, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Cached metadata for the given ids, with no network call — lets a restored
+/// session paint instantly while `enrich_ytmusic_entries` fills in the rest.
+#[tauri::command]
+pub async fn cached_ytmusic_meta(app: AppHandle, video_ids: Vec<String>) -> Result<Vec<EntryMeta>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::commands::library_index::open_db(&app)?;
+        Ok(video_ids.iter().filter_map(|id| read_cached_meta(&conn, id)).collect())
+    })
+    .await
+    .map_err(|_| "Cache lookup task panicked".to_string())?
+}
+
+/// Fetches real per-video metadata for each id (full `yt-dlp -j`, not the
+/// flat-playlist extraction), 4 at a time so a big playlist doesn't run
+/// yt-dlp processes one after another. Cache hits are emitted immediately and
+/// never re-fetched; only misses touch the network. Each result is emitted as
+/// it finishes on `ytmusic-entry-meta`, plus a running `{done, total}` on
+/// `ytmusic-enrich-progress`, so the frontend paints incrementally instead of
+/// waiting for the whole playlist.
+#[tauri::command]
+pub async fn enrich_ytmusic_entries(
+    app: AppHandle,
+    cancel: tauri::State<'_, EnrichCancelFlag>,
+    video_ids: Vec<String>,
+) -> Result<(), String> {
+    cancel.0.store(false, Ordering::SeqCst);
+    let cancel_flag = Arc::clone(&cancel.0);
+
+    let to_fetch = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || -> Result<Vec<String>, String> {
+            let conn = crate::commands::library_index::open_db(&app)?;
+            let mut misses = Vec::new();
+            for id in &video_ids {
+                match read_cached_meta(&conn, id) {
+                    Some(meta) => {
+                        let _ = app.emit("ytmusic-entry-meta", &meta);
+                    }
+                    None => misses.push(id.clone()),
+                }
+            }
+            Ok(misses)
+        }
+    })
+    .await
+    .map_err(|_| "Cache lookup task panicked".to_string())??;
+
+    let total = to_fetch.len();
+    if total == 0 || cancel_flag.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let exe = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || find_ytdlp(&app)
+    })
+    .await
+    .map_err(|_| "yt-dlp lookup task panicked".to_string())?
+    .ok_or_else(|| "yt-dlp is not installed — install it from Settings first".to_string())?;
+
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue = Arc::new(StdMutex::new(VecDeque::from(to_fetch)));
+
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let queue = Arc::clone(&queue);
+                let done = Arc::clone(&done);
+                let cancel_flag = Arc::clone(&cancel_flag);
+                let app = app.clone();
+                let exe = exe.clone();
+                scope.spawn(move || loop {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let id = queue.lock().unwrap().pop_front();
+                    let Some(id) = id else { break };
+                    let meta = fetch_one_video_meta(&exe, &id);
+                    if meta.error.is_none() {
+                        if let Ok(conn) = crate::commands::library_index::open_db(&app) {
+                            let _ = cache_meta(&conn, &meta);
+                        }
+                    }
+                    let _ = app.emit("ytmusic-entry-meta", &meta);
+                    let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = app.emit("ytmusic-enrich-progress", serde_json::json!({ "done": n, "total": total }));
+                });
+            }
+        });
+    })
+    .await
+    .map_err(|_| "Enrichment task panicked".to_string())?;
+
+    Ok(())
+}
+
+/// The owner may fetch a different playlist while one enrichment run is
+/// still in flight — this stops the workers between videos rather than
+/// letting a stale run keep emitting into the new one.
+#[tauri::command]
+pub fn cancel_ytmusic_enrich(cancel: tauri::State<'_, EnrichCancelFlag>) {
+    cancel.0.store(true, Ordering::SeqCst);
 }
 
 /// Fetches a playlist's track list — title, duration, video id — via one
@@ -494,6 +801,71 @@ mod tests {
         let raw = r#"{"title": "x", "entries": [{"id": "v1", "title": "t", "creator": "Creator Name"}]}"#;
         let result = parse_playlist_json(raw).unwrap();
         assert_eq!(result.entries[0].artist.as_deref(), Some("Creator Name"));
+    }
+
+    #[test]
+    fn parse_video_json_reads_full_metadata_when_the_artists_array_is_present() {
+        let raw = r#"{
+            "track": "Low (feat. T-Pain)", "title": "Low (feat. T-Pain)",
+            "artists": ["Flo Rida", "T-Pain"], "album": "Mail on Sunday",
+            "release_year": 2007, "channel": "Flo Rida", "duration": 200.5
+        }"#;
+        let meta = parse_video_json(raw, "uUL8a7eJCk8");
+        assert_eq!(meta.video_id, "uUL8a7eJCk8");
+        assert_eq!(meta.title.as_deref(), Some("Low (feat. T-Pain)"));
+        assert_eq!(meta.artists, vec!["Flo Rida".to_string(), "T-Pain".to_string()]);
+        assert_eq!(meta.album.as_deref(), Some("Mail on Sunday"));
+        assert_eq!(meta.year, Some(2007));
+        assert_eq!(meta.channel.as_deref(), Some("Flo Rida"));
+        assert_eq!(meta.duration_secs, Some(200.5));
+        assert!(meta.error.is_none());
+    }
+
+    #[test]
+    fn parse_video_json_splits_a_flat_artist_string_only_when_the_array_is_absent() {
+        let raw = r#"{"title": "Low", "artist": "Flo Rida, T-Pain"}"#;
+        let meta = parse_video_json(raw, "v1");
+        assert_eq!(meta.artists, vec!["Flo Rida".to_string(), "T-Pain".to_string()]);
+    }
+
+    #[test]
+    fn parse_video_json_strips_the_topic_suffix_from_an_uploader_only_channel() {
+        let raw = r#"{"title": "Gravity", "uploader": "Boris Brejcha - Topic"}"#;
+        let meta = parse_video_json(raw, "v1");
+        assert_eq!(meta.channel.as_deref(), Some("Boris Brejcha"));
+        assert!(meta.artists.is_empty());
+    }
+
+    #[test]
+    fn parse_video_json_falls_back_to_the_first_four_chars_of_upload_date_for_year() {
+        let raw = r#"{"title": "x", "upload_date": "20190815"}"#;
+        let meta = parse_video_json(raw, "v1");
+        assert_eq!(meta.year, Some(2019));
+    }
+
+    #[test]
+    fn parse_video_json_with_nothing_at_all_still_has_a_title_and_no_error() {
+        let raw = r#"{"title": "Bare Title"}"#;
+        let meta = parse_video_json(raw, "v1");
+        assert_eq!(meta.title.as_deref(), Some("Bare Title"));
+        assert!(meta.artists.is_empty());
+        assert!(meta.album.is_none());
+        assert!(meta.year.is_none());
+        assert!(meta.channel.is_none());
+        assert!(meta.error.is_none());
+    }
+
+    #[test]
+    fn parse_video_json_reports_the_error_on_malformed_json() {
+        let meta = parse_video_json("not json", "v1");
+        assert!(meta.error.is_some());
+        assert!(meta.title.is_none());
+    }
+
+    #[test]
+    fn version_is_stale_flags_anything_older_than_six_months() {
+        assert!(version_is_stale("2024.10.07"));
+        assert!(!version_is_stale("garbage"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { UsbFormatCard } from "../components/UsbFormatCard";
 import {
+  AlertTriangle,
   Boxes,
   CheckCircle2,
   Download,
@@ -16,6 +17,7 @@ import {
   FileAudio,
   Layers,
   Loader2,
+  Music2,
   Play,
   RefreshCw,
   RotateCw,
@@ -31,6 +33,7 @@ import type {
   FfmpegInstallProgress,
   OllamaInfo,
   OllamaStatus,
+  YtDlpInfo,
 } from "../types";
 import { formatBytes } from "../types";
 import { Badge, Button, Card, cn, inputClass } from "../components/ui";
@@ -100,6 +103,9 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
   const [ffmpeg, setFfmpeg] = useState<FfmpegInfo | null>(null);
   const [ffmpegInstalling, setFfmpegInstalling] = useState(false);
   const [ffmpegProgress, setFfmpegProgress] = useState<FfmpegInstallProgress | null>(null);
+  const [ytdlp, setYtdlp] = useState<YtDlpInfo | null>(null);
+  const [ytdlpInstalling, setYtdlpInstalling] = useState(false);
+  const [ytdlpProgress, setYtdlpProgress] = useState<{ downloaded: number; total: number } | null>(null);
   const isWindows = navigator.userAgent.includes("Windows");
   const [models, setModels] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -231,10 +237,34 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
     }
   };
 
+  const refreshYtdlp = useCallback(async () => {
+    try {
+      setYtdlp(await invoke<YtDlpInfo>("ytdlp_info"));
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  }, [notify]);
+
+  const installYtdlp = async () => {
+    setYtdlpInstalling(true);
+    setYtdlpProgress(null);
+    try {
+      await invoke("install_ytdlp");
+      notify("yt-dlp installed", "success");
+      await refreshYtdlp();
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setYtdlpInstalling(false);
+      setYtdlpProgress(null);
+    }
+  };
+
   useEffect(() => {
     refresh();
     refreshFfmpeg();
     refreshDemucs();
+    refreshYtdlp();
     const unlisten = listen<ComponentProgress>("component-progress", (e) => {
       setProgress(e.payload);
     });
@@ -248,10 +278,15 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
     const unlistenFfmpeg = listen<FfmpegInstallProgress>("ffmpeg-install-progress", (e) => {
       setFfmpegProgress(e.payload);
     });
+    const unlistenYtdlp = listen<{ phase: string; downloaded: number; total: number }>(
+      "ytdlp-install-progress",
+      (e) => setYtdlpProgress(e.payload),
+    );
     return () => {
       unlisten.then((fn) => fn());
       unlistenDemucs.then((fn) => fn());
       unlistenFfmpeg.then((fn) => fn());
+      unlistenYtdlp.then((fn) => fn());
       if (pollTimer.current) window.clearTimeout(pollTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -595,6 +630,88 @@ export function ComponentsPage({ ollamaUrl, notify, onOllamaChanged, onFfmpegCha
                       ? ` / ${formatBytes(ffmpegProgress.total)}`
                       : ""
                   }`}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* yt-dlp — used by YouTube Music Import */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">
+              <Music2 className="h-5 w-5 text-muted-foreground" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">yt-dlp</span>
+                {ytdlp === null ? (
+                  <Badge>…</Badge>
+                ) : ytdlp.installed ? (
+                  ytdlp.stale ? (
+                    <Badge className="gap-1 bg-amber-500/15 text-amber-600 dark:text-amber-400">
+                      <AlertTriangle className="h-3 w-3" /> Outdated
+                    </Badge>
+                  ) : (
+                    <Badge className="gap-1 bg-primary/15 text-primary">
+                      <CheckCircle2 className="h-3 w-3" /> Installed
+                    </Badge>
+                  )
+                ) : (
+                  <Badge className="gap-1 bg-destructive/15 text-destructive">
+                    <XCircle className="h-3 w-3" /> Not installed
+                  </Badge>
+                )}
+              </div>
+              <button
+                onClick={() => void openUrl("https://github.com/yt-dlp/yt-dlp")}
+                className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"
+              >
+                yt-dlp/yt-dlp <ExternalLink className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 gap-2">
+            {ytdlp && (!ytdlp.installed || ytdlp.stale) && (
+              <Button size="sm" onClick={installYtdlp} disabled={ytdlpInstalling}>
+                {ytdlpInstalling ? <Loader2 className="animate-spin" /> : <Download />}
+                {ytdlp.installed ? "Update" : "Install"}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <p className="mt-3 text-xs text-muted-foreground">
+          Powers <span className="font-medium">YouTube Music Import</span> — reads playlist and track
+          metadata only, never downloads audio.
+          {ytdlp?.stale && (
+            <>
+              {" "}
+              Your copy is from {ytdlp.version?.slice(0, 7)} — YouTube often breaks old versions.
+              Update it.
+            </>
+          )}
+        </p>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <InfoTile label="Version" value={ytdlp?.version ?? "—"} />
+          <InfoTile label="Path" value={ytdlp?.path ?? "—"} />
+        </div>
+
+        {ytdlpInstalling && (
+          <div className="mt-3">
+            <ProgressBar
+              value={
+                ytdlpProgress && ytdlpProgress.total > 0
+                  ? ytdlpProgress.downloaded / ytdlpProgress.total
+                  : null
+              }
+            />
+            <div className="mt-1 text-xs text-muted-foreground">
+              {`Downloading ${formatBytes(ytdlpProgress?.downloaded ?? 0)}${
+                ytdlpProgress && ytdlpProgress.total > 0 ? ` / ${formatBytes(ytdlpProgress.total)}` : ""
+              }`}
             </div>
           </div>
         )}
