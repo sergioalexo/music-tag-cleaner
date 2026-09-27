@@ -1951,6 +1951,102 @@ driven headlessly). Both were already implemented and tested; only the
 
 `cargo test` (78), `npm test` (114 TS), `npm run build` all pass.
 
+### 55. Real YouTube Music metadata, library-track labels, list import, wheel diagnostics — v0.14.0
+
+Four workstreams, plus five already-shipped backlog fixes (below) that had
+never made it into a numbered release entry.
+
+**No more guessed artists.** The owner's "(Dance) Wedding Music" playlist
+had every entry with `uploader`/`artist` null — `yt-dlp -J --flat-playlist`
+doesn't return per-track artist/album for a `music.youtube.com` playlist —
+so the matcher fell back to splitting the video title on its first dash,
+which mangled `Low (feat. T-Pain)` into artist `Low (feat. T` / title
+`Pain)`. New `enrich_ytmusic_entries` (`ytmusic.rs`) runs a *full*
+(non-flat) `yt-dlp -j` extraction per video, 4 at a time, cached in a new
+`yt_entry_meta` sqlite table so a restored session paints instantly with no
+network; `cached_ytmusic_meta` serves the cache directly and
+`cancel_ytmusic_enrich` stops a run superseded by a new fetch. The artist
+shown is now only ever `entry.artists[0]` (or the legacy structured `artist`
+field) — the title-split and channel-name guesses are gone entirely from
+`buildWanted`, and `splitArtistTitle` (kept only as an internal matching
+signal) now requires whitespace around the dash so `Jay-Z`, `A-ha`,
+`T-Pain`, `Ne-Yo` survive. "Still to get" / Copy Links use the real artist
+when known. `ytdlp_info` also flags a yt-dlp release more than ~6 months
+old (`version_is_stale`), surfaced on the import page and a new yt-dlp card
+on the Components page. `npm test` (150 total) and `cargo test` (85, 5
+ignored) both green.
+
+**Matched library tracks show `Artist - Title`, not a path.** A matched
+row's right side was rendering the *full file path* and an em dash for
+artist for some rows in the owner's real library, and clicking an
+indexed-only match showed a dead "open its folder" toast. Root-cause note:
+this environment couldn't drive `npm run tauri dev` interactively against
+the owner's real library/session to confirm it live, so the cause is a
+static-analysis finding, not a confirmed one — worth a quick check on the
+owner's machine. The most likely explanation is a byte-level path mismatch:
+`trackLabel` looked up `tags[p]`/`fileByPath[p]` by exact string, so a path
+saved in a session's `overrides` (or matched against a file opened in an
+earlier session, outside any indexed root) that differs from the index by
+case, `/` vs `\`, falls through both lookups straight to the raw path. Fixed
+regardless of the exact cause: a case/slash-folded fallback lookup, then an
+on-demand `read_tags_batch` for a path outside the collection entirely, then
+the bare filename — never the full path, which is now tooltip-only. A path
+confirmed gone from disk shows "File missing" and is treated as unmatched
+for export. `useLibraryIndex.refreshTracks` now logs a real load failure
+instead of silently emptying the collection. Opening an indexed-only track
+now reads its tags directly instead of the "not loaded" toast — the
+inspector was already read-only, so there was no edit path to wire up.
+
+**Horizontal wheel: diagnostics, not a fourth guess.** Three prior fixes
+(item 42, v0.11.4, `dba4b93`) guessed at the cause of the sideways-scroll
+bug and were never confirmed against a real repro. Asked the owner first,
+per this batch's plan: the actual symptom — "scrolls for a second, then
+breaks, only fixed by relaunching the app," with Logitech Options+ installed
+— doesn't cleanly match any of the three failure modes anticipated (all-zero
+deltas, snap-back, or a dead header zone), so a fix now would be a fourth
+guess. Shipped a "Log wheel events" toggle instead (Logs page, in-memory
+only, off by default): while on, `TrackTable`'s wheel handler logs every
+event's `deltaX`/`deltaY`/`deltaMode`/`shiftKey`/legacy `wheelDeltaX`, target
+tag/class, `document.hasFocus()`, `scrollLeft` before/after,
+`scrollWidth`/`clientWidth`, and which guard (if any) gave up on it —
+throttled to ~20/s. **Not fixed yet** — needs the owner to reproduce the
+break with logging on and share the Logs page output before the real fix
+(native `WM_MOUSEHWHEEL` handling, a refocus-on-hover, or whatever the log
+turns up) can be chosen from evidence.
+
+**Import from a list, not just a playlist link.** The single-URL box is now
+a multi-line paste area that also takes individual video links and plain
+typed song names, one per line (`src/lib/ytListInput.ts`'s
+`parseImportInput`, pure + Vitest-tested), plus a "Load .txt / .csv" button
+and CSV `artist,title` header mapping. Per the owner's steer, typed song
+names are for building a playlist against the local collection only — no
+"Find on YouTube" search integration for them, so that part of the original
+plan (C4) was dropped rather than built and left unused. A pasted video link
+still gets real per-video metadata through the same enrichment pipeline
+above, so it matches and displays exactly like a playlist track. Session
+keying: a lone playlist or video link keeps the exact key `sessionKeyFor`
+always produced, so a session saved before this shipped still restores
+unchanged; anything else (a mix, several links, or typed text) hashes the
+whole pasted input, which is now itself part of the saved payload so the box
+refills and Re-match/re-fetch keep working.
+
+**Also folded into this release** — five fixes already on `master` as
+individual "(backlog item)" commits since v0.13.2, each already logged with
+full detail in the Backlog section below, but never bundled into a numbered
+release entry until now: capitalization casing exceptions
+(`applyCasingExceptions`), the "move Track Number IDs into Track ID"
+migration, an `algo_version` stamp on the fingerprint/waveform cache, a
+150ms hover-dwell debounce on the row cover-info fetch, and 51 new Vitest
+cases for `standardize.ts`.
+
+**Verification.** `npm test` and `cargo test` pass (counts above); `npm run
+build` (`tsc` + `vite build`) passes. This environment cannot drive
+`npm run tauri dev` interactively, so A/B's UI acceptance criteria and D's
+fix are **not** independently confirmed against the real app — the owner
+should click through the wedding playlist (real artist/album/year, no path
+strings, indexed-only tracks open) and, for D, turn on wheel logging and
+reproduce the break.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
