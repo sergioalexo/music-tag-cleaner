@@ -166,7 +166,7 @@ export default function App() {
   const { covers, invalidate: invalidateCovers } = useCovers(filesApi.files);
   const imageInfoApi = useImageInfo(filesApi.files, settings.visibleColumns.includes("imageInfo"));
   const analytics = useAnalytics();
-  const libraryIndex = useLibraryIndex();
+  const libraryIndex = useLibraryIndex(notify);
 
   /** Adds a folder to the indexed roots if it isn't (or isn't already
    * covered by) one, then kicks off a quiet incremental index run so it
@@ -2009,12 +2009,30 @@ This rewrites the genre tag on ${
               onIndexNow={() => void libraryIndex.runIndex(false)}
               onInspect={(path) => {
                 const file = filesApi.files.find((f) => f.path === path);
-                if (file) inspect(file);
-                else
-                  notify(
-                    "That track is in the index but not loaded — open its folder to inspect it",
-                    "info",
-                  );
+                if (file) {
+                  inspect(file);
+                  return;
+                }
+                // Indexed-only track (never opened this session): the index
+                // has the curated fields but not `allFields`, so this reads
+                // the file directly instead of showing "not loaded" — the
+                // inspector is read-only either way, so there's no edit path
+                // to wire up for a track that isn't part of the session.
+                const indexed = wholeCollection.files.find((f) => f.path === path);
+                if (!indexed) {
+                  notify("That file could not be found — it may have moved or been deleted", "error");
+                  return;
+                }
+                void (async () => {
+                  try {
+                    const { map, errors } = await tagsApi.read([path]);
+                    const tags = map[path];
+                    if (tags) setInspected({ file: indexed, tags });
+                    else notify(errors[0] ?? `Could not read tags for ${indexed.filename}`, "error");
+                  } catch (e) {
+                    notify(String(e), "error");
+                  }
+                })();
               }}
             />
           ) : page === "components" ? (

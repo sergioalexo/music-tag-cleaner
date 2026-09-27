@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { Notify } from "./useFiles";
 import {
   indexedToFile,
   indexedToTags,
@@ -27,7 +28,7 @@ import {
  * shapes so `matchPlaylist` and `searchTracks` take indexed and loaded
  * tracks identically, with no second code path.
  */
-export function useLibraryIndex() {
+export function useLibraryIndex(notify: Notify) {
   const [tracks, setTracks] = useState<IndexedTrack[]>([]);
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [genres, setGenres] = useState<GenreCount[]>([]);
@@ -52,12 +53,19 @@ export function useLibraryIndex() {
     try {
       const rows = await invoke<IndexedTrack[]>("library_tracks");
       if (seq === refreshSeq.current) setTracks(rows);
-    } catch {
-      if (seq === refreshSeq.current) setTracks([]);
+    } catch (e) {
+      if (seq === refreshSeq.current) {
+        setTracks([]);
+        // Silent — a fresh install with no index yet hits this too, which
+        // isn't an error worth a toast. It still goes to the Logs page,
+        // since a real failure here (a locked/corrupt db) used to vanish
+        // completely, showing up only as an inexplicably empty collection.
+        notify(`Could not load the library index: ${e}`, "error", { silent: true });
+      }
     } finally {
       if (seq === refreshSeq.current) setLoaded(true);
     }
-  }, []);
+  }, [notify]);
 
   const refresh = useCallback(async () => {
     await Promise.all([refreshStats(), refreshTracks()]);

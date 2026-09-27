@@ -175,19 +175,51 @@ export function YtMusicImportPage({
   const [panelHeight, setPanelHeight] = useState(180);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
 
+  // --- B2: a path saved in a session's overrides (from a previous run, or
+  // matched against files opened in an earlier session) doesn't always come
+  // back byte-identical to how the collection has it today — different case,
+  // `/` vs `\`, a trailing space. Looked up as typed first, then again
+  // case/slash-folded, before ever falling back to "not found".
   const fileByPath = useMemo(() => Object.fromEntries(files.map((f) => [f.path, f])), [files]);
+  const normPath = (p: string) => p.trim().toLowerCase().replace(/\//g, "\\");
+  const fileByNormPath = useMemo(() => {
+    const m = new Map<string, AudioFile>();
+    for (const f of files) if (!m.has(normPath(f.path))) m.set(normPath(f.path), f);
+    return m;
+  }, [files]);
+  const tagsByNormPath = useMemo(() => {
+    const m = new Map<string, TagData>();
+    for (const [p, t] of Object.entries(tags)) if (!m.has(normPath(p))) m.set(normPath(p), t);
+    return m;
+  }, [tags]);
 
-  /** A library path split into the two lines the UI shows for it. */
+  /** Tags fetched on demand for a path the collection doesn't have — a match
+   * from an earlier session pointing at a file outside the indexed roots
+   * (see `useMissingPathLookup` below). */
+  const [extraTags, setExtraTags] = useState<Record<string, TagData>>({});
+  /** Paths a lookup confirmed no longer exist on disk. */
+  const [missingPaths, setMissingPaths] = useState<Set<string>>(new Set());
+
+  const basename = (p: string): string => {
+    const base = p.split(/[\\/]/).pop() ?? p;
+    return base.replace(/\.[^./\\]+$/, "");
+  };
+
+  /** A library path split into the two lines the UI shows for it. Falls back
+   * to the bare filename, never the full path — the path is still available
+   * as the row's `title=` tooltip. */
   const trackLabel = useMemo(() => {
-    return (p: string): { title: string; artist: string } => {
-      const t = tags[p];
-      const f = fileByPath[p];
+    return (p: string): { title: string; artist: string; missing: boolean } => {
+      if (missingPaths.has(p)) return { title: basename(p), artist: "", missing: true };
+      const t = tags[p] ?? tagsByNormPath.get(normPath(p)) ?? extraTags[p];
+      const f = fileByPath[p] ?? fileByNormPath.get(normPath(p));
       return {
-        title: t?.title?.trim() || f?.filename || p,
+        title: t?.title?.trim() || f?.filename || basename(p),
         artist: t?.artist?.trim() || "",
+        missing: false,
       };
     };
-  }, [tags, fileByPath]);
+  }, [tags, fileByPath, tagsByNormPath, fileByNormPath, extraTags, missingPaths]);
 
   const flatLabel = useMemo(() => {
     return (p: string) => {
@@ -473,13 +505,63 @@ export function YtMusicImportPage({
   };
 
   const effectiveStatus = (m: EntryMatch): EffectiveStatus => {
-    if (resolvedPath(m)) return "matched";
+    const resolved = resolvedPath(m);
+    if (resolved && !missingPaths.has(resolved)) return "matched";
     return shownCandidate(m) && overrides[m.entry.videoId] === undefined ? "ambiguous" : "missing";
   };
 
   const resolved = matches?.map((m) => ({ m, path: resolvedPath(m) })) ?? [];
-  const matchedList = resolved.filter((r): r is { m: EntryMatch; path: string } => !!r.path);
-  const missingList = resolved.filter((r) => !r.path);
+  // A path confirmed gone from disk (see the lookup effect below) is treated
+  // as unmatched for export — a link to a file that no longer exists isn't
+  // a match, so it falls through to "Still to get" instead of the playlist.
+  const matchedList = resolved.filter(
+    (r): r is { m: EntryMatch; path: string } => !!r.path && !missingPaths.has(r.path),
+  );
+  const missingList = resolved.filter((r) => !r.path || missingPaths.has(r.path));
+
+  /**
+   * B2: fetches tags on demand for any displayed path the collection doesn't
+   * have — a match saved in a previous session for a file that lives outside
+   * the indexed roots (opened directly in an earlier session), or whose path
+   * no longer byte-matches the index for some other reason. Runs off the
+   * resolved/shown paths actually on screen, not the whole playlist, and
+   * never re-fetches a path it already has an answer for (found or missing).
+   */
+  useEffect(() => {
+    if (!matches) return;
+    const shown = new Set<string>();
+    for (const m of matches) {
+      const p = resolvedPath(m) ?? shownCandidate(m)?.path;
+      if (p) shown.add(p);
+    }
+    const unresolved = [...shown].filter(
+      (p) =>
+        !tags[p] &&
+        !tagsByNormPath.has(normPath(p)) &&
+        !(p in extraTags) &&
+        !missingPaths.has(p),
+    );
+    if (!unresolved.length) return;
+    void (async () => {
+      try {
+        const results = await invoke<{ path: string; tags: TagData | null; error: string | null }[]>(
+          "read_tags_batch",
+          { paths: unresolved },
+        );
+        const found: Record<string, TagData> = {};
+        const gone: string[] = [];
+        for (const r of results) {
+          if (r.tags) found[r.path] = r.tags;
+          else gone.push(r.path);
+        }
+        if (Object.keys(found).length) setExtraTags((prev) => ({ ...prev, ...found }));
+        if (gone.length) setMissingPaths((prev) => new Set([...prev, ...gone]));
+      } catch {
+        // Best-effort — rows just keep showing the filename fallback.
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, tags, tagsByNormPath, extraTags, missingPaths]);
 
   /**
    * The focused row's other matcher-found candidates, for the "Other
@@ -1105,7 +1187,14 @@ export function YtMusicImportPage({
                       {/* What it matched in the collection — same two lines, so
                           a long "Artist - Title" is readable instead of clipped. */}
                       <div className="flex min-w-0 flex-1 items-center gap-2">
-                        {displayPath && lib ? (
+                        {displayPath && lib?.missing ? (
+                          <span
+                            className="flex-1 truncate text-xs text-muted-foreground"
+                            title={displayPath}
+                          >
+                            File missing — {lib.title}
+                          </span>
+                        ) : displayPath && lib ? (
                           <>
                             <AudioPreview
                               path={displayPath}
