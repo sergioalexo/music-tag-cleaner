@@ -2047,6 +2047,42 @@ should click through the wedding playlist (real artist/album/year, no path
 strings, indexed-only tracks open) and, for D, turn on wheel logging and
 reproduce the break.
 
+### 56. Export Rekordbox playlists as .m3u8 for Mixxx — v0.14.0
+
+The owner wanted to move a library from Rekordbox to Mixxx without
+connecting a USB/SD device — Mixxx's own Rekordbox importer requires a real
+device export (`PIONEER`/`Contents` folders), it can't read a bare
+`rekordbox.xml`. `rekordbox_import.rs` already parsed `rekordbox.xml` for
+cue import but explicitly skipped `<PLAYLISTS>` as out of scope.
+
+**Fix** (`rekordbox_import.rs`): added `parse_playlist_tree` — a recursive
+descent over `<PLAYLISTS>`'s `<NODE>` tree (`Type="0"` folder / `Type="1"`
+playlist), returning a `PlaylistNode` tree for the UI plus a flat
+`playlist id -> (folder path, name, track ids)` map for export. Also found
+and fixed a real gap while testing this: `parse_rekordbox_xml` only matched
+`Start`/`End` TRACK pairs, silently dropping any self-closed `<TRACK .../>`
+(no cue children) — now handled via a shared `track_from_attrs` helper.
+`export_rekordbox_playlists_for_mixxx` writes one `.m3u8` per selected
+playlist (same `#EXTINF`/`-1` convention as `rekordboxExport.ts`'s
+`buildM3u8`), mirroring Rekordbox folders as output subfolders, filenames
+sanitized against Windows-reserved characters. `playlist_ids: None` exports
+everything.
+
+**UI**: new `RekordboxMixxxExportDialog.tsx` — a checkbox tree (all
+playlists checked by default, so exporting everything is one click; folder
+checkboxes are tri-state and toggle their whole subtree) fed by the new
+`read_rekordbox_playlists` command, plus an output-folder picker. Wired into
+Settings next to the existing Rekordbox Cue Import card.
+
+**Verification.** 4 new `cargo test` cases (playlist tree parsing incl.
+nested folders, m3u8 export incl. folder mirroring and artist-less tracks,
+scoped export, filename sanitizing) plus all 8 existing rekordbox_import
+tests still green; `cargo check` clean across the crate; `npm test` (131)
+and `npm run build` (`tsc` + `vite build`) both pass. Not independently
+confirmed against a real `npm run tauri dev` window or a real Mixxx import —
+the owner should try it against their actual rekordbox.xml and confirm the
+generated .m3u8s import cleanly via Mixxx's right-click "Import Playlist".
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

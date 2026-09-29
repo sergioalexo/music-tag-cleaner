@@ -8,6 +8,7 @@
 //! move — the whole reason the roadmap called for this instead of the
 //! simpler path-keyed approach.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use quick_xml::events::Event;
@@ -58,7 +59,12 @@ pub struct CueData {
 
 #[derive(Debug, Clone, Default)]
 struct ParsedTrack {
+    track_id: i64,
     location: String,
+    name: String,
+    artist: String,
+    /// Whole seconds, straight from rekordbox's `TotalTime` attribute.
+    total_time_secs: Option<i64>,
     average_bpm: Option<f64>,
     cues: CueData,
 }
@@ -121,8 +127,25 @@ fn attr_i32(e: &quick_xml::events::BytesStart, name: &str) -> Option<i32> {
     attr_str(e, name).and_then(|v| v.parse().ok())
 }
 
+/// Reads the plain (non-cue) fields off a `<TRACK>`'s attributes — shared by
+/// the `Start` (has cue children) and `Empty` (self-closed, no children,
+/// e.g. a track with no memory/hot cues) cases below.
+fn track_from_attrs(e: &quick_xml::events::BytesStart) -> ParsedTrack {
+    let location = attr_str(e, "Location").map(|l| location_to_path(&l)).unwrap_or_default();
+    ParsedTrack {
+        track_id: attr_str(e, "TrackID").and_then(|v| v.parse().ok()).unwrap_or(0),
+        location,
+        name: attr_str(e, "Name").unwrap_or_default(),
+        artist: attr_str(e, "Artist").unwrap_or_default(),
+        total_time_secs: attr_i32(e, "TotalTime").map(|v| v as i64),
+        average_bpm: attr_f64(e, "AverageBpm"),
+        cues: CueData::default(),
+    }
+}
+
 /// Parses a rekordbox.xml collection export into one entry per `<TRACK>`.
-/// Ignores `<PLAYLISTS>` entirely — out of scope for cue import.
+/// Ignores `<PLAYLISTS>` entirely — out of scope for cue import (see
+/// `parse_playlist_tree` below, which reads that section separately).
 fn parse_rekordbox_xml(xml_path: &str) -> Result<Vec<ParsedTrack>, String> {
     let mut reader = Reader::from_file(xml_path).map_err(|e| e.to_string())?;
     reader.config_mut().trim_text(true);
@@ -135,12 +158,12 @@ fn parse_rekordbox_xml(xml_path: &str) -> Result<Vec<ParsedTrack>, String> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) if e.name().as_ref() == "TRACK" => {
-                let location = attr_str(&e, "Location").map(|l| location_to_path(&l)).unwrap_or_default();
-                current = Some(ParsedTrack {
-                    location,
-                    average_bpm: attr_f64(&e, "AverageBpm"),
-                    cues: CueData::default(),
-                });
+                current = Some(track_from_attrs(&e));
+            }
+            // A track with no memory/hot cues at all may be self-closed
+            // rather than an empty Start/End pair.
+            Ok(Event::Empty(e)) if e.name().as_ref() == "TRACK" => {
+                tracks.push(track_from_attrs(&e));
             }
             Ok(Event::End(e)) if e.name().as_ref() == "TRACK" => {
                 if let Some(track) = current.take() {
@@ -195,6 +218,281 @@ fn parse_rekordbox_xml(xml_path: &str) -> Result<Vec<ParsedTrack>, String> {
     }
 
     Ok(tracks)
+}
+
+// --- Playlist export (v0.14 Mixxx bridge): reads <PLAYLISTS> from a
+// rekordbox.xml (skipped entirely by the cue importer above) and writes each
+// playlist out as a standalone .m3u8 that Mixxx's "Import Playlist" reads
+// directly — no USB/SD device export required. Folder structure in
+// Rekordbox is mirrored as subfolders of the chosen output directory.
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistNode {
+    /// Stable within one parse of one file; built from the node's position
+    /// in the tree plus its name, not persisted across imports.
+    pub id: String,
+    pub name: String,
+    pub is_folder: bool,
+    /// A playlist's own entry count, or the sum of a folder's descendants.
+    pub track_count: usize,
+    pub children: Vec<PlaylistNode>,
+}
+
+/// playlist id -> (folder path components, playlist name, ordered track keys).
+type PlaylistData = HashMap<String, (Vec<String>, String, Vec<i64>)>;
+
+fn read_playlist_children<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    parent_id: &str,
+    parent_path: &[String],
+    data: &mut PlaylistData,
+) -> Result<Vec<PlaylistNode>, String> {
+    let mut children = Vec::new();
+    let mut index = 0usize;
+    loop {
+        match reader.read_event_into(buf) {
+            Ok(Event::Eof) => return Err("unexpected EOF inside <NODE>".to_string()),
+            Ok(Event::End(e)) if e.name().as_ref() == "NODE" => {
+                let _ = e;
+                break;
+            }
+            Ok(Event::Start(e)) if e.name().as_ref() == "NODE" => {
+                let owned = e.into_owned();
+                buf.clear();
+                let node = read_playlist_node(reader, buf, &owned, parent_id, index, parent_path, data)?;
+                index += 1;
+                children.push(node);
+            }
+            Ok(Event::Empty(e)) if e.name().as_ref() == "NODE" => {
+                children.push(playlist_leaf(&e, parent_id, index, parent_path, data));
+                index += 1;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("XML parse error: {e}")),
+        }
+        buf.clear();
+    }
+    Ok(children)
+}
+
+fn read_playlist_node<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    attrs: &quick_xml::events::BytesStart,
+    parent_id: &str,
+    index: usize,
+    parent_path: &[String],
+    data: &mut PlaylistData,
+) -> Result<PlaylistNode, String> {
+    let name = attr_str(attrs, "Name").unwrap_or_default();
+    let is_folder = attr_str(attrs, "Type").as_deref() != Some("1");
+    let id = format!("{parent_id}/{index}:{name}");
+
+    if is_folder {
+        let mut child_path = parent_path.to_vec();
+        child_path.push(name.clone());
+        let children = read_playlist_children(reader, buf, &id, &child_path, data)?;
+        let track_count = children.iter().map(|c| c.track_count).sum();
+        Ok(PlaylistNode { id, name, is_folder: true, track_count, children })
+    } else {
+        // A playlist NODE's children are <TRACK Key="…"/> entries, not sub-NODEs.
+        let mut track_ids = Vec::new();
+        loop {
+            match reader.read_event_into(buf) {
+                Ok(Event::Eof) => return Err("unexpected EOF inside playlist NODE".to_string()),
+                Ok(Event::End(e)) if e.name().as_ref() == "NODE" => {
+                    let _ = e;
+                    break;
+                }
+                Ok(Event::Empty(e)) if e.name().as_ref() == "TRACK" => {
+                    if let Some(key) = attr_str(&e, "Key").and_then(|v| v.parse::<i64>().ok()) {
+                        track_ids.push(key);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("XML parse error: {e}")),
+            }
+            buf.clear();
+        }
+        let track_count = track_ids.len();
+        data.insert(id.clone(), (parent_path.to_vec(), name.clone(), track_ids));
+        Ok(PlaylistNode { id, name, is_folder: false, track_count, children: Vec::new() })
+    }
+}
+
+/// A self-closed `<NODE .../>` — an empty folder or empty playlist, either
+/// way it has no children to recurse into.
+fn playlist_leaf(
+    e: &quick_xml::events::BytesStart,
+    parent_id: &str,
+    index: usize,
+    parent_path: &[String],
+    data: &mut PlaylistData,
+) -> PlaylistNode {
+    let name = attr_str(e, "Name").unwrap_or_default();
+    let is_folder = attr_str(e, "Type").as_deref() != Some("1");
+    let id = format!("{parent_id}/{index}:{name}");
+    if !is_folder {
+        data.insert(id.clone(), (parent_path.to_vec(), name.clone(), Vec::new()));
+    }
+    PlaylistNode { id, name, is_folder, track_count: 0, children: Vec::new() }
+}
+
+/// Parses the `<PLAYLISTS>` tree of a rekordbox.xml. The root `<NODE
+/// Name="ROOT">` itself is synthesized (id `"root"`) rather than surfaced as
+/// a real folder, since its own name is never part of a playlist's path.
+fn parse_playlist_tree(xml_path: &str) -> Result<(PlaylistNode, PlaylistData), String> {
+    let mut reader = Reader::from_file(xml_path).map_err(|e| e.to_string())?;
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => return Err("no <PLAYLISTS> section found in this XML".to_string()),
+            Ok(Event::Start(e)) if e.name().as_ref() == "PLAYLISTS" => break,
+            Ok(_) => {}
+            Err(e) => return Err(format!("XML parse error: {e}")),
+        }
+        buf.clear();
+    }
+    buf.clear();
+
+    let mut data: PlaylistData = HashMap::new();
+    let root_children = loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => return Err("<PLAYLISTS> has no root NODE".to_string()),
+            Ok(Event::Start(e)) if e.name().as_ref() == "NODE" => {
+                let _ = e;
+                buf.clear();
+                break read_playlist_children(&mut reader, &mut buf, "root", &[], &mut data)?;
+            }
+            Ok(Event::Empty(e)) if e.name().as_ref() == "NODE" => {
+                let _ = e;
+                break Vec::new();
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("XML parse error: {e}")),
+        }
+        buf.clear();
+    };
+
+    let track_count = root_children.iter().map(|c| c.track_count).sum();
+    let root = PlaylistNode { id: "root".to_string(), name: "ROOT".to_string(), is_folder: true, track_count, children: root_children };
+    Ok((root, data))
+}
+
+/// Strips characters Windows (and, harmlessly, everyone else) rejects in a
+/// path segment, so a Rekordbox folder/playlist name can never break the
+/// output path.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name.chars().map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
+    let trimmed = cleaned.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Builds an `.m3u8` body identical in shape to the TS `buildM3u8()` in
+/// `rekordboxExport.ts` (same `#EXTINF` convention, `-1` for unknown
+/// duration) so a Rekordbox-sourced and an app-sourced playlist look the
+/// same to Mixxx. Track ids with no COLLECTION match (deleted from
+/// Rekordbox since the playlist was built, or a parse mismatch) are skipped.
+fn build_m3u8(track_ids: &[i64], tracks_by_id: &HashMap<i64, ParsedTrack>) -> (String, usize) {
+    let mut lines = vec!["#EXTM3U".to_string()];
+    let mut matched = 0;
+    for id in track_ids {
+        let Some(t) = tracks_by_id.get(id) else { continue };
+        matched += 1;
+        let title = if t.name.is_empty() {
+            Path::new(&t.location).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            t.name.clone()
+        };
+        let label = if t.artist.is_empty() { title } else { format!("{} - {}", t.artist, title) };
+        let duration = t.total_time_secs.unwrap_or(-1);
+        lines.push(format!("#EXTINF:{duration},{label}"));
+        lines.push(t.location.clone());
+    }
+    (lines.join("\n") + "\n", matched)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistExportEntry {
+    pub playlist_id: String,
+    pub playlist_name: String,
+    pub file_path: String,
+    pub track_count: usize,
+    pub matched: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistExportResult {
+    pub exported: Vec<PlaylistExportEntry>,
+}
+
+fn export_playlists_blocking(
+    xml_path: &str,
+    output_dir: &str,
+    playlist_ids: Option<Vec<String>>,
+) -> Result<PlaylistExportResult, String> {
+    let tracks = parse_rekordbox_xml(xml_path)?;
+    let tracks_by_id: HashMap<i64, ParsedTrack> = tracks.into_iter().map(|t| (t.track_id, t)).collect();
+
+    let (_, playlist_data) = parse_playlist_tree(xml_path)?;
+
+    let wanted: Vec<String> = match playlist_ids {
+        Some(ids) => ids,
+        None => playlist_data.keys().cloned().collect(),
+    };
+
+    let mut exported = Vec::new();
+    for id in wanted {
+        let Some((folder_path, name, track_ids)) = playlist_data.get(&id) else { continue };
+
+        let mut dir = std::path::PathBuf::from(output_dir);
+        for segment in folder_path {
+            dir.push(sanitize_filename(segment));
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+
+        let file_path = dir.join(format!("{}.m3u8", sanitize_filename(name)));
+        let (content, matched) = build_m3u8(track_ids, &tracks_by_id);
+        std::fs::write(&file_path, content).map_err(|e| format!("could not write {}: {e}", file_path.display()))?;
+
+        exported.push(PlaylistExportEntry {
+            playlist_id: id.clone(),
+            playlist_name: name.clone(),
+            file_path: file_path.display().to_string(),
+            track_count: track_ids.len(),
+            matched,
+        });
+    }
+
+    Ok(PlaylistExportResult { exported })
+}
+
+#[tauri::command]
+pub async fn read_rekordbox_playlists(xml_path: String) -> Result<PlaylistNode, String> {
+    tauri::async_runtime::spawn_blocking(move || parse_playlist_tree(&xml_path).map(|(tree, _)| tree))
+        .await
+        .map_err(|_| "rekordbox playlist read task panicked".to_string())?
+}
+
+#[tauri::command]
+pub async fn export_rekordbox_playlists_for_mixxx(
+    xml_path: String,
+    output_dir: String,
+    playlist_ids: Option<Vec<String>>,
+) -> Result<PlaylistExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || export_playlists_blocking(&xml_path, &output_dir, playlist_ids))
+        .await
+        .map_err(|_| "rekordbox playlist export task panicked".to_string())?
 }
 
 const CUES_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS cues (
@@ -457,5 +755,138 @@ mod tests {
         assert!(miss.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A folder containing a nested folder and two top-level playlists — the
+    /// shape a real Rekordbox collection with any organization actually has.
+    const PLAYLIST_TREE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="7.2.18" Company="AlphaTheta"/>
+  <COLLECTION Entries="3">
+    <TRACK TrackID="1" Name="Coming Home" Artist="A-Trak" TotalTime="245"
+           Location="file://localhost/C:/Music/song1.flac"/>
+    <TRACK TrackID="2" Name="Loom" Artist="Ferreck Dawn" TotalTime="312"
+           Location="file://localhost/C:/Music/song2.flac"/>
+    <TRACK TrackID="3" Name="No Name Track" TotalTime="0"
+           Location="file://localhost/C:/Music/song3.flac"/>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="2">
+      <NODE Type="1" Name="Openers" KeyType="0" Entries="2">
+        <TRACK Key="1"/>
+        <TRACK Key="2"/>
+      </NODE>
+      <NODE Type="0" Name="Sets" Count="1">
+        <NODE Type="1" Name="Friday" KeyType="0" Entries="1">
+          <TRACK Key="3"/>
+        </NODE>
+      </NODE>
+    </NODE>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>"#;
+
+    fn write_temp_xml(contents: &str, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mtc-rb-{tag}-{:?}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml_path = dir.join("rekordbox.xml");
+        std::fs::write(&xml_path, contents).unwrap();
+        xml_path
+    }
+
+    #[test]
+    fn parses_a_playlist_tree_with_nested_folders() {
+        let xml_path = write_temp_xml(PLAYLIST_TREE_XML, "tree");
+
+        let (root, data) = parse_playlist_tree(xml_path.to_str().unwrap()).unwrap();
+        assert_eq!(root.name, "ROOT");
+        assert!(root.is_folder);
+        assert_eq!(root.track_count, 3, "2 in Openers + 1 in Sets/Friday");
+        assert_eq!(root.children.len(), 2);
+
+        let openers = &root.children[0];
+        assert_eq!(openers.name, "Openers");
+        assert!(!openers.is_folder);
+        assert_eq!(openers.track_count, 2);
+
+        let sets = &root.children[1];
+        assert_eq!(sets.name, "Sets");
+        assert!(sets.is_folder);
+        assert_eq!(sets.children.len(), 1);
+        let friday = &sets.children[0];
+        assert_eq!(friday.name, "Friday");
+        assert!(!friday.is_folder);
+        assert_eq!(friday.track_count, 1);
+
+        // "Openers" sits directly under ROOT, so its folder path is empty;
+        // "Friday" sits under ROOT/Sets, so its path is just ["Sets"].
+        let (openers_path, _, openers_tracks) = data.get(&openers.id).unwrap();
+        assert!(openers_path.is_empty());
+        assert_eq!(openers_tracks, &vec![1, 2]);
+        let (friday_path, _, friday_tracks) = data.get(&friday.id).unwrap();
+        assert_eq!(friday_path, &vec!["Sets".to_string()]);
+        assert_eq!(friday_tracks, &vec![3]);
+
+        std::fs::remove_dir_all(xml_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn exports_playlists_as_m3u8_mirroring_rekordbox_folders() {
+        let xml_path = write_temp_xml(PLAYLIST_TREE_XML, "export");
+        let out_dir = xml_path.parent().unwrap().join("out");
+
+        let result = export_playlists_blocking(xml_path.to_str().unwrap(), out_dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(result.exported.len(), 2, "one entry per playlist, folders excluded");
+
+        let openers = result.exported.iter().find(|e| e.playlist_name == "Openers").unwrap();
+        assert_eq!(std::path::Path::new(&openers.file_path), out_dir.join("Openers.m3u8"));
+        assert_eq!(openers.matched, 2);
+        let openers_body = std::fs::read_to_string(&openers.file_path).unwrap();
+        assert!(openers_body.starts_with("#EXTM3U\n"));
+        assert!(openers_body.contains("#EXTINF:245,A-Trak - Coming Home\n"));
+        assert!(openers_body.contains(r"C:\Music\song1.flac"));
+
+        let friday = result.exported.iter().find(|e| e.playlist_name == "Friday").unwrap();
+        assert_eq!(
+            std::path::Path::new(&friday.file_path),
+            out_dir.join("Sets").join("Friday.m3u8"),
+            "nested Rekordbox folder becomes a nested output folder"
+        );
+        let friday_body = std::fs::read_to_string(&friday.file_path).unwrap();
+        assert!(
+            friday_body.contains("#EXTINF:0,No Name Track\n"),
+            "a track with no Artist falls back to just the title"
+        );
+
+        std::fs::remove_dir_all(xml_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn export_can_be_scoped_to_selected_playlist_ids() {
+        let xml_path = write_temp_xml(PLAYLIST_TREE_XML, "scoped");
+        let out_dir = xml_path.parent().unwrap().join("out");
+
+        let (root, _) = parse_playlist_tree(xml_path.to_str().unwrap()).unwrap();
+        let openers_id = root.children[0].id.clone();
+
+        let result = export_playlists_blocking(
+            xml_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            Some(vec![openers_id]),
+        )
+        .unwrap();
+        assert_eq!(result.exported.len(), 1);
+        assert_eq!(result.exported[0].playlist_name, "Openers");
+        assert!(!out_dir.join("Sets").exists(), "unselected playlist's folder is never created");
+
+        std::fs::remove_dir_all(xml_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn sanitize_filename_strips_windows_reserved_characters() {
+        assert_eq!(sanitize_filename("Friday: Peak Time / Techno"), "Friday_ Peak Time _ Techno");
+        assert_eq!(sanitize_filename("   "), "Untitled");
     }
 }

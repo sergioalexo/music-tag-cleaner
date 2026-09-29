@@ -43,6 +43,7 @@ import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
 import type { GenreGroup } from "../lib/genres";
 import { Badge, Button, Card, CardHeader, Row, cn, inputClass, selectClass } from "../components/ui";
 import { Combobox } from "../components/Combobox";
+import { RekordboxMixxxExportDialog } from "../components/RekordboxMixxxExportDialog";
 import type { LibraryIndexApi } from "../hooks/useLibraryIndex";
 
 interface Props {
@@ -395,6 +396,7 @@ export function SettingsPage({
   const [recordingShortcut, setRecordingShortcut] = useState<string | null>(null);
   const [rbImporting, setRbImporting] = useState(false);
   const [rbProgress, setRbProgress] = useState<{ done: number; total: number } | null>(null);
+  const [mixxxExportXmlPath, setMixxxExportXmlPath] = useState<string | null>(null);
   const [casingExceptionDraft, setCasingExceptionDraft] = useState("");
 
   const exportSettings = async () => {
@@ -436,6 +438,15 @@ export function SettingsPage({
     } finally {
       setImportingSettings(false);
     }
+  };
+
+  const pickRekordboxXmlForMixxxExport = async () => {
+    const picked = await open({
+      title: "Select rekordbox.xml",
+      multiple: false,
+      filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
+    });
+    if (typeof picked === "string") setMixxxExportXmlPath(picked);
   };
 
   const importRekordboxCues = async () => {
@@ -1568,8 +1579,25 @@ export function SettingsPage({
             </span>
           )}
         </div>
+        <div className="flex items-center gap-3 border-t px-5 py-3">
+          <Button variant="secondary" size="sm" onClick={pickRekordboxXmlForMixxxExport}>
+            <ListMusic />
+            Export Playlists for Mixxx
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Writes each Rekordbox playlist as a .m3u8 — no USB/SD device required.
+          </span>
+        </div>
       </Card>
     </div>
+
+    {mixxxExportXmlPath && (
+      <RekordboxMixxxExportDialog
+        xmlPath={mixxxExportXmlPath}
+        onClose={() => setMixxxExportXmlPath(null)}
+        notify={notify}
+      />
+    )}
 
     {promptOpen && (
       <div

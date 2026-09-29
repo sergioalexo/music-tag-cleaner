@@ -133,6 +133,8 @@ fn main() {
             commands::backup_archive::read_backup_manifest,
             commands::rekordbox_import::import_rekordbox_cues,
             commands::rekordbox_import::get_cues_for_path,
+            commands::rekordbox_import::read_rekordbox_playlists,
+            commands::rekordbox_import::export_rekordbox_playlists_for_mixxx,
             commands::ytmusic::ytdlp_info,
             commands::ytmusic::install_ytdlp,
             commands::ytmusic::fetch_ytmusic_playlist,

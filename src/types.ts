@@ -433,6 +433,27 @@ export interface ImportResult {
   errors: string[];
 }
 
+// v0.14 — Rekordbox playlists -> Mixxx .m3u8 export.
+export interface PlaylistNode {
+  id: string;
+  name: string;
+  isFolder: boolean;
+  trackCount: number;
+  children: PlaylistNode[];
+}
+
+export interface PlaylistExportEntry {
+  playlistId: string;
+  playlistName: string;
+  filePath: string;
+  trackCount: number;
+  matched: number;
+}
+
+export interface PlaylistExportResult {
+  exported: PlaylistExportEntry[];
+}
+
 // v0.9 F4 — YouTube Music playlist import. Matches the camelCase structs in
 // `src-tauri/src/commands/ytmusic.rs`.
 export interface YtDlpInfo {
