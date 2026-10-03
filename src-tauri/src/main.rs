@@ -41,7 +41,61 @@ fn take_opened_files(state: tauri::State<PendingOpen>) -> Vec<String> {
     std::mem::take(&mut *state.0.lock().unwrap())
 }
 
+/// Taskbar identity. Must equal `identifier` in tauri.conf.json — that is the
+/// AUMID the pinned / Start-menu shortcut carries, so a window with any other
+/// AUMID gets its own icon-less taskbar button instead of grouping with it.
+#[cfg(windows)]
+const APP_USER_MODEL_ID: &str = "com.sopas.musictagcleaner";
+
+/// A launch from the Explorer shell extension inherits the sparse package's
+/// identity, and with it the package's AUMID (`...ShellExtension_<hash>!...`).
+/// Forcing the process AUMID makes every launch path present as the same app.
+#[cfg(windows)]
+fn set_process_app_user_model_id() {
+    use windows::core::HSTRING;
+    let _ = unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(
+            APP_USER_MODEL_ID,
+        ))
+    };
+}
+
+/// Window-level AUMID. A property on the window wins over process/package
+/// identity for taskbar grouping, so this covers a packaged launch that
+/// ignores the process-level call above.
+#[cfg(windows)]
+fn set_window_app_user_model_id(win: &tauri::WebviewWindow) {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Variant::VT_LPWSTR;
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+    use windows::Win32::UI::Shell::SHStrDupW;
+
+    let Ok(hwnd) = win.hwnd() else { return };
+    let hwnd = HWND(hwnd.0);
+    unsafe {
+        let Ok(store) = SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) else { return };
+        let wide: Vec<u16> = APP_USER_MODEL_ID.encode_utf16().chain(Some(0)).collect();
+        let Ok(dup): Result<PWSTR, _> = SHStrDupW(PCWSTR(wide.as_ptr())) else { return };
+        // VT_LPWSTR (not the BSTR that `PROPVARIANT::from(&str)` builds): the
+        // shell only accepts a plain wide string for this key. The PROPVARIANT
+        // owns `dup` and frees it with CoTaskMemFree on drop.
+        let mut pv = PROPVARIANT::default();
+        let inner = &mut *pv.Anonymous.Anonymous;
+        inner.vt = VT_LPWSTR;
+        inner.Anonymous.pwszVal = dup;
+        if store.SetValue(&PKEY_AppUserModel_ID, &pv).is_ok() {
+            let _ = store.Commit();
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    set_process_app_user_model_id();
+
     // Elevated helper mode: a second copy of this exe, launched with `runas`,
     // formats one drive and exits. Handled before anything else so the
     // single-instance plugin never sees it — that plugin forwards arguments to
@@ -77,6 +131,13 @@ fn main() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .setup(|_app| {
+            #[cfg(windows)]
+            if let Some(win) = _app.get_webview_window("main") {
+                set_window_app_user_model_id(&win);
+            }
+            Ok(())
+        })
         .manage(PendingOpen(Mutex::new(initial)))
         .manage(commands::ytmusic::EnrichCancelFlag::default())
         .invoke_handler(tauri::generate_handler![

@@ -10,8 +10,8 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
@@ -23,6 +23,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Com::{IBindCtx, IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+    UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, STARTUPINFOEXW,
+};
 use windows::Win32::UI::Shell::{
     IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray, SHStrDupW,
     ECF_DEFAULT, ECS_ENABLED, SIGDN_FILESYSPATH,
@@ -54,6 +59,85 @@ fn install_dir() -> Option<PathBuf> {
 
 fn exe_path() -> Option<PathBuf> {
     install_dir().map(|d| d.join(EXE_NAME))
+}
+
+/// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_OVERRIDE` (winbase.h): the child
+/// starts as a plain desktop process instead of inheriting this DLL's package.
+const DESKTOP_APP_BREAKAWAY_OVERRIDE: u32 = 0x2;
+
+/// Quotes one argument for `CreateProcessW`'s single command-line string:
+/// wraps it in quotes and doubles any backslashes that would otherwise escape
+/// the closing quote (a selected folder like `D:\Music\` ends in one).
+fn quote_arg(a: &str) -> String {
+    let trailing = a.len() - a.trim_end_matches('\\').len();
+    format!("\"{}{}\"", a.replace('"', "\\\""), "\\".repeat(trailing))
+}
+
+/// Starts the app *outside* the sparse package. A plain `Command::spawn` from
+/// this COM surrogate hands the child the package identity, which gives its
+/// window the package's AppUserModelID — a second, icon-less taskbar button
+/// next to the pinned one. Returns false if the call failed so the caller can
+/// fall back to an ordinary spawn.
+fn spawn_outside_package(exe: &Path, args: &[String]) -> bool {
+    let mut cmdline = quote_arg(&exe.to_string_lossy());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_arg(a));
+    }
+    let mut cmd: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+    let dir: Vec<u16> = exe
+        .parent()
+        .map(|d| d.as_os_str().encode_wide().chain(std::iter::once(0)).collect())
+        .unwrap_or_default();
+
+    unsafe {
+        let mut size = 0usize;
+        // Expected to fail with ERROR_INSUFFICIENT_BUFFER; it reports the size.
+        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
+        let mut buf = vec![0u8; size];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr() as *mut c_void);
+        if InitializeProcThreadAttributeList(Some(list), 1, None, &mut size).is_err() {
+            return false;
+        }
+        let policy: u32 = DESKTOP_APP_BREAKAWAY_OVERRIDE;
+        let ok = UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY as usize,
+            Some(&policy as *const u32 as *const c_void),
+            std::mem::size_of::<u32>(),
+            None,
+            None,
+        )
+        .is_ok();
+
+        let mut started = false;
+        if ok {
+            let mut si = STARTUPINFOEXW::default();
+            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            si.lpAttributeList = list;
+            let mut pi = PROCESS_INFORMATION::default();
+            started = CreateProcessW(
+                None,
+                Some(PWSTR(cmd.as_mut_ptr())),
+                None,
+                None,
+                false,
+                EXTENDED_STARTUPINFO_PRESENT,
+                None,
+                if dir.is_empty() { windows::core::PCWSTR::null() } else { windows::core::PCWSTR(dir.as_ptr()) },
+                &si.StartupInfo,
+                &mut pi,
+            )
+            .is_ok();
+            if started {
+                let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+                let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+            }
+        }
+        DeleteProcThreadAttributeList(list);
+        started
+    }
 }
 
 fn co_str(s: &str) -> Result<PWSTR> {
@@ -124,7 +208,9 @@ impl IExplorerCommand_Impl for OpenCommand_Impl {
         let mut chars = 0usize;
         let launch = |batch: &[String]| {
             if !batch.is_empty() {
-                let _ = Command::new(&exe).args(batch).spawn();
+                if !spawn_outside_package(&exe, batch) {
+                    let _ = Command::new(&exe).args(batch).spawn();
+                }
             }
         };
         for p in paths {

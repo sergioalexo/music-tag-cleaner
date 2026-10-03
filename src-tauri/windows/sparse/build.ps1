@@ -47,8 +47,27 @@ $version = (Get-Content "$tauri\tauri.conf.json" -Raw | ConvertFrom-Json).versio
 $m.Package.Identity.Publisher = $Subject
 $m.Package.Identity.Version = "$version.0"
 $m.Save("$stage\AppxManifest.xml")
-foreach ($n in 'StoreLogo', 'Square150x150Logo', 'Square44x44Logo') {
-  Copy-Item "$tauri\icons\128x128.png" "$stage\Assets\$n.png"
+# Visual assets: the taskbar / Settings -> Apps pick Square44x44Logo by scale
+# and targetsize, so a single oversized PNG renders blank. Resize the largest
+# source icon to every size the manifest and shell look up.
+Add-Type -AssemblyName System.Drawing
+function New-Logo([string]$name, [int]$size) {
+  $src = [System.Drawing.Image]::FromFile((Join-Path $tauri 'icons\icon.png'))
+  $bmp = New-Object System.Drawing.Bitmap $size, $size
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.InterpolationMode = 'HighQualityBicubic'
+  $g.SmoothingMode = 'HighQuality'
+  $g.PixelOffsetMode = 'HighQuality'
+  $g.DrawImage($src, 0, 0, $size, $size)
+  $bmp.Save("$stage\Assets\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+  $g.Dispose(); $bmp.Dispose(); $src.Dispose()
+}
+New-Logo 'StoreLogo' 50
+New-Logo 'Square150x150Logo' 150
+New-Logo 'Square44x44Logo' 44
+foreach ($t in 16, 24, 32, 48, 256) {
+  New-Logo "Square44x44Logo.targetsize-$t" $t
+  New-Logo "Square44x44Logo.targetsize-${t}_altform-unplated" $t
 }
 
 # 3. Pack
