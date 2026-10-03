@@ -218,6 +218,12 @@ export interface PlanInfo {
   creditsTotal: number;
 }
 
+/** Empty string for either field omits that CLI flag ("CLI default"). */
+export interface ClaudeTaskSettings {
+  model: string;
+  effort: string;
+}
+
 export interface Settings {
   /**
    * "ollama" runs the local model; "claude" drives the Claude Code CLI that
@@ -226,8 +232,12 @@ export interface Settings {
    * takes its answer back by paste.
    */
   aiBackend: "ollama" | "manual" | "claude";
-  /** Model passed to the Claude CLI; empty means whatever it defaults to. */
-  claudeModel: string;
+  /** Per-task Claude CLI model + effort. Empty model/effort omits the
+   * corresponding flag, which means "whatever the CLI defaults to". */
+  claudeTasks: {
+    clean: ClaudeTaskSettings;
+    playlist: ClaudeTaskSettings;
+  };
   ollamaUrl: string;
   ollamaModel: string;
   batchSize: number;

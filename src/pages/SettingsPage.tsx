@@ -87,6 +87,76 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
   );
 }
 
+const CLAUDE_MODEL_PRESETS = ["", "haiku", "sonnet", "opus"] as const;
+const CLAUDE_MODEL_LABELS: Record<string, string> = {
+  "": "Claude Code default",
+  haiku: "Haiku",
+  sonnet: "Sonnet",
+  opus: "Opus",
+};
+const CLAUDE_EFFORT_PRESETS = ["", "low", "medium", "high"] as const;
+const CLAUDE_EFFORT_LABELS: Record<string, string> = {
+  "": "Default",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+
+/** A model picker for a Claude CLI task: Haiku/Sonnet/Opus/CLI-default, or a
+ * free-typed model id via "Custom". */
+function ModelSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const isPreset = (CLAUDE_MODEL_PRESETS as readonly string[]).includes(value);
+  return (
+    <div className="flex items-center gap-2">
+      <select
+        className={cn(selectClass, "w-44")}
+        value={isPreset ? value : "custom"}
+        onChange={(e) => onChange(e.target.value === "custom" ? value || " " : e.target.value)}
+      >
+        {CLAUDE_MODEL_PRESETS.map((m) => (
+          <option key={m} value={m}>
+            {CLAUDE_MODEL_LABELS[m]}
+          </option>
+        ))}
+        <option value="custom">Custom…</option>
+      </select>
+      {!isPreset && (
+        <input
+          className={cn(inputClass, "w-36")}
+          value={value.trim()}
+          placeholder="full model id"
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+    </div>
+  );
+}
+
+function EffortSelect({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: string;
+  disabled?: boolean;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <select
+      className={cn(selectClass, "w-32")}
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      {CLAUDE_EFFORT_PRESETS.map((e) => (
+        <option key={e} value={e}>
+          {CLAUDE_EFFORT_LABELS[e]}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 /**
  * A genre input with its own draft, committed on blur/Enter rather than on
  * every keystroke. Committing goes through `onCommit(newName)` (a rename,
@@ -739,13 +809,29 @@ export function SettingsPage({
               </div>
               <Row
                 label="Model"
-                hint="Leave empty to use whatever the CLI defaults to (e.g. sonnet, opus, haiku)"
+                hint="Which model AI Clean runs on — Custom lets you type a full model id"
               >
-                <input
-                  className={cn(inputClass, "w-44")}
-                  value={settings.claudeModel}
-                  placeholder="default"
-                  onChange={(e) => set("claudeModel", e.target.value)}
+                <ModelSelect
+                  value={settings.claudeTasks.clean.model}
+                  onChange={(model) =>
+                    set("claudeTasks", { ...settings.claudeTasks, clean: { ...settings.claudeTasks.clean, model } })
+                  }
+                />
+              </Row>
+              <Row
+                label="Effort"
+                hint={
+                  settings.claudeTasks.clean.model === "haiku"
+                    ? "Haiku 4.5 has no effort setting"
+                    : "How much the model thinks before answering — low is fastest"
+                }
+              >
+                <EffortSelect
+                  value={settings.claudeTasks.clean.effort}
+                  disabled={settings.claudeTasks.clean.model === "haiku"}
+                  onChange={(effort) =>
+                    set("claudeTasks", { ...settings.claudeTasks, clean: { ...settings.claudeTasks.clean, effort } })
+                  }
                 />
               </Row>
             </>

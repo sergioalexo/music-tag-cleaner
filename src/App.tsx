@@ -695,7 +695,7 @@ export default function App() {
         return null;
       }
       // The CLI picks its own default when none is set.
-      return settingsRef.current.claudeModel || "";
+      return settingsRef.current.claudeTasks.clean.model || "";
     }
 
     const status = await ai.check(settingsRef.current.ollamaUrl);
@@ -725,6 +725,16 @@ export default function App() {
 
     setBusy(true);
     setAiRunning(true);
+    // Tallied locally (rather than read back from settings.usage, which
+    // updates asynchronously) so the completion toast can report this run's
+    // own token cost, not the lifetime total.
+    let runTokens = 0;
+    const unlistenUsage = await listen<{ promptEvalCount: number; evalCount: number }>(
+      "ai-usage",
+      (e) => {
+        runTokens += e.payload.promptEvalCount + e.payload.evalCount;
+      },
+    );
     try {
       const { map, errors } = await tagsApi.read(paths);
       errors.forEach((e) => notify(e, "error"));
@@ -743,12 +753,14 @@ export default function App() {
       setTagsMap(map);
       setPreviewMode("ai");
       setUnresolved(new Set(unresolvedPaths));
+      const tokenNote = runTokens > 0 ? ` (${runTokens.toLocaleString()} tokens)` : "";
       if (stopped && rows.length === 0) {
         notify("AI stopped — no results to show", "info");
       } else {
         setPending(rows);
-        if (stopped) notify("AI stopped — showing results processed so far", "info");
-        else if (!rows.some((r) => r.changed)) notify("AI found nothing to change", "info");
+        if (stopped) notify(`AI stopped — showing results processed so far${tokenNote}`, "info");
+        else if (!rows.some((r) => r.changed)) notify(`AI found nothing to change${tokenNote}`, "info");
+        else if (tokenNote) notify(`AI Clean ready — review changes below${tokenNote}`, "success");
       }
       if (unresolvedPaths.length)
         notify(
@@ -760,6 +772,7 @@ export default function App() {
     } catch (e) {
       notify(String(e), "error");
     } finally {
+      unlistenUsage();
       setProgress(null);
       setAiRunning(false);
       setBusy(false);

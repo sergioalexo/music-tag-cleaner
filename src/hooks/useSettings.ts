@@ -5,11 +5,14 @@ import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 11;
+export const CURRENT_SETTINGS_VERSION = 12;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
-  claudeModel: "",
+  claudeTasks: {
+    clean: { model: "sonnet", effort: "low" },
+    playlist: { model: "sonnet", effort: "medium" },
+  },
   ollamaUrl: "http://localhost:11434",
   ollamaModel: "",
   batchSize: 50,
@@ -85,7 +88,10 @@ const STORE_FILE = "settings.json";
  * renders as-typed), same merge-fills-it-in bump. v11 adds `libraryFolder`
  * (the one permanent Library folder, replacing the old multi-root model) —
  * seeded from the first existing `library_root` row by the loader below,
- * since that needs an `invoke` call `migrate` itself can't make.
+ * since that needs an `invoke` call `migrate` itself can't make. v12 splits
+ * the single `claudeModel` into a model+effort pair per AI task
+ * (`claudeTasks.clean` / `.playlist`) — a non-empty old `claudeModel`
+ * becomes the Clean task's model, keeping the Clean task's default effort.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -134,6 +140,17 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     const legacy = next as unknown as Record<string, unknown>;
     delete legacy.genrePresets;
     delete legacy.activeGenrePreset;
+  }
+  if (savedVersion < 12) {
+    const legacy = next as unknown as Record<string, unknown>;
+    const oldModel = legacy.claudeModel;
+    if (typeof oldModel === "string" && oldModel.trim()) {
+      next.claudeTasks = {
+        ...next.claudeTasks,
+        clean: { ...next.claudeTasks.clean, model: oldModel },
+      };
+    }
+    delete legacy.claudeModel;
   }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;

@@ -168,7 +168,8 @@ export function useAI() {
           ? await invoke<CleanedTrack[]>("claude_clean_batch", {
               tracks: batch,
               transliterateScripts: settings.transliterateScripts,
-              model: settings.claudeModel || null,
+              model: settings.claudeTasks.clean.model || null,
+              effort: settings.claudeTasks.clean.effort || null,
             })
           : await invoke<CleanedTrack[]>("ai_clean_batch", {
               url: settings.ollamaUrl,

@@ -189,7 +189,12 @@ fn version_of(exe: &PathBuf) -> Option<String> {
 /// there isn't one. The CLI exits non-zero in that case too, but the body is
 /// still valid JSON and carries the only useful message, so the body is
 /// parsed first and the exit code is only a fallback.
-fn run_prompt(exe: &PathBuf, prompt: &str, model: Option<&str>) -> Result<(String, Value), String> {
+fn run_prompt(
+    exe: &PathBuf,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(String, Value), String> {
     let mut cmd = Command::new(exe);
     cmd.arg("--print")
         .arg(prompt)
@@ -204,6 +209,9 @@ fn run_prompt(exe: &PathBuf, prompt: &str, model: Option<&str>) -> Result<(Strin
         .arg("Return only the requested JSON. Do not use any tools.");
     if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
         cmd.arg("--model").arg(m);
+    }
+    if let Some(e) = effort.filter(|e| !e.trim().is_empty()) {
+        cmd.arg("--effort").arg(e);
     }
     hide_console(&mut cmd);
 
@@ -243,19 +251,47 @@ fn run_prompt(exe: &PathBuf, prompt: &str, model: Option<&str>) -> Result<(Strin
 
 /// Reports usage the same way the Ollama path does, so the usage dashboard
 /// counts every backend rather than silently under-reporting this one.
+///
+/// Field names must match `AiUsage` (`model`, `prompt_eval_count`,
+/// `eval_count`, `tracks`, camel-cased by serde) — the frontend's `ai-usage`
+/// listener destructures those names, so an envelope with different keys
+/// here is silently dropped (undefined fields, not an error).
+///
+/// `modelUsage` can list a small helper model (e.g. Haiku) alongside the
+/// main one that did the actual work; the entry with the most output
+/// tokens is the one that matters, not whichever key happens to come first.
 fn emit_usage(app: &AppHandle, envelope: &Value, tracks: usize) {
     let usage = &envelope["usage"];
+    // The CLI's per-model entries have been observed in both snake_case
+    // (mirroring the top-level `usage` object) and camelCase; accept either.
+    fn tokens(v: &Value, snake: &str, camel: &str) -> u64 {
+        v[snake].as_u64().or_else(|| v[camel].as_u64()).unwrap_or(0)
+    }
+    let model_usage = envelope["modelUsage"].as_object();
+    let main_entry = model_usage.and_then(|m| {
+        m.iter().max_by_key(|(_, v)| tokens(v, "output_tokens", "outputTokens"))
+    });
+    let model = main_entry
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| "claude-cli".to_string());
+    let (prompt_tokens, completion_tokens) = match main_entry {
+        Some((_, v)) => (
+            tokens(v, "input_tokens", "inputTokens"),
+            tokens(v, "output_tokens", "outputTokens"),
+        ),
+        None => (
+            usage["input_tokens"].as_u64().unwrap_or(0),
+            usage["output_tokens"].as_u64().unwrap_or(0),
+        ),
+    };
     let _ = app.emit(
         "ai-usage",
-        serde_json::json!({
-            "model": envelope["modelUsage"]
-                .as_object()
-                .and_then(|m| m.keys().next().cloned())
-                .unwrap_or_else(|| "claude-cli".to_string()),
-            "promptTokens": usage["input_tokens"].as_u64().unwrap_or(0),
-            "completionTokens": usage["output_tokens"].as_u64().unwrap_or(0),
-            "songs": tracks,
-        }),
+        crate::models::AiUsage {
+            model,
+            prompt_eval_count: prompt_tokens,
+            eval_count: completion_tokens,
+            tracks,
+        },
     );
 }
 
@@ -371,7 +407,7 @@ pub async fn claude_cli_info() -> ClaudeCliInfo {
         let version = version_of(&exe);
         // The cheapest possible real call: it costs a handful of tokens and
         // is the only way to tell "installed" from "actually usable".
-        let (logged_in, error) = match run_prompt(&exe, "Reply with exactly: OK", None) {
+        let (logged_in, error) = match run_prompt(&exe, "Reply with exactly: OK", None, None) {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e)),
         };
@@ -399,6 +435,7 @@ pub async fn claude_clean_batch(
     tracks: Vec<TrackInput>,
     transliterate_scripts: Vec<String>,
     model: Option<String>,
+    effort: Option<String>,
 ) -> Result<Vec<CleanedTrack>, String> {
     let count = tracks.len();
     let prompt = ai::build_clean_prompt(&tracks, &transliterate_scripts)?;
@@ -406,7 +443,7 @@ pub async fn claude_clean_batch(
         let exe = find_claude().ok_or_else(|| {
             "No Claude CLI found — install it, or switch the AI backend in Settings.".to_string()
         })?;
-        run_prompt(&exe, &prompt, model.as_deref())
+        run_prompt(&exe, &prompt, model.as_deref(), effort.as_deref())
     })
     .await
     .map_err(|_| "The Claude CLI task panicked".to_string())??;
@@ -487,6 +524,61 @@ mod tests {
     fn an_empty_result_is_an_error_not_an_empty_parse() {
         let v = json!({ "is_error": false, "result": "   " });
         assert!(interpret(&v).is_err());
+    }
+
+    /// Mirrors `run_prompt`'s flag-building so the empty-vs-set behaviour for
+    /// both `--model` and `--effort` can be checked without spawning the CLI.
+    fn build_args(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+        if let Some(e) = effort.filter(|e| !e.trim().is_empty()) {
+            args.push("--effort".to_string());
+            args.push(e.to_string());
+        }
+        args
+    }
+
+    #[test]
+    fn empty_model_and_effort_add_no_flags() {
+        assert_eq!(build_args(None, None), Vec::<String>::new());
+        assert_eq!(build_args(Some(""), Some("")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_set_model_and_effort_each_add_their_flag() {
+        assert_eq!(
+            build_args(Some("sonnet"), Some("low")),
+            vec!["--model", "sonnet", "--effort", "low"]
+        );
+    }
+
+    #[test]
+    fn only_effort_set_omits_the_model_flag() {
+        assert_eq!(build_args(None, Some("medium")), vec!["--effort", "medium"]);
+    }
+
+    #[test]
+    fn usage_picks_the_model_with_the_most_output_tokens_not_the_first_key() {
+        let envelope = json!({
+            "modelUsage": {
+                "claude-haiku-4-5": { "input_tokens": 50, "output_tokens": 10 },
+                "claude-sonnet-5": { "input_tokens": 500, "output_tokens": 900 },
+            },
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+        });
+        fn tokens(v: &Value, snake: &str, camel: &str) -> u64 {
+            v[snake].as_u64().or_else(|| v[camel].as_u64()).unwrap_or(0)
+        }
+        let model_usage = envelope["modelUsage"].as_object().unwrap();
+        let (main_model, main_entry) = model_usage
+            .iter()
+            .max_by_key(|(_, v)| tokens(v, "output_tokens", "outputTokens"))
+            .unwrap();
+        assert_eq!(main_model, "claude-sonnet-5");
+        assert_eq!(tokens(main_entry, "output_tokens", "outputTokens"), 900);
     }
 
     /// The CLI's own response is fed to the same parser the Ollama and manual
