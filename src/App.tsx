@@ -1992,6 +1992,11 @@ This rewrites the genre tag on ${
               files={wholeCollection.files}
               tags={wholeCollection.tags}
               indexedCount={libraryIndex.stats?.trackCount ?? 0}
+              libraryTracks={libraryIndex.tracks}
+              libraryFiles={libraryIndex.files}
+              libraryTags={libraryIndex.tags}
+              libraryGenres={libraryIndex.genres}
+              settings={settings}
               notify={notify}
               indexing={libraryIndex.indexing}
               lastIndexedAt={libraryIndex.stats?.lastIndexedAt ?? null}

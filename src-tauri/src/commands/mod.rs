@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod ai_playlist;
 #[cfg(test)]
 mod ai_tests;
 pub mod backup;

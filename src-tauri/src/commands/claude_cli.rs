@@ -35,8 +35,9 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
 use crate::commands::ai;
+use crate::commands::ai_playlist;
 use crate::commands::ffmpeg::hide_console;
-use crate::models::{CleanedTrack, TrackInput};
+use crate::models::{CleanedTrack, PlaylistAiResult, PlaylistSetSpec, PlaylistTrackInput, TrackInput};
 
 #[cfg(target_os = "windows")]
 const CLAUDE_EXE: &str = "claude.exe";
@@ -450,6 +451,32 @@ pub async fn claude_clean_batch(
 
     emit_usage(&app, &envelope, count);
     ai::parse_cleaned(&text)
+}
+
+/// AI playlists (D5) through the Claude CLI backend, using workstream F's
+/// `claudeTasks.playlist` model/effort pair rather than the Clean task's.
+#[tauri::command]
+pub async fn claude_playlist_batch(
+    app: AppHandle,
+    pool: Vec<PlaylistTrackInput>,
+    instructions: String,
+    sets: Vec<PlaylistSetSpec>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<PlaylistAiResult, String> {
+    let pool_ids: Vec<u32> = pool.iter().map(|t| t.id).collect();
+    let prompt = ai_playlist::build_playlist_prompt(&pool, &instructions, &sets)?;
+    let (text, envelope) = tauri::async_runtime::spawn_blocking(move || {
+        let exe = find_claude().ok_or_else(|| {
+            "No Claude CLI found — install it, or switch the AI backend in Settings.".to_string()
+        })?;
+        run_prompt(&exe, &prompt, model.as_deref(), effort.as_deref())
+    })
+    .await
+    .map_err(|_| "The Claude CLI task panicked".to_string())??;
+
+    emit_usage(&app, &envelope, pool_ids.len());
+    Ok(ai_playlist::parse_playlist_response(&text, &pool_ids))
 }
 
 #[cfg(test)]

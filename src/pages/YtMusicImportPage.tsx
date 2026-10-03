@@ -27,15 +27,19 @@ import {
 import type {
   AudioFile,
   EntryMeta,
+  GenreCount,
   ImportSession,
   ImportSessionSummary,
+  IndexedTrack,
   PlaylistEntry,
   PlaylistFetchResult,
+  Settings,
   TagData,
   YtDlpInfo,
 } from "../types";
 import { AudioPreview } from "../components/AudioPreview";
 import { YouTubePreview } from "../components/YouTubePreview";
+import { AiPlaylistBuilder } from "../components/AiPlaylistBuilder";
 import {
   AMBIGUOUS_THRESHOLD,
   buildWanted,
@@ -130,6 +134,11 @@ export function YtMusicImportPage({
   files,
   tags,
   indexedCount,
+  libraryTracks,
+  libraryFiles,
+  libraryTags,
+  libraryGenres,
+  settings,
   notify,
   onInspect,
   indexing,
@@ -142,6 +151,12 @@ export function YtMusicImportPage({
   tags: Record<string, TagData>;
   /** How many of `files` came from the index, for the "index your library" hint. */
   indexedCount: number;
+  /** The Library index only (D1) — AI Playlists must never see the working batch. */
+  libraryTracks: IndexedTrack[];
+  libraryFiles: AudioFile[];
+  libraryTags: Record<string, TagData>;
+  libraryGenres: GenreCount[];
+  settings: Settings;
   notify: Notify;
   onInspect: (path: string) => void;
   /** Whether a whole-library index run is currently in progress. */
@@ -152,6 +167,7 @@ export function YtMusicImportPage({
   /** Right-click → "Add to working batch", for matched rows and the search dock. */
   onAddToBatch?: (paths: string[]) => unknown;
 }) {
+  const [mode, setMode] = useState<"import" | "playlists">("import");
   const [ytdlp, setYtdlp] = useState<YtDlpInfo | null>(null);
   const [checkingYtdlp, setCheckingYtdlp] = useState(true);
   const [installing, setInstalling] = useState(false);
@@ -1036,8 +1052,53 @@ export function YtMusicImportPage({
     }
   };
 
+  if (mode === "playlists") {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex items-center gap-1.5 border-b px-6 py-2">
+          <button
+            onClick={() => setMode("import")}
+            className="rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent"
+          >
+            Import
+          </button>
+          <button
+            onClick={() => setMode("playlists")}
+            className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground"
+          >
+            AI Playlists
+          </button>
+        </div>
+        <AiPlaylistBuilder
+          tracks={libraryTracks}
+          files={libraryFiles}
+          tags={libraryTags}
+          genres={libraryGenres}
+          settings={settings}
+          notify={notify}
+          onAddToBatch={onAddToBatch}
+          onInspect={onInspect}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-1.5 border-b px-6 py-2">
+        <button
+          onClick={() => setMode("import")}
+          className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground"
+        >
+          Import
+        </button>
+        <button
+          onClick={() => setMode("playlists")}
+          className="rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-accent"
+        >
+          AI Playlists
+        </button>
+      </div>
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-6">
         <div>
           <h1 className="text-xl font-bold">YouTube Music Import</h1>

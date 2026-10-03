@@ -111,6 +111,46 @@ pub struct CleanedTrack {
     pub genre: Option<String>,
 }
 
+/// One Library track as the AI playlist prompt sees it (D5). `id` is the
+/// pool-local 1-based index, not a database id — the AI echoes it back in
+/// `trackIds`, and anything it returns outside the pool is dropped rather
+/// than trusted (the "AI must never invent tracks" rule).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistTrackInput {
+    pub id: u32,
+    pub artist: String,
+    pub title: String,
+    pub genre: String,
+    pub year: String,
+    pub bpm: String,
+}
+
+/// One requested set (D4) — a name, and optionally how many tracks it
+/// should hold. `target_count` of `None` lets the AI decide the split.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSetSpec {
+    pub name: String,
+    pub target_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSet {
+    pub name: String,
+    pub track_ids: Vec<u32>,
+}
+
+/// The AI's full answer (D5 + D6): the requested sets, plus a separate list
+/// of songs it thinks would fit but aren't in the Library at all.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistAiResult {
+    pub sets: Vec<PlaylistSet>,
+    #[serde(default)]
+    pub suggestions: Vec<String>,
+}
+
 /// One file's table thumbnail, as returned by `read_cover_thumbnails`.
 /// `data_url` is `None` both for "no embedded art" and for an unreadable
 /// file — the table draws the same placeholder either way, and a per-file

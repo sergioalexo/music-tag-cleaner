@@ -596,6 +596,33 @@ export interface IndexProgress {
   current: string;
 }
 
+/** One Library track as the AI playlist prompt sees it (D5). `id` is a
+ * pool-local, 1-based position — not a database id. */
+export interface PlaylistTrackInput {
+  id: number;
+  artist: string;
+  title: string;
+  genre: string;
+  year: string;
+  bpm: string;
+}
+
+/** One requested set (D4). `targetCount` of `undefined` lets the AI decide. */
+export interface PlaylistSetSpec {
+  name: string;
+  targetCount?: number;
+}
+
+export interface PlaylistSet {
+  name: string;
+  trackIds: number[];
+}
+
+export interface PlaylistAiResult {
+  sets: PlaylistSet[];
+  suggestions: string[];
+}
+
 /** A saved YouTube-import session (see `ImportSession` in ytmusic.rs). */
 export interface ImportSession {
   key: string;
