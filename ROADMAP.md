@@ -2187,6 +2187,39 @@ settings files heal on next launch.
 
 **Verification.** `tsc --noEmit` clean. Not clicked through in the GUI yet.
 
+### 59. "Open with MusicTagCleaner" in Explorer's right-click menu — v0.15.2
+
+**What/why.** Right-clicking audio files in Explorer never offered the app.
+`bundle.fileAssociations` only registers a ProgID, which Explorer ignores
+once another player (AIMP here) owns the extension's UserChoice; and Windows
+11's compact menu only lists `IExplorerCommand` handlers from packaged apps,
+never plain registry verbs.
+
+**How.**
+- `src-tauri/windows/hooks.nsh` (NSIS installer hooks): adds the ProgID to
+  each audio extension's `OpenWithProgids`, plus a classic
+  `SystemFileAssociations\<ext>\shell\MusicTagCleaner` verb (shows under
+  "Show more options"). Skipped when the main-menu DLL below is installed,
+  since that entry already appears there too. Uninstall removes all of it.
+- `src-tauri/shell-ext/`: standalone Rust cdylib implementing
+  `IExplorerCommand` + class factory (CLSID `18a527bb-…`). Invoke launches
+  the exe with every selected path (batched under the command-line limit;
+  single-instance merges launches).
+- `src-tauri/windows/sparse/`: sparse MSIX manifest (`desktop4/5`
+  `FileExplorerContextMenus` + `com:SurrogateServer`) with
+  `AllowExternalContent`, registered against the install folder.
+  `build.ps1 -Install` builds the DLL, packs, signs, copies the DLL next to
+  the exe and registers.
+
+**Limit.** The sparse package must be signed by a cert the machine trusts.
+It is currently signed with a self-signed dev cert, so the main-menu entry
+is owner-machine only; everyone else gets the "Show more options" verb.
+Shipping it needs a real code-signing cert (e.g. Azure Trusted Signing)
+wired into `release.yml`.
+
+**Verification.** `cargo test` in `shell-ext` (CLSID matches manifest);
+package registered (`Status Ok`), COM class activates, and the owner
+confirmed the entry shows in the Windows 11 main menu and opens files.
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

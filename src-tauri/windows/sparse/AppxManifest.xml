@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse package: gives MusicTagCleaner a package identity so Windows 11 shows
+  its IExplorerCommand (shell-ext DLL) in the compact right-click menu instead
+  of under "Show more options". Its content is the normal install folder,
+  passed as -ExternalLocation at registration. Built by build.ps1, which
+  rewrites Publisher and Version.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 desktop4 desktop5 com rescap">
+
+  <Identity
+    Name="SergioAlexo.MusicTagCleaner.ShellExtension"
+    Publisher="CN=MusicTagCleaner Dev"
+    Version="0.15.1.0"
+    ProcessorArchitecture="neutral" />
+
+  <Properties>
+    <DisplayName>MusicTagCleaner Explorer integration</DisplayName>
+    <PublisherDisplayName>Sergio Alexo</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <Application
+      Id="MusicTagCleaner"
+      Executable="music-tag-cleaner.exe"
+      uap10:TrustLevel="mediumIL"
+      uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements
+        AppListEntry="none"
+        DisplayName="MusicTagCleaner"
+        Description="Clean up messy audio tags"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type=".mp3"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".flac"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".ogg"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".aac"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".m4a"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".wav"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".aiff"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+            <desktop5:ItemType Type=".aif"><desktop5:Verb Id="OpenWithMusicTagCleaner" Clsid="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" /></desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="MusicTagCleaner context menu">
+              <com:Class Id="18a527bb-5fa8-4688-98fd-9db4d2ff7e7c" Path="music_tag_cleaner_shell.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
