@@ -415,10 +415,12 @@ export default function App() {
       void update((prev) => ({
         ...prev,
         usage: {
-          totalPromptTokens: prev.usage.totalPromptTokens + promptEvalCount,
-          totalCompletionTokens: prev.usage.totalCompletionTokens + evalCount,
+          // `?? 0`: a missing count would turn the running total into NaN,
+          // which is saved as null and breaks the Settings page on next launch.
+          totalPromptTokens: prev.usage.totalPromptTokens + (promptEvalCount ?? 0),
+          totalCompletionTokens: prev.usage.totalCompletionTokens + (evalCount ?? 0),
           totalCalls: prev.usage.totalCalls + 1,
-          songsProcessed: prev.usage.songsProcessed + tracks,
+          songsProcessed: prev.usage.songsProcessed + (tracks ?? 0),
         },
       }));
     });

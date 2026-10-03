@@ -2174,6 +2174,19 @@ owner should click through Settings, open a batch outside the Library,
 re-index, and run an AI playlist against the real Collection with at least
 one real backend before relying on this release.
 
+### 58. Settings crash from null usage counters — v0.15.1
+
+**What/why.** Settings page threw `Cannot read properties of null (reading
+'toLocaleString')`. A missing token count in an `ai-usage` event made a
+running total `NaN`, which JSON-persists as `null`; the shallow
+`{ ...DEFAULT_SETTINGS, ...saved }` merge then kept it.
+
+**How.** `App.tsx` accumulates with `?? 0`; `useSettings.ts` sanitizes saved
+`usage`/`plan` numbers on load (non-finite -> default), so already-corrupted
+settings files heal on next launch.
+
+**Verification.** `tsc --noEmit` clean. Not clicked through in the GUI yet.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

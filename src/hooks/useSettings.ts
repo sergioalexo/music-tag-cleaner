@@ -72,6 +72,15 @@ export const DEFAULT_SETTINGS: Settings = {
 
 const STORE_FILE = "settings.json";
 
+/** Replaces any non-finite numeric field of `obj` with the default's value. */
+function sanitizeNumbers<T extends object>(obj: T | undefined, defaults: T): T {
+  const out = { ...defaults, ...obj } as Record<string, unknown>;
+  for (const [k, def] of Object.entries(defaults)) {
+    if (typeof def === "number" && !Number.isFinite(out[k])) out[k] = def;
+  }
+  return out as T;
+}
+
 /**
  * Brings older saved settings up to date. v2 ensures the Preview and Rating
  * columns (added after some users' settings were first saved) are visible.
@@ -177,6 +186,11 @@ export function useSettings() {
         const saved = await store.get<Partial<Settings>>("settings");
         if (saved) {
           const merged = { ...DEFAULT_SETTINGS, ...saved };
+          // The merge is shallow, so a saved `usage`/`plan` replaces the default
+          // object wholesale. A counter that was once NaN is persisted as JSON
+          // `null`, which later crashes `.toLocaleString()` on the Settings page.
+          merged.usage = sanitizeNumbers(merged.usage, DEFAULT_SETTINGS.usage);
+          merged.plan = { ...merged.plan, ...sanitizeNumbers(merged.plan, DEFAULT_SETTINGS.plan) };
           const savedVersion = saved.settingsVersion ?? 1;
           let next =
             savedVersion < CURRENT_SETTINGS_VERSION ? migrate(merged, savedVersion) : merged;
