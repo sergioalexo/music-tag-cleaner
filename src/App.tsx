@@ -2070,7 +2070,6 @@ This rewrites the genre tag on ${
         fileCount={filesApi.files.length}
         selectedCount={filesApi.selectedPaths.length}
         totalSize={filesApi.totalSize}
-        ollama={ai.status}
         progress={progress}
         busy={busy || filesApi.scanning || backupRunning || aiRunning}
       />
