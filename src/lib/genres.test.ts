@@ -36,6 +36,20 @@ describe("libraryGenreNames", () => {
   it("returns nothing when there is no collection yet, rather than inventing a taxonomy", () => {
     expect(libraryGenreNames([], {})).toEqual([]);
   });
+
+  it("offers every Library genre even when the open batch lives outside the Library folder", () => {
+    // Workstream A5: opening a batch from e.g. Downloads must never hide the
+    // Library's genre vocabulary — `libraryGenreNames` takes the indexed
+    // tally and the loaded tracks' tags as plain inputs, with no notion of
+    // "where" either one lives, so a batch opened from anywhere still sees
+    // the full Library list plus whatever it adds on top.
+    const batchTags: Record<string, TagData> = {
+      "C:/Users/sopas/Downloads/new-rip.mp3": tag("Downloads-Only Genre"),
+    };
+    const names = libraryGenreNames(indexed, batchTags);
+    for (const g of indexed) expect(names).toContain(g.name);
+    expect(names).toContain("Downloads-Only Genre");
+  });
 });
 
 describe("detectGenreGroups", () => {

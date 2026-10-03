@@ -44,6 +44,17 @@ import { CapitalizationMenu } from "../components/CapitalizationMenu";
 import { LibrarySidebar, matchesSidebarFilter, type SidebarFilter } from "../components/LibrarySidebar";
 import { Button } from "../components/ui";
 
+/** Whether the open working batch is somewhere other than inside the
+ * permanent Library folder — the status line in A6 only needs to show up
+ * when that's actually true, never when there's no Library set at all. */
+function isBatchOutsideLibrary(batchFolder: string, libraryFolder: string): boolean {
+  if (!libraryFolder) return false;
+  const norm = (p: string) => p.replace(/[\\/]+$/, "").toLowerCase();
+  const batch = norm(batchFolder);
+  const lib = norm(libraryFolder);
+  return batch !== lib && !batch.startsWith(lib + "\\") && !batch.startsWith(lib + "/");
+}
+
 interface FilesApi {
   files: AudioFile[];
   selected: Set<string>;
@@ -260,6 +271,11 @@ export function LibraryPage({
           <p className="truncate text-sm text-muted-foreground" title={lastFolder}>
             {lastFolder || "Tidy messy tags, then let AI clean the rest"}
           </p>
+          {lastFolder && isBatchOutsideLibrary(lastFolder, settings.libraryFolder) && (
+            <p className="truncate text-xs text-amber-500">
+              Batch is not in your Library. Library genres are still available.
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 gap-2">
           <Button

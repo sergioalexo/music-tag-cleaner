@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { load, type Store } from "@tauri-apps/plugin-store";
 import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 10;
+export const CURRENT_SETTINGS_VERSION = 11;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: Settings = {
   backupField: "Composer",
   djApp: { primary: "other", secondary: "other" },
   lastFolder: "",
+  libraryFolder: "",
   theme: "system",
   visibleColumns: [
     "preview",
@@ -80,7 +82,10 @@ const STORE_FILE = "settings.json";
  * the files. v9 adds Demucs stem-separation defaults (`stemOptions`), filled
  * in by the `{ ...DEFAULT_SETTINGS, ...saved }` merge. v10 adds
  * `casingExceptions` (user-defined tokens Capitalize/Title Case always
- * renders as-typed), same merge-fills-it-in bump.
+ * renders as-typed), same merge-fills-it-in bump. v11 adds `libraryFolder`
+ * (the one permanent Library folder, replacing the old multi-root model) —
+ * seeded from the first existing `library_root` row by the loader below,
+ * since that needs an `invoke` call `migrate` itself can't make.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -152,11 +157,26 @@ export function useSettings() {
         if (saved) {
           const merged = { ...DEFAULT_SETTINGS, ...saved };
           const savedVersion = saved.settingsVersion ?? 1;
-          const next =
+          let next =
             savedVersion < CURRENT_SETTINGS_VERSION ? migrate(merged, savedVersion) : merged;
+          let dirty = savedVersion < CURRENT_SETTINGS_VERSION;
+          if (!next.libraryFolder) {
+            // Seed from the first root the old multi-root index already had,
+            // so upgrading never shows an empty Library when one was already
+            // indexed under the previous model.
+            try {
+              const roots = await invoke<string[]>("library_roots");
+              if (roots.length) {
+                next = { ...next, libraryFolder: roots[0] };
+                dirty = true;
+              }
+            } catch {
+              // No index yet (fresh install) — App's first-launch prompt handles it.
+            }
+          }
           latestRef.current = next;
           setSettings(next);
-          if (savedVersion < CURRENT_SETTINGS_VERSION) {
+          if (dirty) {
             await store.set("settings", next);
             await store.save();
           }

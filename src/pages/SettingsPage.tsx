@@ -219,30 +219,19 @@ function DetectGenresPanel({
  * from a backup keep their old mtime, for instance).
  */
 function LibraryIndexCard({
+  settings,
+  onSave,
   libraryIndex,
   notify,
 }: {
+  settings: Settings;
+  onSave: (settings: Settings) => void;
   libraryIndex: LibraryIndexApi;
   notify: Notify;
 }) {
   const { stats, indexing, progress } = libraryIndex;
-  const roots = stats?.roots ?? [];
-
-  const addRoot = async () => {
-    const picked = await open({ directory: true, multiple: false, title: "Add a library folder" });
-    if (typeof picked !== "string") return;
-    if (roots.includes(picked)) return;
-    await libraryIndex.setRoots([...roots, picked]);
-  };
-
-  const removeRoot = async (root: string) => {
-    const ok = await confirm(
-      `Stop indexing "${root}"?\n\nIts tracks are removed from the index. The files themselves are not touched.`,
-      { title: "Remove Library Folder", kind: "warning" },
-    );
-    if (!ok) return;
-    await libraryIndex.setRoots(roots.filter((r) => r !== root));
-  };
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [clearConfirmText, setClearConfirmText] = useState("");
 
   const runIndex = async (rescanAll: boolean) => {
     try {
@@ -261,57 +250,75 @@ function LibraryIndexCard({
     }
   };
 
-  const clearIndex = async () => {
+  const changeFolder = async () => {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Choose your Library folder",
+    });
+    if (typeof picked !== "string" || picked === settings.libraryFolder) return;
     const ok = await confirm(
-      "Empty the library index?\n\nNothing on disk changes — you would just need to index again.",
-      { title: "Clear Index", kind: "warning" },
+      `Library will be re-scanned from "${picked}".\n\nThis replaces "${settings.libraryFolder || "(none set)"}" as the Library.`,
+      { title: "Change Library Folder", kind: "warning" },
     );
     if (!ok) return;
+    try {
+      await libraryIndex.setRoots([picked]);
+      onSave({ ...settings, libraryFolder: picked });
+      void runIndex(false);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const clearIndex = async () => {
+    if (clearConfirmText.trim().toUpperCase() !== "CLEAR") return;
     await libraryIndex.clear();
+    setClearConfirmText("");
     notify("Library index cleared", "info");
   };
 
   const pct =
     progress && progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : null;
+  const folderMissing = !indexing && !!settings.libraryFolder && (stats?.trackCount ?? 0) > 0 && !stats?.roots.includes(settings.libraryFolder);
 
   return (
     <Card>
       <CardHeader
-        title="Library Index"
-        hint="Scans your whole collection so genres, search and playlist matching see every track — not just the ones you opened"
+        title="Library"
+        hint="The one permanent folder your genres, search and playlist matching are drawn from — separate from whatever folder you have open to work on right now"
       />
       <div className="px-5 py-3">
         <div className="mb-3 space-y-1.5">
-          {roots.length === 0 ? (
+          {!settings.libraryFolder ? (
             <p className="text-xs text-muted-foreground">
-              No folders yet. Add the folder your music lives in, then index it.
+              No Library folder set yet. Choose the folder your finished collection lives in.
             </p>
           ) : (
-            roots.map((r) => (
-              <div key={r} className="flex items-center gap-2 rounded-md bg-secondary/30 px-2 py-1.5">
-                <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1 truncate font-mono text-xs" title={r}>
-                  {r}
-                </span>
-                <button
-                  onClick={() => void removeRoot(r)}
-                  disabled={indexing}
-                  className="shrink-0 text-muted-foreground hover:text-destructive disabled:opacity-30"
-                  title="Stop indexing this folder"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ))
+            <div className="flex items-center gap-2 rounded-md bg-secondary/30 px-2 py-1.5">
+              <FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate font-mono text-xs" title={settings.libraryFolder}>
+                {settings.libraryFolder}
+              </span>
+            </div>
+          )}
+          {folderMissing && (
+            <p className="text-xs text-amber-500">
+              Library folder not found — showing last known library.
+            </p>
           )}
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Button variant="secondary" size="sm" onClick={addRoot} disabled={indexing}>
-            <Plus />
-            Add Folder
+          <Button variant="secondary" size="sm" onClick={changeFolder} disabled={indexing}>
+            <FolderOpen />
+            {settings.libraryFolder ? "Change…" : "Choose Library Folder…"}
           </Button>
-          <Button size="sm" onClick={() => void runIndex(false)} disabled={indexing || !roots.length}>
+          <Button
+            size="sm"
+            onClick={() => void runIndex(false)}
+            disabled={indexing || !settings.libraryFolder}
+          >
             {indexing ? <Loader2 className="animate-spin" /> : <Library />}
             {indexing ? "Indexing…" : "Index Library"}
           </Button>
@@ -319,17 +326,12 @@ function LibraryIndexCard({
             variant="secondary"
             size="sm"
             onClick={() => void runIndex(true)}
-            disabled={indexing || !roots.length}
+            disabled={indexing || !settings.libraryFolder}
             title="Ignore the size/modified-time check and re-read every file"
           >
             <RefreshCw />
             Re-read Everything
           </Button>
-          {(stats?.trackCount ?? 0) > 0 && (
-            <Button variant="ghost" size="sm" onClick={clearIndex} disabled={indexing}>
-              Clear
-            </Button>
-          )}
         </div>
 
         {indexing && (
@@ -365,6 +367,44 @@ function LibraryIndexCard({
             )}
           </p>
         )}
+
+        <div className="mt-3 border-t pt-3">
+          {!advancedOpen ? (
+            <Button variant="ghost" size="sm" onClick={() => setAdvancedOpen(true)}>
+              Advanced
+            </Button>
+          ) : (
+            <div className="space-y-2">
+              <Button variant="ghost" size="sm" onClick={() => setAdvancedOpen(false)}>
+                Hide Advanced
+              </Button>
+              {(stats?.trackCount ?? 0) > 0 && (
+                <div className="rounded-lg border bg-secondary/20 p-3">
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    Empties the library index. Nothing on disk changes — you would just need to
+                    index again. Type <span className="font-mono">CLEAR</span> to confirm.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      className={cn(inputClass, "h-8 w-32 font-mono")}
+                      value={clearConfirmText}
+                      onChange={(e) => setClearConfirmText(e.target.value)}
+                      placeholder="CLEAR"
+                    />
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={clearIndex}
+                      disabled={clearConfirmText.trim().toUpperCase() !== "CLEAR"}
+                    >
+                      Clear Index
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </Card>
   );
@@ -1313,7 +1353,7 @@ export function SettingsPage({
         </div>
       </Card>
 
-      <LibraryIndexCard libraryIndex={libraryIndex} notify={notify} />
+      <LibraryIndexCard settings={settings} onSave={onSave} libraryIndex={libraryIndex} notify={notify} />
 
       <Card>
         <CardHeader

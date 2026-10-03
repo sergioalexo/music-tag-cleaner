@@ -260,8 +260,25 @@ pub async fn library_roots(app: AppHandle) -> Result<Vec<String>, String> {
 /// Replaces the whole root list. Rows under a root that is no longer listed
 /// are dropped, so removing a folder from the index actually removes its
 /// tracks rather than leaving them as orphans nothing will ever refresh.
+/// An empty list used to mean "delete every indexed track" — the exact shape
+/// of the bug that wiped the index with no confirmation. Changing the
+/// Library folder always goes through `set_library_roots` with exactly one
+/// new root; nothing legitimate ever calls it with zero. Clearing the index
+/// on purpose has its own command (`clear_library_index`).
+fn validate_roots(roots: &[String]) -> Result<(), String> {
+    if roots.is_empty() {
+        Err(
+            "Refusing to clear every library folder this way — use Clear Index if that's what you want."
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub async fn set_library_roots(app: AppHandle, roots: Vec<String>) -> Result<(), String> {
+    validate_roots(&roots)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut conn = open_db(&app)?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -273,21 +290,17 @@ pub async fn set_library_roots(app: AppHandle, roots: Vec<String>) -> Result<(),
             )
             .map_err(|e| e.to_string())?;
         }
-        if roots.is_empty() {
-            tx.execute("DELETE FROM library_track", []).map_err(|e| e.to_string())?;
-        } else {
-            let mut keep = String::new();
-            for (i, _) in roots.iter().enumerate() {
-                if i > 0 {
-                    keep.push_str(" OR ");
-                }
-                keep.push_str(&format!("path LIKE ?{} ESCAPE '\\'", i + 1));
+        let mut keep = String::new();
+        for (i, _) in roots.iter().enumerate() {
+            if i > 0 {
+                keep.push_str(" OR ");
             }
-            let patterns: Vec<String> = roots.iter().map(|r| format!("{}%", escape_like(r))).collect();
-            let sql = format!("DELETE FROM library_track WHERE NOT ({keep})");
-            tx.execute(&sql, rusqlite::params_from_iter(patterns.iter()))
-                .map_err(|e| e.to_string())?;
+            keep.push_str(&format!("path LIKE ?{} ESCAPE '\\'", i + 1));
         }
+        let patterns: Vec<String> = roots.iter().map(|r| format!("{}%", escape_like(r))).collect();
+        let sql = format!("DELETE FROM library_track WHERE NOT ({keep})");
+        tx.execute(&sql, rusqlite::params_from_iter(patterns.iter()))
+            .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })
@@ -347,11 +360,17 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
 
         emit_progress(&app, "walking", 0, 0, "");
         let mut found: Vec<PathBuf> = Vec::new();
+        // Roots that actually resolved to a directory this run. A root that
+        // doesn't (an unplugged external drive, a renamed folder) must never
+        // cause its tracks to be pruned as "deleted" — there is no way to
+        // tell "offline" from "gone" from here, so the safer read is assumed.
+        let mut available_roots: Vec<String> = Vec::new();
         for root in &roots {
             let rp = Path::new(root);
             if !rp.is_dir() {
                 continue;
             }
+            available_roots.push(root.clone());
             for e in WalkDir::new(rp)
                 // depth 0 is the root itself: if someone deliberately adds a
                 // folder called "stems" as a library root, index it.
@@ -469,14 +488,16 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
             }
         }
 
-        // Drop rows whose file is gone. Only paths under a root are
-        // considered, so an unplugged external drive doesn't quietly erase
-        // its half of the index — its root simply produced no `found` entries
-        // and we can't tell "deleted" from "offline".
+        // Drop rows whose file is gone — but only under a root that actually
+        // resolved to a directory this run. Without `available_roots`, an
+        // unplugged external drive makes every path under it fail
+        // `Path::exists()` too, so its whole half of the index would be
+        // deleted as "removed" instead of correctly reported as offline.
         let stale: Vec<String> = known
             .keys()
             .filter(|k| !seen.contains(*k))
             .filter(|k| !Path::new(k).exists())
+            .filter(|k| available_roots.iter().any(|r| k.starts_with(r.as_str())))
             .cloned()
             .collect();
         for path in &stale {
@@ -736,6 +757,17 @@ pub async fn retag_field(
     Ok(results)
 }
 
+/// Re-reads specific paths into the index, for any write made outside
+/// `retag_field` (an ordinary AI Clean/manual edit on a track that happens to
+/// sit inside the Library folder) — so genres and search see the change
+/// immediately instead of waiting for the next full re-index.
+#[tauri::command]
+pub async fn reindex_library_paths(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reindex_paths(&app, &paths))
+        .await
+        .map_err(|_| "Refreshing the library index failed unexpectedly".to_string())?
+}
+
 /// Re-reads specific paths into the index. Cheap enough to run right after a
 /// write, so the index never lags the files it describes.
 pub(crate) fn reindex_paths(app: &AppHandle, paths: &[String]) -> Result<(), String> {
@@ -920,6 +952,30 @@ mod tests {
         assert_eq!(from_stems_root, vec!["drums.wav".to_string(), "vocals.wav".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Workstream A3: `set_library_roots([])` must never silently wipe the
+    /// index again — the 09-30 bug this plan exists to make impossible.
+    #[test]
+    fn set_library_roots_rejects_an_empty_list() {
+        assert!(validate_roots(&[]).is_err());
+        assert!(validate_roots(&["C:/Music/Collection".to_string()]).is_ok());
+    }
+
+    /// Workstream A3: an unplugged/offline root must not cause its tracks to
+    /// be pruned as "deleted" — only a root that actually resolved to a
+    /// directory this run may have stale rows removed under it.
+    #[test]
+    fn stale_rows_under_an_offline_root_are_not_pruned() {
+        let known_paths = ["C:/Online/a.mp3", "C:/Offline/b.mp3"];
+        let seen: BTreeSet<String> = BTreeSet::new(); // neither was walked this run
+        let available_roots = vec!["C:/Online".to_string()]; // only Online resolved to a dir
+        let stale: Vec<&&str> = known_paths
+            .iter()
+            .filter(|k| !seen.contains(**k))
+            .filter(|k| available_roots.iter().any(|r| k.starts_with(r.as_str())))
+            .collect();
+        assert_eq!(stale, vec![&"C:/Online/a.mp3"]);
     }
 
     #[test]

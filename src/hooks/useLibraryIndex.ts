@@ -118,6 +118,23 @@ export function useLibraryIndex(notify: Notify) {
     [],
   );
 
+  /** Re-reads specific paths into the index right after a write, so a tag
+   * edit on a Library track shows up in genres/search without waiting for
+   * the next full re-index. Silent — this rides along every write, and a
+   * failure here just means the next full index catches up instead. */
+  const reindexPaths = useCallback(
+    async (paths: string[]) => {
+      if (!paths.length) return;
+      try {
+        await invoke("reindex_library_paths", { paths });
+        await refreshStats();
+      } catch {
+        // Best-effort.
+      }
+    },
+    [refreshStats],
+  );
+
   const files = useMemo<AudioFile[]>(() => tracks.map(indexedToFile), [tracks]);
   const tags = useMemo<Record<string, TagData>>(() => {
     const out: Record<string, TagData> = {};
@@ -141,6 +158,7 @@ export function useLibraryIndex(notify: Notify) {
     runIndex,
     clear,
     pathsWithGenre,
+    reindexPaths,
   };
 }
 

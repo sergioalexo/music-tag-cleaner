@@ -11,7 +11,7 @@ import StatusBar from "./components/StatusBar";
 import type { ManualMode, ManualResults } from "./components/ManualAIDialog";
 import type { ConvertOptions } from "./components/ConvertDialog";
 import type { UnifyGroup } from "./components/UnifyDialog";
-import { Card, cn } from "./components/ui";
+import { Button, Card, cn } from "./components/ui";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
@@ -151,14 +151,12 @@ export default function App() {
     settings.recursive,
     notify,
     (folder) => {
+      // `lastFolder` is the *working batch* you just opened, purely a UI
+      // convenience (shown as a hint, reopened on next launch) — it must
+      // never touch the Library or its roots. See the owner's mental model
+      // in PLAN-v0.15-library.md: opening a batch can never shrink or
+      // replace the Library.
       void update((prev) => ({ ...prev, lastFolder: folder }));
-      // A folder you open is a folder you plainly care about, so it joins
-      // the library index automatically — the alternative (only indexing
-      // what you separately add in Settings) is exactly why matching
-      // against "your whole library" used to mean "whatever's loaded right
-      // now". `addLibraryRoot` no-ops if it's already a root or a root
-      // already contains it.
-      void addLibraryRoot(folder);
     },
     settings.lastFolder,
   );
@@ -169,59 +167,64 @@ export default function App() {
   const analytics = useAnalytics();
   const libraryIndex = useLibraryIndex(notify);
 
-  /** Adds a folder to the indexed roots if it isn't (or isn't already
-   * covered by) one, then kicks off a quiet incremental index run so it
-   * shows up for matching without a trip to Settings. Failures are silent —
-   * this is a convenience on top of manual indexing, not a replacement for
-   * it, and errors there already get their own toast. */
-  const addLibraryRoot = async (folder: string) => {
-    try {
-      const roots = await libraryIndex.getRoots();
-      const normalized = folder.replace(/[\\/]+$/, "").toLowerCase();
-      const alreadyCovered = roots.some((r) => {
-        const rn = r.replace(/[\\/]+$/, "").toLowerCase();
-        return normalized === rn || normalized.startsWith(rn + "\\") || normalized.startsWith(rn + "/");
-      });
-      if (alreadyCovered) {
-        void libraryIndex.runIndex(false);
-        return;
-      }
-      await libraryIndex.setRoots([...roots, folder]);
-      await libraryIndex.runIndex(false);
-    } catch {
-      // Best-effort — the folder is still fully usable this session even if
-      // it never joins the index.
-    }
-  };
+  // One-time prompt for a never-configured Library folder — defaults to
+  // Music\Collection when it exists, so most installs need only a click.
+  const [libraryPromptOpen, setLibraryPromptOpen] = useState(false);
+  const [suggestedLibraryFolder, setSuggestedLibraryFolder] = useState<string | null>(null);
 
-  // Keeps the index warm without requiring a trip to Settings: once per
-  // launch, if there's anything to index, bring it up to date in the
-  // background. Incremental (mtime+size), so this is cheap on a library
-  // that hasn't changed since last time — the whole point of "once it's
-  // indexed it's there no matter what" is that this doesn't need a manual
-  // button press every session.
+  // The Library's roots are always exactly `[settings.libraryFolder]` —
+  // nothing else ever writes them. Opening a working batch (above) is
+  // deliberately excluded, which is the whole point of this workstream: a
+  // folder you open to clean up never becomes part of the permanent Library.
   const startupIndexRef = useRef(false);
   useEffect(() => {
     if (!loaded || startupIndexRef.current) return;
     startupIndexRef.current = true;
     void (async () => {
-      try {
-        const roots = await libraryIndex.getRoots();
-        if (roots.length) {
+      if (settings.libraryFolder) {
+        try {
+          const roots = await libraryIndex.getRoots();
+          if (roots.length !== 1 || roots[0] !== settings.libraryFolder) {
+            await libraryIndex.setRoots([settings.libraryFolder]);
+          }
           void libraryIndex.runIndex(false);
-        } else if (settings.lastFolder) {
-          // First run after upgrading: nothing indexed yet, but there's a
-          // known folder from past sessions — seed the roots from it so
-          // indexing has something to do without asking again.
-          await libraryIndex.setRoots([settings.lastFolder]);
-          void libraryIndex.runIndex(false);
+        } catch {
+          // Settings' own index card still works for a manual run.
         }
+        return;
+      }
+      // No Library folder ever configured — ask once, suggesting the
+      // owner's usual Music\Collection if it's actually there.
+      try {
+        const defaultPath = "C:\\Users\\sopas\\Music\\Collection";
+        const exists = await invoke<boolean>("path_exists", { path: defaultPath }).catch(
+          () => false,
+        );
+        setSuggestedLibraryFolder(exists ? defaultPath : null);
       } catch {
-        // Settings' own index card still works for a manual run.
+        setSuggestedLibraryFolder(null);
+      } finally {
+        setLibraryPromptOpen(true);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
+
+  const chooseLibraryFolder = async (folder: string) => {
+    setLibraryPromptOpen(false);
+    try {
+      await libraryIndex.setRoots([folder]);
+      void update((prev) => ({ ...prev, libraryFolder: folder }));
+      void libraryIndex.runIndex(false);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  };
+
+  const pickLibraryFolder = async () => {
+    const picked = await open({ directory: true, multiple: false, title: "Where is your music library?" });
+    if (typeof picked === "string") void chooseLibraryFolder(picked);
+  };
   const withTrack = (name: string, fn: () => void) => () => {
     analytics.track(name);
     fn();
@@ -277,6 +280,13 @@ export default function App() {
     resetLibraryTags: () => setLibraryTags({}),
     refreshPaths: (paths) => filesApi.refreshPaths(paths),
     refreshAll: () => filesApi.refresh(),
+    reindexLibraryPaths: (paths) => {
+      const root = settingsRef.current.libraryFolder;
+      if (!root) return Promise.resolve();
+      const normalizedRoot = root.replace(/[\\/]+$/, "").toLowerCase() + "\\";
+      const inLibrary = paths.filter((p) => p.toLowerCase().startsWith(normalizedRoot));
+      return libraryIndex.reindexPaths(inLibrary);
+    },
   });
   const pushHistory = history.push;
 
@@ -1919,6 +1929,7 @@ This rewrites the genre tag on ${
           setPage={setPage}
           fileCount={filesApi.files.length}
           errorLogCount={logs.filter((l) => l.kind === "error").length}
+          libraryTrackCount={libraryIndex.stats?.trackCount ?? 0}
         />
         <main className="relative min-w-0 flex-1 overflow-y-auto">
           <Suspense fallback={null}>
@@ -2184,6 +2195,34 @@ This rewrites the genre tag on ${
                 {inspected.file.hasBackup ? "backup present" : "no backup"}
               </p>
               <TagDetails tags={inspected.tags} />
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {libraryPromptOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <Card className="w-[480px]">
+            <div className="p-5">
+              <h2 className="mb-1 text-sm font-semibold">Where is your music library?</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Pick the one folder your finished collection lives in. It's indexed permanently and
+                remembered across launches — separate from whatever folder you open to clean up
+                right now.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {suggestedLibraryFolder && (
+                  <Button size="sm" onClick={() => void chooseLibraryFolder(suggestedLibraryFolder)}>
+                    Use {suggestedLibraryFolder}
+                  </Button>
+                )}
+                <Button variant="secondary" size="sm" onClick={pickLibraryFolder}>
+                  Choose folder…
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setLibraryPromptOpen(false)}>
+                  Not now
+                </Button>
+              </div>
             </div>
           </Card>
         </div>

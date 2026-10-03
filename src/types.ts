@@ -250,6 +250,12 @@ export interface Settings {
   djApp: { primary: DjApp; secondary: DjApp };
   lastFolder: string;
   /**
+   * The one permanent Library folder — the finished collection, indexed and
+   * remembered across launches. Distinct from `lastFolder` (the batch you
+   * last opened to work on), which may or may not be inside it.
+   */
+  libraryFolder: string;
+  /**
    * "system" follows the OS light/dark setting and is the default —
    * there is no in-app theme switcher any more. The explicit values are
    * kept so a pinned choice can still be honoured if one was saved.

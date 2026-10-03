@@ -39,6 +39,9 @@ interface Deps {
   resetLibraryTags: () => void;
   refreshPaths: (paths: string[]) => Promise<void>;
   refreshAll: () => Promise<void>;
+  /** Re-reads changed paths into the Library index, for whichever ones sit
+   * inside the Library folder — see Workstream A4 in PLAN-v0.15-library.md. */
+  reindexLibraryPaths: (paths: string[]) => Promise<void>;
 }
 
 /**
@@ -65,6 +68,7 @@ export function useHistory({
   resetLibraryTags,
   refreshPaths,
   refreshAll,
+  reindexLibraryPaths,
 }: Deps) {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [redoStack, setRedoStack] = useState<HistoryEntry[]>([]);
@@ -73,6 +77,7 @@ export function useHistory({
     if (!entry.changes.length) return;
     setHistory((h) => [...h.slice(-(HISTORY_LIMIT - 1)), entry]);
     setRedoStack([]);
+    void reindexLibraryPaths([...new Set(entry.changes.map((c) => c.path))]);
   };
 
   /** Writes `before` (undo) or `after` (redo) for every change in `changes`. */

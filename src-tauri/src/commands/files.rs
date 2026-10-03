@@ -1400,6 +1400,13 @@ pub async fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// Whether a path exists on disk. Used for the first-launch Library prompt,
+/// to offer `Music\Collection` as a default only when it's actually there.
+#[tauri::command]
+pub async fn path_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
 fn set_text(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
     if let Some(v) = value {
         let v = v.trim();

@@ -22,9 +22,12 @@ interface Props {
   setPage: (page: Page) => void;
   fileCount: number;
   errorLogCount: number;
+  /** Tracks in the permanent Library index — distinct from `fileCount`, the
+   * working batch open right now. See PLAN-v0.15-library.md Workstream A6. */
+  libraryTrackCount: number;
 }
 
-export function Sidebar({ page, setPage, fileCount, errorLogCount }: Props) {
+export function Sidebar({ page, setPage, fileCount, errorLogCount, libraryTrackCount }: Props) {
   // getVersion() reads the real app version at runtime (package.json /
   // tauri.conf.json / Cargo.toml all stay in sync via `npm version`) instead
   // of a hardcoded string that silently goes stale across releases.
@@ -84,7 +87,10 @@ export function Sidebar({ page, setPage, fileCount, errorLogCount }: Props) {
               <Icon className="h-4 w-4" />
               <span className="flex-1 text-left font-medium">{label}</span>
               {p === "library" && fileCount > 0 && (
-                <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground">
+                <span
+                  className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground"
+                  title={`Working batch: ${fileCount} track${fileCount === 1 ? "" : "s"} open right now`}
+                >
                   {fileCount}
                 </span>
               )}
@@ -97,6 +103,17 @@ export function Sidebar({ page, setPage, fileCount, errorLogCount }: Props) {
           );
         })}
       </nav>
+
+      <div className="border-t px-5 py-3 text-[10px] text-muted-foreground">
+        <span className="font-medium text-foreground">Library</span>{" "}
+        {libraryTrackCount > 0 ? `(${libraryTrackCount})` : "— not set up"}
+        {fileCount > 0 && (
+          <>
+            {" · "}
+            <span className="font-medium text-foreground">Working batch</span> ({fileCount})
+          </>
+        )}
+      </div>
     </aside>
   );
 }
