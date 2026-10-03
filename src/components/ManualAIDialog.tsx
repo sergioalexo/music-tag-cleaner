@@ -3,25 +3,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, ChevronLeft, ChevronRight, Copy, ExternalLink, X } from "lucide-react";
 
-import { cleanInputs, genreInputs, type GenreResult } from "../hooks/useAI";
+import { cleanInputs } from "../hooks/useAI";
 import { basename, type CleanedTrack, type TagData } from "../types";
 import { Button, Card, cn, selectClass } from "./ui";
 
 /** What the dialog hands back once the user is done pasting answers. */
-export type ManualResults =
-  | { mode: "clean"; byIndex: Map<number, CleanedTrack> }
-  | { mode: "genre"; byIndex: Map<number, string> };
-
-export type ManualMode = "clean" | "genre";
+export type ManualResults = { byIndex: Map<number, CleanedTrack> };
 
 interface Props {
-  mode: ManualMode;
   /** Tracks to process, in the order their 1-based prompt index follows. */
   paths: string[];
   tags: Record<string, TagData>;
   transliterateScripts: string[];
-  /** Allowed genres from the active preset (genre mode only). */
-  genres: string[];
   chunkSize: number;
   onChunkSizeChange: (size: number) => void;
   onCancel: () => void;
@@ -60,11 +53,9 @@ async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 export function ManualAIDialog({
-  mode,
   paths,
   tags,
   transliterateScripts,
-  genres,
   chunkSize,
   onChunkSizeChange,
   onCancel,
@@ -74,7 +65,7 @@ export function ManualAIDialog({
   /** Raw pasted text, per batch. */
   const [texts, setTexts] = useState<Record<number, string>>({});
   /** Parsed results per batch — reparsing a batch replaces only its own entries. */
-  const [parsed, setParsed] = useState<Record<number, (CleanedTrack | GenreResult)[]>>({});
+  const [parsed, setParsed] = useState<Record<number, CleanedTrack[]>>({});
   const [errors, setErrors] = useState<Record<number, string>>({});
   const [prompt, setPrompt] = useState("");
   const [copied, setCopied] = useState(false);
@@ -90,21 +81,15 @@ export function ManualAIDialog({
   // Prompt indexes are global (1-based over the whole selection), so a pasted
   // answer lands on the right track no matter which order batches are done in.
   const inputs = useMemo(
-    () =>
-      mode === "clean"
-        ? cleanInputs(paths, tags).slice(start, end)
-        : genreInputs(paths, tags).slice(start, end),
-    [mode, paths, tags, start, end],
+    () => cleanInputs(paths, tags).slice(start, end),
+    [paths, tags, start, end],
   );
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const text =
-          mode === "clean"
-            ? await invoke<string>("ai_clean_prompt", { tracks: inputs, transliterateScripts })
-            : await invoke<string>("ai_genre_prompt", { tracks: inputs, genres });
+        const text = await invoke<string>("ai_clean_prompt", { tracks: inputs, transliterateScripts });
         if (!cancelled) setPrompt(text);
       } catch (e) {
         if (!cancelled) setPrompt(`Could not build the prompt: ${String(e)}`);
@@ -113,7 +98,7 @@ export function ManualAIDialog({
     return () => {
       cancelled = true;
     };
-  }, [inputs, mode, transliterateScripts, genres]);
+  }, [inputs, transliterateScripts]);
 
   // Parse while the user pastes, so a bad answer is caught before they move on.
   const text = texts[current] ?? "";
@@ -131,10 +116,7 @@ export function ManualAIDialog({
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
-        const results =
-          mode === "clean"
-            ? await invoke<CleanedTrack[]>("ai_parse_clean_response", { text })
-            : await invoke<GenreResult[]>("ai_parse_genre_response", { text, genres });
+        const results = await invoke<CleanedTrack[]>("ai_parse_clean_response", { text });
         if (cancelled) return;
         setParsed((p) => ({ ...p, [current]: results }));
         setErrors((e) => ({ ...e, [current]: "" }));
@@ -152,11 +134,11 @@ export function ManualAIDialog({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [text, current, mode, genres]);
+  }, [text, current]);
 
   /** Every batch's results merged by global index; out-of-range ones are dropped. */
   const merged = useMemo(() => {
-    const byIndex = new Map<number, CleanedTrack | GenreResult>();
+    const byIndex = new Map<number, CleanedTrack>();
     for (const key of Object.keys(parsed)
       .map(Number)
       .sort((a, b) => a - b)) {
@@ -187,18 +169,9 @@ export function ManualAIDialog({
   };
 
   const finish = () => {
-    if (mode === "clean") {
-      const byIndex = new Map<number, CleanedTrack>();
-      merged.forEach((v, k) => byIndex.set(k, v as CleanedTrack));
-      onDone({ mode: "clean", byIndex });
-    } else {
-      const byIndex = new Map<number, string>();
-      merged.forEach((v, k) => {
-        const genre = (v as GenreResult).genre;
-        if (genre) byIndex.set(k, genre);
-      });
-      onDone({ mode: "genre", byIndex });
-    }
+    const byIndex = new Map<number, CleanedTrack>();
+    merged.forEach((v, k) => byIndex.set(k, v));
+    onDone({ byIndex });
   };
 
   const chunkError = errors[current];
@@ -209,9 +182,7 @@ export function ManualAIDialog({
       <Card className="flex max-h-full w-[860px] flex-col overflow-hidden">
         <div className="flex items-start justify-between gap-4 border-b px-5 py-3.5">
           <div>
-            <h2 className="text-sm font-semibold">
-              Manual AI — {mode === "clean" ? "Clean tags" : "Match genres"}
-            </h2>
+            <h2 className="text-sm font-semibold">Manual AI — Clean tags</h2>
             <p className="text-xs text-muted-foreground">
               No Ollama needed. Copy the prompt, paste it into any AI, then paste its answer back
               here. {paths.length} track{paths.length === 1 ? "" : "s"} selected.
@@ -338,11 +309,7 @@ export function ManualAIDialog({
             <textarea
               value={text}
               spellCheck={false}
-              placeholder={
-                mode === "clean"
-                  ? '[{"index": 1, "artist": "…", "title": "…", "year": "…", "genre": "…"}]'
-                  : '[{"index": 1, "genre": "…"}]'
-              }
+              placeholder='[{"index": 1, "artist": "…", "title": "…", "year": "…", "genre": "…"}]'
               onChange={(e) => setTexts((t) => ({ ...t, [current]: e.target.value }))}
               className="h-40 w-full resize-y rounded-md border bg-transparent p-3 font-mono text-[11px] leading-relaxed outline-none focus-visible:ring-1 focus-visible:ring-ring"
             />
@@ -367,11 +334,7 @@ export function ManualAIDialog({
                 {chunkPaths.map((p, i) => {
                   const index = start + i + 1;
                   const hit = merged.get(index);
-                  const answer = hit
-                    ? mode === "clean"
-                      ? `${(hit as CleanedTrack).artist ?? "?"} — ${(hit as CleanedTrack).title ?? "?"}`
-                      : ((hit as GenreResult).genre ?? "—")
-                    : "—";
+                  const answer = hit ? `${hit.artist ?? "?"} — ${hit.title ?? "?"}` : "—";
                   return (
                     <div
                       key={p}

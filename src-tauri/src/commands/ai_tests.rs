@@ -2,7 +2,7 @@
 //! has to survive the same parsers the Ollama path uses.
 
 use super::ai::*;
-use crate::models::{GenreInput, TrackInput};
+use crate::models::TrackInput;
 
 fn track(index: u32, artist: &str, title: &str) -> TrackInput {
     TrackInput {
@@ -31,19 +31,6 @@ fn clean_prompt_honours_transliteration_choices() {
         ai_clean_prompt(vec![track(1, "Кино", "Группа крови")], vec!["Cyrillic".into()]).unwrap();
     assert!(prompt.contains("Cyrillic: transliterate it phonetically"));
     assert!(prompt.contains("Hebrew: keep it exactly as written"));
-}
-
-#[test]
-fn genre_prompt_lists_only_the_preset_genres() {
-    let tracks = vec![GenreInput {
-        index: 1,
-        artist: "Daft Punk".into(),
-        title: "Around the World".into(),
-        genre: "electronica".into(),
-    }];
-    let prompt = ai_genre_prompt(tracks, vec!["House".into(), "Techno".into()]).unwrap();
-    assert!(prompt.contains("[House, Techno]"));
-    assert!(prompt.contains("Around the World"));
 }
 
 #[test]
@@ -94,18 +81,4 @@ fn keeps_global_indexes_so_batches_land_on_the_right_track() {
 fn rejects_an_answer_with_no_json_in_it() {
     let err = ai_parse_clean_response("I'm sorry, I can't help with that.".into()).unwrap_err();
     assert!(err.contains("Could not parse"));
-}
-
-#[test]
-fn genre_answers_snap_to_the_preset_and_drop_inventions() {
-    let allowed = vec!["House".to_string(), "Techno".to_string()];
-    let out = ai_parse_genre_response(
-        r#"[{"index":1,"genre":"house"},{"index":2,"genre":"Speedcore"}]"#.into(),
-        allowed,
-    )
-    .unwrap();
-    // Case-insensitive match snaps to the preset's own spelling…
-    assert_eq!(out[0].genre.as_deref(), Some("House"));
-    // …and anything outside the preset is dropped rather than written.
-    assert_eq!(out[1].genre, None);
 }

@@ -17,7 +17,6 @@ import {
   StopCircle,
   Link2,
   Repeat,
-  Tags,
   Trash2,
   Type,
   Undo2,
@@ -97,7 +96,6 @@ interface Props {
   onCapitalization: (mode: Capitalization) => void;
   onCharacterRules: () => void;
   onRemoveChars: () => void;
-  onGenre: () => void;
   onGenerateIds: () => void;
   onUnifyIds: () => void;
   onConvert: () => void;
@@ -167,7 +165,6 @@ export function LibraryPage({
   onCapitalization,
   onCharacterRules,
   onRemoveChars,
-  onGenre,
   onGenerateIds,
   onUnifyIds,
   onConvert,
@@ -257,11 +254,9 @@ export function LibraryPage({
   const modeLabel =
     previewMode === "ai"
       ? "AI Cleanup"
-      : previewMode === "genre"
-        ? "Genre Match"
-        : previewMode === "clear"
-          ? "Clear Fields"
-          : "Standardize";
+      : previewMode === "clear"
+        ? "Clear Fields"
+        : "Standardize";
 
   return (
     <div className="flex h-full flex-col gap-4 p-6">
@@ -526,21 +521,6 @@ export function LibraryPage({
             backupFieldKey={backupFieldId ?? undefined}
             onRun={onClearFields}
           />
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={onGenre}
-            disabled={noSel}
-            title={
-              settings.aiBackend === "manual"
-                ? "Match each genre to one your collection already uses, by copy/paste into any AI"
-                : "Match each genre to one your collection already uses, using the local model"
-            }
-          >
-            <Tags />
-            Genre
-          </Button>
-
           <span className="mx-1 h-6 w-px bg-border" />
 
           <Button variant="secondary" size="sm" onClick={onGenerateIds} disabled={noSel}>

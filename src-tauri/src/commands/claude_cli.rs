@@ -36,7 +36,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::commands::ai;
 use crate::commands::ffmpeg::hide_console;
-use crate::models::{CleanedTrack, GenreInput, GenreResult, TrackInput};
+use crate::models::{CleanedTrack, TrackInput};
 
 #[cfg(target_os = "windows")]
 const CLAUDE_EXE: &str = "claude.exe";
@@ -413,29 +413,6 @@ pub async fn claude_clean_batch(
 
     emit_usage(&app, &envelope, count);
     ai::parse_cleaned(&text)
-}
-
-#[tauri::command]
-pub async fn claude_genre_batch(
-    app: AppHandle,
-    tracks: Vec<GenreInput>,
-    genres: Vec<String>,
-    model: Option<String>,
-) -> Result<Vec<GenreResult>, String> {
-    let count = tracks.len();
-    let prompt = ai::build_genre_prompt(&tracks, &genres)?;
-    let allowed = genres.clone();
-    let (text, envelope) = tauri::async_runtime::spawn_blocking(move || {
-        let exe = find_claude().ok_or_else(|| {
-            "No Claude CLI found — install it, or switch the AI backend in Settings.".to_string()
-        })?;
-        run_prompt(&exe, &prompt, model.as_deref())
-    })
-    .await
-    .map_err(|_| "The Claude CLI task panicked".to_string())??;
-
-    emit_usage(&app, &envelope, count);
-    ai::parse_genres(&text, &allowed)
 }
 
 #[cfg(test)]

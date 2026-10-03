@@ -49,15 +49,13 @@ export default function PreviewTable({ rows, mode, busy, onRowsChange, onApply, 
           <h2 className="text-sm font-semibold">
             {mode === "ai"
                 ? "Preview — AI Cleanup"
-                : mode === "genre"
-                  ? "Preview — Genre Match"
-                  : mode === "clear"
-                    ? "Preview — Clear Fields"
-                    : mode === "history"
-                      ? "Session Changes"
-                      : mode === "trackIdMigration"
-                        ? "Preview — Move Track Number IDs to Track ID"
-                        : "Preview — Standardize"}
+                : mode === "clear"
+                  ? "Preview — Clear Fields"
+                  : mode === "history"
+                    ? "Session Changes"
+                    : mode === "trackIdMigration"
+                      ? "Preview — Move Track Number IDs to Track ID"
+                      : "Preview — Standardize"}
           </h2>
           <p className="text-xs text-muted-foreground">
             {readOnly

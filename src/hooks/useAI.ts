@@ -19,19 +19,6 @@ export interface TrackInput {
   genre: string;
 }
 
-/** One track as the genre prompt sees it. */
-export interface GenreInput {
-  index: number;
-  artist: string;
-  title: string;
-  genre: string;
-}
-
-export interface GenreResult {
-  index: number;
-  genre?: string;
-}
-
 const AI_FIELDS = ["artist", "title", "year", "genre"] as const;
 
 /**
@@ -63,16 +50,6 @@ export function cleanInputs(paths: string[], map: Record<string, TagData>): Trac
     artist: map[p]?.artist ?? "",
     title: map[p]?.title ?? "",
     year: map[p]?.year ?? "",
-    genre: map[p]?.genre ?? "",
-  }));
-}
-
-/** Builds the genre prompt's track list. Indexes are 1-based over `paths`. */
-export function genreInputs(paths: string[], map: Record<string, TagData>): GenreInput[] {
-  return paths.map((p, i) => ({
-    index: i + 1,
-    artist: map[p]?.artist ?? "",
-    title: map[p]?.title ?? "",
     genre: map[p]?.genre ?? "",
   }));
 }
@@ -138,33 +115,6 @@ export function buildCleanRows(
     }
   });
   return { rows, unresolved };
-}
-
-/** Turns matched genres (keyed by their 1-based index) into preview rows. */
-export function buildGenreRows(
-  paths: string[],
-  map: Record<string, TagData>,
-  byIndex: Map<number, string>,
-): PendingChange[] {
-  const rows: PendingChange[] = [];
-  paths.forEach((path, i) => {
-    const after = byIndex.get(i + 1);
-    if (!after) return;
-    const before = (map[path].genre ?? "").trim();
-    const changed = after !== before;
-    rows.push({
-      id: `${path}::genre::genre`,
-      path,
-      filename: basename(path),
-      field: "genre",
-      before,
-      after,
-      include: changed,
-      changed,
-      kind: "update",
-    });
-  });
-  return rows;
 }
 
 export function useAI() {
@@ -236,46 +186,5 @@ export function useAI() {
     return { rows, stopped: stopRef.current, unresolved };
   };
 
-  /** Maps each track's genre to the best fit from `genres` via the model. */
-  const runGenre = async (
-    paths: string[],
-    map: Record<string, TagData>,
-    settings: Settings,
-    model: string,
-    genres: string[],
-    onProgress: (done: number, total: number) => void,
-  ): Promise<CleanResult> => {
-    stopRef.current = false;
-    const valid = paths.filter((p) => map[p]);
-    const inputs = genreInputs(valid, map);
-
-    const byIndex = new Map<number, string>();
-    const batchSize = safeBatchSize(settings.batchSize);
-    onProgress(0, valid.length);
-    for (let start = 0; start < inputs.length; start += batchSize) {
-      if (stopRef.current) break;
-      const batch = inputs.slice(start, start + batchSize);
-      const results =
-        settings.aiBackend === "claude"
-          ? await invoke<GenreResult[]>("claude_genre_batch", {
-              tracks: batch,
-              genres,
-              model: settings.claudeModel || null,
-            })
-          : await invoke<GenreResult[]>("ai_map_genre_batch", {
-              url: settings.ollamaUrl,
-              model,
-              tracks: batch,
-              genres,
-            });
-      if (stopRef.current) break;
-      for (const r of results) if (r.genre) byIndex.set(r.index, r.genre);
-      onProgress(Math.min(start + batch.length, valid.length), valid.length);
-    }
-
-    const rows = buildGenreRows(valid, map, byIndex);
-    return { rows, stopped: stopRef.current, unresolved: [] };
-  };
-
-  return { status, check, runClean, runGenre, stop };
+  return { status, check, runClean, stop };
 }

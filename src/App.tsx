@@ -8,12 +8,12 @@ import { Upload, X } from "lucide-react";
 
 import { Sidebar, type Page } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
-import type { ManualMode, ManualResults } from "./components/ManualAIDialog";
+import type { ManualResults } from "./components/ManualAIDialog";
 import type { ConvertOptions } from "./components/ConvertDialog";
 import type { UnifyGroup } from "./components/UnifyDialog";
 import { Button, Card, cn } from "./components/ui";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
+import { buildCleanRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
 import { useImageInfo } from "./hooks/useImageInfo";
 import { useAnalytics } from "./hooks/useAnalytics";
@@ -310,10 +310,8 @@ export default function App() {
   const [unresolved, setUnresolved] = useState<Set<string>>(new Set());
   /** Open manual-AI session: the tracks and tags the copy/paste dialog works on. */
   const [manual, setManual] = useState<{
-    mode: ManualMode;
     paths: string[];
     map: Record<string, TagData>;
-    genres: string[];
   } | null>(null);
 
   // FFmpeg-backed conversion (v0.10). `ffmpegInfo` gates the Convert dialog.
@@ -636,7 +634,7 @@ export default function App() {
    * dialog instead of calling Ollama. Nothing leaves the app on its own — the
    * user pastes the prompt into whichever AI they like.
    */
-  const openManual = async (mode: ManualMode, genres: string[] = []) => {
+  const openManual = async () => {
     const paths = filesApi.selectedPaths;
     setBusy(true);
     try {
@@ -644,7 +642,7 @@ export default function App() {
       errors.forEach((e) => notify(e, "error"));
       const valid = paths.filter((p) => map[p]);
       if (!valid.length) return notify("Could not read tags for the selected files", "error");
-      setManual({ mode, paths: valid, map, genres });
+      setManual({ paths: valid, map });
     } catch (e) {
       notify(String(e), "error");
     } finally {
@@ -657,25 +655,18 @@ export default function App() {
     if (!manual) return;
     const { paths, map } = manual;
     setTagsMap(map);
-    if (results.mode === "clean") {
-      const { rows, unresolved: unresolvedPaths } = buildCleanRows(paths, map, results.byIndex);
-      setPreviewMode("ai");
-      setUnresolved(new Set(unresolvedPaths));
-      setPending(rows);
-      if (!rows.some((r) => r.changed)) notify("That answer changes nothing", "info");
-      if (unresolvedPaths.length)
-        notify(
-          `${unresolvedPaths.length} track${
-            unresolvedPaths.length === 1 ? "" : "s"
-          } couldn't be identified — highlighted in amber. Edit them manually.`,
-          "error",
-        );
-    } else {
-      const rows = buildGenreRows(paths, map, results.byIndex);
-      setPreviewMode("genre");
-      setPending(rows);
-      if (!rows.some((r) => r.changed)) notify("Genres already match the preset", "info");
-    }
+    const { rows, unresolved: unresolvedPaths } = buildCleanRows(paths, map, results.byIndex);
+    setPreviewMode("ai");
+    setUnresolved(new Set(unresolvedPaths));
+    setPending(rows);
+    if (!rows.some((r) => r.changed)) notify("That answer changes nothing", "info");
+    if (unresolvedPaths.length)
+      notify(
+        `${unresolvedPaths.length} track${
+          unresolvedPaths.length === 1 ? "" : "s"
+        } couldn't be identified — highlighted in amber. Edit them manually.`,
+        "error",
+      );
     setManual(null);
   };
 
@@ -723,64 +714,11 @@ export default function App() {
     return model;
   };
 
-  const runGenre = async () => {
-    const paths = filesApi.selectedPaths;
-    if (!paths.length) return notify("No files selected", "info");
-    // The target vocabulary is the collection's own genres. If the library
-    // has never been indexed there is nothing to snap to, and guessing a
-    // default taxonomy would be exactly the drift this replaced.
-    if (genreOptions.length === 0)
-      return notify(
-        "No genres found in your collection yet — index your library in Settings first",
-        "info",
-      );
-
-    if (settings.aiBackend === "manual") return openManual("genre", genreOptions);
-
-    const model = await resolveAiModel();
-    if (model === null) return;
-
-    setBusy(true);
-    setAiRunning(true);
-    try {
-      const { map, errors } = await tagsApi.read(paths);
-      errors.forEach((e) => notify(e, "error"));
-      const { rows, stopped } = await ai.runGenre(
-        paths,
-        map,
-        settings,
-        model,
-        genreOptions,
-        (done, total) =>
-          setProgress({
-            done,
-            total,
-            label: `Genre ${Math.min(done + 1, total)} of ${total}`,
-          }),
-      );
-      setTagsMap(map);
-      setPreviewMode("genre");
-      if (stopped && rows.length === 0) {
-        notify("Genre matching stopped — no results", "info");
-      } else {
-        setPending(rows);
-        if (stopped) notify("Genre matching stopped — showing results so far", "info");
-        else if (!rows.some((r) => r.changed)) notify("Genres already match the preset", "info");
-      }
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setProgress(null);
-      setAiRunning(false);
-      setBusy(false);
-    }
-  };
-
   const runAIClean = async () => {
     const paths = filesApi.selectedPaths;
     if (!paths.length) return notify("No files selected", "info");
 
-    if (settings.aiBackend === "manual") return openManual("clean");
+    if (settings.aiBackend === "manual") return openManual();
 
     const model = await resolveAiModel();
     if (model === null) return;
@@ -1971,7 +1909,6 @@ This rewrites the genre tag on ${
               onCapitalization={withTrack1<Capitalization>("capitalization", runCapitalizationOnly)}
               onCharacterRules={withTrack("characterRules", runCharacterRules)}
               onRemoveChars={withTrack("removeChars", runRemoveChars)}
-              onGenre={withTrack("genre", runGenre)}
               onGenerateIds={withTrack("generateIds", generateIds)}
               onUnifyIds={withTrack("unifyIds", () => void startUnify())}
               onConvert={withTrack("convert", () => openConvert())}
@@ -2114,11 +2051,9 @@ This rewrites the genre tag on ${
       <Suspense fallback={null}>
       {manual && (
         <ManualAIDialog
-          mode={manual.mode}
           paths={manual.paths}
           tags={manual.map}
           transliterateScripts={settings.transliterateScripts}
-          genres={manual.genres}
           chunkSize={settings.manualChunkSize}
           onChunkSizeChange={(size) => void update((prev) => ({ ...prev, manualChunkSize: size }))}
           onCancel={() => setManual(null)}

@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
-use crate::models::{AiUsage, CleanedTrack, GenreInput, GenreResult, OllamaStatus, TrackInput};
+use crate::models::{AiUsage, CleanedTrack, OllamaStatus, TrackInput};
 
 /// Emits token-usage counters from an Ollama `/api/generate` response so the
 /// frontend can accumulate session/lifetime usage stats independent of the
@@ -118,28 +118,12 @@ pub fn ai_clean_prompt(
     build_clean_prompt(&tracks, &transliterate_scripts)
 }
 
-/// Manual mode: the genre-matching counterpart of `ai_clean_prompt`.
-#[tauri::command]
-pub fn ai_genre_prompt(tracks: Vec<GenreInput>, genres: Vec<String>) -> Result<String, String> {
-    build_genre_prompt(&tracks, &genres)
-}
-
 /// Manual mode: parses a response the user pasted back from an outside AI
 /// with the same tolerant parser the Ollama path uses, so markdown fences,
 /// reasoning blocks and `{"tracks": [...]}` wrappers are all accepted.
 #[tauri::command]
 pub fn ai_parse_clean_response(text: String) -> Result<Vec<CleanedTrack>, String> {
     parse_cleaned(&text)
-}
-
-/// Manual mode: parses a pasted genre response, snapping every value to the
-/// user's preset exactly as `ai_map_genre_batch` does.
-#[tauri::command]
-pub fn ai_parse_genre_response(
-    text: String,
-    genres: Vec<String>,
-) -> Result<Vec<GenreResult>, String> {
-    parse_genres(&text, &genres)
 }
 
 #[tauri::command]
@@ -239,106 +223,6 @@ pub async fn ai_clean_batch(
         .as_str()
         .ok_or_else(|| "Ollama response is missing the 'response' field".to_string())?;
     parse_cleaned(text)
-}
-
-/// The complete genre-matching prompt, shared by the Ollama path and manual
-/// mode so both ask for exactly the same thing.
-pub(crate) fn build_genre_prompt(tracks: &[GenreInput], genres: &[String]) -> Result<String, String> {
-    let track_list = serde_json::to_string_pretty(tracks).map_err(|e| e.to_string())?;
-    let allowed = genres.join(", ");
-    Ok(format!(
-        "You are a music genre classifier. For each track, choose the SINGLE best-fitting \
-genre from THIS EXACT LIST and no others:\n[{allowed}]\n\n\
-Rules:\n\
-- You MUST return one of the listed genres verbatim (exact spelling) for every track.\n\
-- Use the artist, title, and any existing genre to decide.\n\
-- If unsure, pick the closest match from the list.\n\
-OUTPUT: Return ONLY a JSON array like \
-[{{\"index\":1,\"genre\":\"Genre From List\"}}], no prose.\n\n\
-Tracks:\n{track_list}"
-    ))
-}
-
-/// Maps each track's genre to the single best fit from `genres` (the user's
-/// preset). The model must choose from the list — never invent a genre.
-#[tauri::command]
-pub async fn ai_map_genre_batch(
-    app: AppHandle,
-    url: String,
-    model: String,
-    tracks: Vec<GenreInput>,
-    genres: Vec<String>,
-) -> Result<Vec<GenreResult>, String> {
-    let track_count = tracks.len();
-    let prompt = build_genre_prompt(&tracks, &genres)?;
-    let body = json!({
-        "model": model,
-        "prompt": prompt,
-        "stream": false,
-        "format": "json"
-    });
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(format!("{}/api/generate", url.trim_end_matches('/')))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Could not reach Ollama: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Ollama returned HTTP {}", resp.status()));
-    }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid response from Ollama: {e}"))?;
-    emit_usage(&app, &model, &v, track_count);
-    let text = v["response"]
-        .as_str()
-        .ok_or_else(|| "Ollama response is missing the 'response' field".to_string())?;
-    parse_genres(text, &genres)
-}
-
-pub(crate) fn parse_genres(text: &str, allowed: &[String]) -> Result<Vec<GenreResult>, String> {
-    let text = strip_reasoning(text);
-    let value: Value = serde_json::from_str(text.trim())
-        .or_else(|_| {
-            extract_json_array(text)
-                .ok_or(())
-                .and_then(|s| serde_json::from_str(s).map_err(|_| ()))
-        })
-        .map_err(|_| {
-            let preview: String = text.chars().take(200).collect();
-            format!("Could not parse the AI genre response: {preview}")
-        })?;
-    let arr = match &value {
-        Value::Array(a) => a.clone(),
-        Value::Object(o) => o
-            .values()
-            .find_map(|x| x.as_array().cloned())
-            .unwrap_or_default(),
-        _ => vec![],
-    };
-    let results = arr
-        .iter()
-        .filter_map(|v| {
-            let index = v.get("index").and_then(|i| {
-                i.as_u64().or_else(|| i.as_str().and_then(|s| s.parse().ok()))
-            })? as u32;
-            let raw = v.get("genre").and_then(|g| g.as_str()).unwrap_or("").trim();
-            // Snap to an allowed genre (case-insensitive), else drop.
-            let genre = allowed
-                .iter()
-                .find(|g| g.eq_ignore_ascii_case(raw))
-                .cloned();
-            Some(GenreResult { index, genre })
-        })
-        .collect();
-    Ok(results)
 }
 
 pub(crate) fn parse_cleaned(text: &str) -> Result<Vec<CleanedTrack>, String> {

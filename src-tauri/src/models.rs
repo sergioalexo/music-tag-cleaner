@@ -111,20 +111,6 @@ pub struct CleanedTrack {
     pub genre: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GenreInput {
-    pub index: u32,
-    pub artist: String,
-    pub title: String,
-    pub genre: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GenreResult {
-    pub index: u32,
-    pub genre: Option<String>,
-}
-
 /// One file's table thumbnail, as returned by `read_cover_thumbnails`.
 /// `data_url` is `None` both for "no embedded art" and for an unreadable
 /// file — the table draws the same placeholder either way, and a per-file
