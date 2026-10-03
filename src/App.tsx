@@ -12,6 +12,7 @@ import type { ManualMode, ManualResults } from "./components/ManualAIDialog";
 import type { ConvertOptions } from "./components/ConvertDialog";
 import type { UnifyGroup } from "./components/UnifyDialog";
 import { Card, cn } from "./components/ui";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { buildCleanRows, buildGenreRows, useAI } from "./hooks/useAI";
 import { useCovers } from "./hooks/useCovers";
 import { useImageInfo } from "./hooks/useImageInfo";
@@ -1921,6 +1922,11 @@ This rewrites the genre tag on ${
         />
         <main className="relative min-w-0 flex-1 overflow-y-auto">
           <Suspense fallback={null}>
+          <ErrorBoundary
+            key={page}
+            onError={(message) => notify(message, "error")}
+            onBack={() => setPage("library")}
+          >
           {page === "library" ? (
             <LibraryPage
               filesApi={filesApi}
@@ -2071,6 +2077,7 @@ This rewrites the genre tag on ${
               notify={notify}
             />
           )}
+          </ErrorBoundary>
           </Suspense>
         </main>
       </div>
