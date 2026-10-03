@@ -760,6 +760,8 @@ export interface ClaudeCliInfo {
   /** Answered a real prompt. `found && !loggedIn` means it needs `/login`. */
   loggedIn: boolean;
   error?: string | null;
+  /** Why `error` happened, so "offline" isn't reported as "not signed in". */
+  errorKind?: "offline" | "timeout" | "not_logged_in" | "other" | null;
 }
 
 export function basename(path: string): string {

@@ -24,6 +24,7 @@ import type {
   TagData,
 } from "../types";
 import { searchTracks } from "../lib/trackSearch";
+import { CLAUDE_OFFLINE_MESSAGE } from "../hooks/useAI";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
 import { Button, Card, CardHeader, cn, inputClass } from "./ui";
 import { TrackContextMenu, trackMenuItems, useTrackContextMenu } from "./TrackContextMenu";
@@ -234,6 +235,10 @@ export function AiPlaylistBuilder({
       } catch (e) {
         notify(String(e), "error");
       }
+      return;
+    }
+    if (settings.aiBackend === "claude" && !navigator.onLine) {
+      notify(CLAUDE_OFFLINE_MESSAGE, "error");
       return;
     }
     setRunning(true);

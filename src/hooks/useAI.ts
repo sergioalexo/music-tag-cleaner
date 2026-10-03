@@ -9,6 +9,11 @@ import {
   type TagData,
 } from "../types";
 
+/** Same wording as the Rust pre-check in `claude_cli.rs`, for the cheap
+ *  `navigator.onLine` check that runs before a Claude batch even starts. */
+export const CLAUDE_OFFLINE_MESSAGE =
+  "No internet connection — the Claude CLI needs to reach Anthropic. Check your connection and try again.";
+
 /** One track as the clean prompt sees it. `index` is 1-based and global to the run. */
 export interface TrackInput {
   index: number;
@@ -150,6 +155,9 @@ export function useAI() {
     onProgress: (done: number, total: number) => void,
   ): Promise<CleanResult> => {
     stopRef.current = false;
+    // Thrown (not notified) so the caller's catch clears its busy state, the
+    // same way a failed invoke would.
+    if (settings.aiBackend === "claude" && !navigator.onLine) throw new Error(CLAUDE_OFFLINE_MESSAGE);
     const valid = paths.filter((p) => map[p]);
     const inputs = cleanInputs(valid, map);
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
@@ -86,6 +86,9 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
     </button>
   );
 }
+
+/** Client-side cap on the Claude CLI check; the backend ping gives up at 30 s. */
+const CLAUDE_CHECK_GUARD_MS = 40_000;
 
 const CLAUDE_MODEL_PRESETS = ["", "haiku", "sonnet", "opus"] as const;
 const CLAUDE_MODEL_LABELS: Record<string, string> = {
@@ -560,6 +563,7 @@ export function SettingsPage({
   const [status, setStatus] = useState<OllamaStatus | null>(null);
   const [claudeCli, setClaudeCli] = useState<ClaudeCliInfo | null>(null);
   const [checkingClaude, setCheckingClaude] = useState(false);
+  const claudeCheckRun = useRef(0);
   const [installingClaude, setInstallingClaude] = useState(false);
   const [signingInClaude, setSigningInClaude] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -721,15 +725,43 @@ export function SettingsPage({
    * demand.
    */
   const checkClaude = async () => {
+    const run = ++claudeCheckRun.current;
     setCheckingClaude(true);
     try {
-      setClaudeCli(await invoke<ClaudeCliInfo>("claude_cli_info"));
+      // The backend gives up after 30 s; this guard is slightly longer so the
+      // spinner can never be permanent even if the command never returns.
+      const info = await Promise.race([
+        invoke<ClaudeCliInfo>("claude_cli_info"),
+        new Promise<ClaudeCliInfo>((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                found: true,
+                loggedIn: false,
+                error: "The Claude CLI check didn't finish — check your internet connection and re-check.",
+                errorKind: "timeout",
+              }),
+            CLAUDE_CHECK_GUARD_MS,
+          ),
+        ),
+      ]);
+      if (run === claudeCheckRun.current) setClaudeCli(info);
     } catch (e) {
       notify(String(e), "error");
     } finally {
-      setCheckingClaude(false);
+      if (run === claudeCheckRun.current) setCheckingClaude(false);
     }
   };
+
+  // Reconnecting after an offline result should refresh it by itself — that
+  // is exactly the "I got connected and Settings didn't notice" case.
+  useEffect(() => {
+    if (settings.aiBackend !== "claude" || claudeCli?.errorKind !== "offline") return;
+    const onOnline = () => void checkClaude();
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.aiBackend, claudeCli]);
 
   useEffect(() => {
     if (settings.aiBackend === "claude" && !claudeCli && !checkingClaude) void checkClaude();
@@ -837,8 +869,17 @@ export function SettingsPage({
                   <div className="space-y-1">
                     <span className="flex items-center gap-2">
                       <Badge className="gap-1 bg-destructive/15 text-destructive">
-                        {claudeCli.found ? "Not signed in" : "Not found"}
+                        {!claudeCli.found
+                          ? "Not found"
+                          : claudeCli.errorKind === "offline"
+                            ? "Offline"
+                            : claudeCli.errorKind === "timeout"
+                              ? "No response"
+                              : "Not signed in"}
                       </Badge>
+                      {claudeCli.found && claudeCli.version && (
+                        <span className="text-muted-foreground">Installed, {claudeCli.version}</span>
+                      )}
                     </span>
                     <p className="text-muted-foreground">{claudeCli.error}</p>
                     {!claudeCli.found ? (
@@ -846,6 +887,11 @@ export function SettingsPage({
                         Click Install below, or run{" "}
                         <span className="font-mono">npm i -g @anthropic-ai/claude-code</span>{" "}
                         yourself — either way, sign in afterwards.
+                      </p>
+                    ) : claudeCli.errorKind === "offline" || claudeCli.errorKind === "timeout" ? (
+                      <p className="text-muted-foreground">
+                        This isn't a sign-in problem. Re-check once you're connected
+                        {claudeCli.errorKind === "offline" ? " — it re-checks by itself when the network returns." : "."}
                       </p>
                     ) : (
                       <p className="text-muted-foreground">
@@ -865,7 +911,11 @@ export function SettingsPage({
                       {installingClaude ? "Installing…" : "Install"}
                     </Button>
                   )}
-                  {claudeCli && claudeCli.found && !claudeCli.loggedIn && (
+                  {claudeCli &&
+                    claudeCli.found &&
+                    !claudeCli.loggedIn &&
+                    claudeCli.errorKind !== "offline" &&
+                    claudeCli.errorKind !== "timeout" && (
                     <Button size="sm" onClick={signInClaude} disabled={signingInClaude}>
                       {signingInClaude ? <Loader2 className="animate-spin" /> : <Terminal />}
                       Sign In

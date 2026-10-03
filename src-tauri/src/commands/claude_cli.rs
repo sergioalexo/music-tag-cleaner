@@ -27,8 +27,12 @@
 //!    with `is_error: true`, so the error text has to be read out of
 //!    `result`.
 
+use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -44,6 +48,90 @@ const CLAUDE_EXE: &str = "claude.exe";
 #[cfg(not(target_os = "windows"))]
 const CLAUDE_EXE: &str = "claude";
 
+/// `claude --version` is a local call; if it takes this long something is wrong.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The Settings "is it usable?" ping — one trivial prompt.
+const PING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Real batches: a base cost plus a per-track allowance, capped so a huge
+/// batch can't hold the UI hostage for more than a few minutes.
+const BATCH_BASE_SECS: u64 = 60;
+const BATCH_PER_TRACK_SECS: u64 = 5;
+const BATCH_MAX_SECS: u64 = 300;
+/// Fast reachability probe before any real prompt (offline => fail in ~3 s
+/// instead of the CLI retrying with backoff for minutes, or forever).
+const CONNECT_HOST: &str = "api.anthropic.com";
+const CONNECT_PORT: u16 = 443;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+const OFFLINE_MESSAGE: &str = "No internet connection — the Claude CLI needs to reach \
+    Anthropic. Check your connection and try again.";
+const NOT_SIGNED_IN_MESSAGE: &str = "The Claude CLI is installed but not signed in. Run \
+    `claude` once in a terminal and log in, then try again.";
+
+/// Why a call failed, so Settings can say "offline" rather than "not signed in".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    Offline,
+    Timeout,
+    NotLoggedIn,
+    Other,
+}
+
+impl ErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::Offline => "offline",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::NotLoggedIn => "not_logged_in",
+            ErrorKind::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CliError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl CliError {
+    fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+    fn other(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Other, message)
+    }
+    fn offline() -> Self {
+        Self::new(ErrorKind::Offline, OFFLINE_MESSAGE)
+    }
+    fn timeout(limit: Duration) -> Self {
+        Self::new(
+            ErrorKind::Timeout,
+            format!(
+                "The Claude CLI didn't respond within {} s — check your internet connection, \
+                 or try a smaller batch.",
+                limit.as_secs()
+            ),
+        )
+    }
+}
+
+/// Time allowed for a real batch of `tracks` items: `60 s + 5 s × tracks`,
+/// capped at 5 minutes.
+fn batch_timeout(tracks: usize) -> Duration {
+    let secs = BATCH_BASE_SECS.saturating_add(BATCH_PER_TRACK_SECS.saturating_mul(tracks as u64));
+    Duration::from_secs(secs.min(BATCH_MAX_SECS))
+}
+
+/// Offline CLI runs surface as Node/fetch errors in stderr or in the
+/// envelope's `result`, not as a distinct exit code.
+fn looks_like_network_error(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["enotfound", "econnrefused", "etimedout", "econnreset", "getaddrinfo", "connection error", "fetch failed"]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeCliInfo {
@@ -56,6 +144,8 @@ pub struct ClaudeCliInfo {
     pub logged_in: bool,
     /// Why it isn't usable, when it isn't.
     pub error: Option<String>,
+    /// `"offline" | "timeout" | "not_logged_in" | "other"` when `error` is set.
+    pub error_kind: Option<String>,
 }
 
 fn on_path() -> Option<PathBuf> {
@@ -178,9 +268,119 @@ fn version_of(exe: &PathBuf) -> Option<String> {
     let mut cmd = Command::new(exe);
     cmd.arg("--version");
     hide_console(&mut cmd);
-    let out = cmd.output().ok()?;
+    let out = run_with_timeout(cmd, VERSION_TIMEOUT).ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!v.is_empty()).then_some(v)
+}
+
+/// Whether Anthropic's API host is reachable right now. DNS resolution has no
+/// timeout of its own, so the whole probe runs on a helper thread that the
+/// caller stops waiting for after a few seconds.
+fn anthropic_reachable() -> bool {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = (CONNECT_HOST, CONNECT_PORT)
+            .to_socket_addrs()
+            .map(|mut addrs| addrs.any(|a| TcpStream::connect_timeout(&a, CONNECT_TIMEOUT).is_ok()))
+            .unwrap_or(false);
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1)).unwrap_or(false)
+}
+
+/// Kills `pid` and everything it started. `claude` can be a node shim, and a
+/// plain `Child::kill` would orphan the `node.exe` doing the actual work.
+fn kill_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
+        hide_console(&mut cmd);
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid; // `Child::kill` right after covers the native binary.
+    }
+}
+
+fn drain<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// `Command::output` with a deadline. Both pipes are drained on helper
+/// threads (a full pipe would otherwise stall the child), the child is polled
+/// until `limit`, and on expiry the whole process tree is killed. The
+/// offline CLI retries with backoff and may never exit by itself, which is
+/// what made AI Clean and the Settings check spin forever.
+fn run_with_timeout(mut cmd: Command, limit: Duration) -> Result<Output, CliError> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CliError::other(format!("Could not run the Claude CLI: {e}")))?;
+    let out_rx = drain(child.stdout.take().expect("piped stdout"));
+    let err_rx = drain(child.stderr.take().expect("piped stderr"));
+
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() >= deadline => {
+                kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CliError::timeout(limit));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(CliError::other(format!("Could not run the Claude CLI: {e}"))),
+        }
+    };
+    // A surviving grandchild could keep a pipe open; don't wait on it forever.
+    let grab = |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    Ok(Output { status, stdout: grab(out_rx), stderr: grab(err_rx) })
+}
+
+/// Turns the CLI's JSON envelope into the answer text or a classified error.
+/// Pure so the message mapping can be tested without spawning the binary.
+fn interpret_envelope(envelope: &Value) -> Result<String, CliError> {
+    let text = envelope["result"].as_str().unwrap_or("").to_string();
+    if envelope["is_error"].as_bool().unwrap_or(false) {
+        let msg = if text.is_empty() { "unknown error".to_string() } else { text };
+        return Err(if msg.contains("Not logged in") {
+            CliError::new(ErrorKind::NotLoggedIn, NOT_SIGNED_IN_MESSAGE)
+        } else if looks_like_network_error(&msg) {
+            CliError::offline()
+        } else {
+            CliError::other(format!("Claude CLI: {msg}"))
+        });
+    }
+    if text.trim().is_empty() {
+        return Err(CliError::other("The Claude CLI returned an empty response"));
+    }
+    Ok(text)
+}
+
+/// Message for output that wasn't a JSON envelope at all: the last line of
+/// stderr, or the offline message when stderr names a network failure.
+fn interpret_unparseable(stderr: &str) -> CliError {
+    if looks_like_network_error(stderr) {
+        return CliError::offline();
+    }
+    let detail = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output")
+        .trim();
+    CliError::other(format!("The Claude CLI returned something unexpected: {detail}"))
 }
 
 /// Runs one non-interactive prompt and returns the assistant's text.
@@ -190,12 +390,19 @@ fn version_of(exe: &PathBuf) -> Option<String> {
 /// there isn't one. The CLI exits non-zero in that case too, but the body is
 /// still valid JSON and carries the only useful message, so the body is
 /// parsed first and the exit code is only a fallback.
+///
+/// Fails fast when Anthropic is unreachable and gives up after `limit`, so a
+/// dead network is an error message rather than an endless spinner.
 fn run_prompt(
     exe: &PathBuf,
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
-) -> Result<(String, Value), String> {
+    limit: Duration,
+) -> Result<(String, Value), CliError> {
+    if !anthropic_reachable() {
+        return Err(CliError::offline());
+    }
     let mut cmd = Command::new(exe);
     cmd.arg("--print")
         .arg(prompt)
@@ -216,37 +423,12 @@ fn run_prompt(
     }
     hide_console(&mut cmd);
 
-    let out = cmd
-        .output()
-        .map_err(|e| format!("Could not run the Claude CLI: {e}"))?;
+    let out = run_with_timeout(cmd, limit)?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
 
-    let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|_| {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = stderr
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("no output")
-            .trim()
-            .to_string();
-        format!("The Claude CLI returned something unexpected: {detail}")
-    })?;
-
-    let text = envelope["result"].as_str().unwrap_or("").to_string();
-    if envelope["is_error"].as_bool().unwrap_or(false) {
-        let msg = if text.is_empty() { "unknown error".to_string() } else { text };
-        return Err(if msg.contains("Not logged in") {
-            "The Claude CLI is installed but not signed in. Run `claude` once in a terminal and \
-             log in, then try again."
-                .to_string()
-        } else {
-            format!("Claude CLI: {msg}")
-        });
-    }
-    if text.trim().is_empty() {
-        return Err("The Claude CLI returned an empty response".to_string());
-    }
+    let envelope: Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| interpret_unparseable(&String::from_utf8_lossy(&out.stderr)))?;
+    let text = interpret_envelope(&envelope)?;
     Ok((text, envelope))
 }
 
@@ -403,21 +585,24 @@ pub async fn claude_cli_info() -> ClaudeCliInfo {
                     "No Claude CLI found. Install it with `npm i -g @anthropic-ai/claude-code`."
                         .to_string(),
                 ),
+                error_kind: Some(ErrorKind::Other.as_str().to_string()),
             };
         };
         let version = version_of(&exe);
         // The cheapest possible real call: it costs a handful of tokens and
         // is the only way to tell "installed" from "actually usable".
-        let (logged_in, error) = match run_prompt(&exe, "Reply with exactly: OK", None, None) {
-            Ok(_) => (true, None),
-            Err(e) => (false, Some(e)),
-        };
+        let (logged_in, error) =
+            match run_prompt(&exe, "Reply with exactly: OK", None, None, PING_TIMEOUT) {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e)),
+            };
         ClaudeCliInfo {
             found: true,
             path: Some(exe.to_string_lossy().to_string()),
             version,
             logged_in,
-            error,
+            error_kind: error.as_ref().map(|e| e.kind.as_str().to_string()),
+            error: error.map(|e| e.message),
         }
     })
     .await
@@ -427,6 +612,7 @@ pub async fn claude_cli_info() -> ClaudeCliInfo {
         version: None,
         logged_in: false,
         error: Some("The Claude CLI probe failed unexpectedly".to_string()),
+        error_kind: Some(ErrorKind::Other.as_str().to_string()),
     })
 }
 
@@ -444,7 +630,8 @@ pub async fn claude_clean_batch(
         let exe = find_claude().ok_or_else(|| {
             "No Claude CLI found — install it, or switch the AI backend in Settings.".to_string()
         })?;
-        run_prompt(&exe, &prompt, model.as_deref(), effort.as_deref())
+        run_prompt(&exe, &prompt, model.as_deref(), effort.as_deref(), batch_timeout(count))
+            .map_err(|e| e.message)
     })
     .await
     .map_err(|_| "The Claude CLI task panicked".to_string())??;
@@ -466,11 +653,19 @@ pub async fn claude_playlist_batch(
 ) -> Result<PlaylistAiResult, String> {
     let pool_ids: Vec<u32> = pool.iter().map(|t| t.id).collect();
     let prompt = ai_playlist::build_playlist_prompt(&pool, &instructions, &sets)?;
+    let timeout = batch_timeout(pool_ids.len());
     let (text, envelope) = tauri::async_runtime::spawn_blocking(move || {
         let exe = find_claude().ok_or_else(|| {
             "No Claude CLI found — install it, or switch the AI backend in Settings.".to_string()
         })?;
-        run_prompt(&exe, &prompt, model.as_deref(), effort.as_deref())
+        run_prompt(
+            &exe,
+            &prompt,
+            model.as_deref(),
+            effort.as_deref(),
+            timeout,
+        )
+        .map_err(|e| e.message)
     })
     .await
     .map_err(|_| "The Claude CLI task panicked".to_string())??;
@@ -500,24 +695,9 @@ mod tests {
         })
     }
 
-    /// Mirrors `run_prompt`'s envelope handling so it can be tested without
-    /// spawning the real binary.
+    /// Exercises the real `interpret_envelope`, flattened to the message.
     fn interpret(envelope: &Value) -> Result<String, String> {
-        let text = envelope["result"].as_str().unwrap_or("").to_string();
-        if envelope["is_error"].as_bool().unwrap_or(false) {
-            let msg = if text.is_empty() { "unknown error".to_string() } else { text };
-            return Err(if msg.contains("Not logged in") {
-                "The Claude CLI is installed but not signed in. Run `claude` once in a terminal and \
-                 log in, then try again."
-                    .to_string()
-            } else {
-                format!("Claude CLI: {msg}")
-            });
-        }
-        if text.trim().is_empty() {
-            return Err("The Claude CLI returned an empty response".to_string());
-        }
-        Ok(text)
+        interpret_envelope(envelope).map_err(|e| e.message)
     }
 
     #[test]
@@ -617,5 +797,58 @@ mod tests {
         let parsed = ai::parse_cleaned(fenced).expect("fenced JSON should parse");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].artist.as_deref(), Some("Boris Brejcha"));
+    }
+
+    #[test]
+    fn batch_timeout_scales_with_tracks_and_is_capped() {
+        assert_eq!(batch_timeout(0), Duration::from_secs(60));
+        assert_eq!(batch_timeout(10), Duration::from_secs(110));
+        assert_eq!(batch_timeout(48), Duration::from_secs(300));
+        assert_eq!(batch_timeout(10_000), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn network_phrases_are_recognised_case_insensitively() {
+        for t in [
+            "getaddrinfo ENOTFOUND api.anthropic.com",
+            "connect ECONNREFUSED 1.2.3.4:443",
+            "ETIMEDOUT",
+            "API Error: Connection error.",
+            "TypeError: fetch failed",
+        ] {
+            assert!(looks_like_network_error(t), "should match: {t}");
+        }
+        assert!(!looks_like_network_error("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn a_network_failure_envelope_maps_to_the_offline_error() {
+        let v = json!({ "is_error": true, "result": "API Error: Connection error." });
+        let e = interpret_envelope(&v).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Offline);
+        assert_eq!(e.message, OFFLINE_MESSAGE);
+    }
+
+    #[test]
+    fn not_logged_in_keeps_its_own_kind() {
+        let e = interpret_envelope(&not_logged_in_envelope()).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotLoggedIn);
+    }
+
+    #[test]
+    fn unparseable_output_with_network_stderr_is_offline() {
+        let e = interpret_unparseable("warn\nError: getaddrinfo ENOTFOUND api.anthropic.com\n");
+        assert_eq!(e.kind, ErrorKind::Offline);
+        let e = interpret_unparseable("something odd\n\n");
+        assert_eq!(e.kind, ErrorKind::Other);
+        assert!(e.message.ends_with("something odd"), "got: {}", e.message);
+    }
+
+    #[test]
+    fn the_timeout_message_names_the_limit() {
+        let e = CliError::timeout(Duration::from_secs(90));
+        assert_eq!(e.kind, ErrorKind::Timeout);
+        assert!(e.message.contains("90 s"), "got: {}", e.message);
+        assert!(e.message.contains("smaller batch"));
     }
 }
