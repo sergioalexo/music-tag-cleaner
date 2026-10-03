@@ -1,6 +1,6 @@
 [package]
 name = "music-tag-cleaner-shell"
-version = "0.15.2"
+version = "0.15.3"
 description = "Windows 11 Explorer context-menu entry (IExplorerCommand) for MusicTagCleaner"
 license = "GPL-3.0-or-later"
 edition = "2021"

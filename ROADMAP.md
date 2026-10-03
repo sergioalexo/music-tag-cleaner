@@ -2220,6 +2220,46 @@ wired into `release.yml`.
 **Verification.** `cargo test` in `shell-ext` (CLSID matches manifest);
 package registered (`Status Ok`), COM class activates, and the owner
 confirmed the entry shows in the Windows 11 main menu and opens files.
+### 60. Explorer launch identity, Claude CLI offline, status bar — v0.15.3
+
+**What/why.** Three issues after v0.15.2.
+1. Opening a song via the right-click entry showed a second, icon-less
+   taskbar button next to the pinned one. The shell-ext's child process
+   inherited the sparse package's identity, so its window got the package
+   AUMID instead of `com.sopas.musictagcleaner` (the pinned shortcut's).
+2. Offline, AI Clean with the Claude CLI backend spun forever, and
+   Settings -> AI stayed on "Checking the Claude CLI..." (the check ran a
+   real prompt with no timeout, and the re-check button was disabled while
+   it "ran").
+3. The bottom-right Ollama dot in the status bar was noise.
+
+**How.**
+- `src-tauri/src/main.rs`: `SetCurrentProcessExplicitAppUserModelID` first
+  thing in `main()`, plus the window-level AUMID (`SHGetPropertyStoreForWindow`
+  + `PKEY_AppUserModel_ID`) in `setup`. `shell-ext/src/lib.rs` now starts the
+  app with `CreateProcessW` + the desktop-app breakaway attribute so it
+  runs outside the package (falls back to a plain spawn). `build.ps1`
+  generates real Square44x44 (scale / targetsize / unplated), Square150x150
+  and StoreLogo assets instead of one 128 px copy.
+- `claude_cli.rs`: `run_with_timeout` (pipes drained on threads, process
+  tree killed via `taskkill /T /F`), timeouts 10 s version / 30 s ping /
+  60 s + 5 s per track capped at 5 min, a 3 s TCP pre-check of
+  `api.anthropic.com:443`, and network phrases in stderr/`result` mapped to
+  one "No internet connection" message. `ClaudeCliInfo.errorKind`
+  (`offline | timeout | not_logged_in | other`) lets Settings say "Offline"
+  instead of "Not signed in"; it has a 40 s client-side guard and re-checks
+  on the window `online` event. AI Clean / AI playlists fail at once when
+  `navigator.onLine` is false.
+- `StatusBar.tsx` / `App.tsx`: Ollama indicator and prop removed
+  (`ai.status` is still used elsewhere).
+
+**Verification.** `cargo test` (new tests for envelope/stderr message
+mapping and timeout scaling), `cargo build` in `shell-ext`, `tsc --noEmit`,
+`npm test`, `npm run build`. **Not verified (needs the GUI / a real
+machine):** that the shell-ext child really drops package identity (Task
+Manager -> Details -> "Package name" blank), taskbar grouping/icon after
+`build.ps1 -Install`, and the offline flows with the network adapter off.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
