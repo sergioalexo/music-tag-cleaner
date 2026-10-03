@@ -2083,6 +2083,97 @@ confirmed against a real `npm run tauri dev` window or a real Mixxx import —
 the owner should try it against their actual rekordbox.xml and confirm the
 generated .m3u8s import cleanly via Mixxx's right-click "Import Playlist".
 
+### 57. A permanent Library, AI playlists from it, right-click open, Settings crash safety-net — v0.15.0
+
+The owner's library index got wiped (`library_root`, `library_track`,
+`index_meta` all empty on 2026-09-30) because nothing distinguished the
+**Library** (the fixed, permanent collection) from a **working batch** (songs
+opened right now to clean). `addLibraryRoot` added every opened batch folder
+as a library root, and `set_library_roots([])` deleted every track row when
+called with no roots — both made emptying the index one click away, with no
+confirmation either way. Full hand-off plan: `PLAN-v0.15-library.md`.
+
+**Workstream E — Settings black screen.** Added a top-level `ErrorBoundary`
+(`main.tsx`) plus a per-page one keyed by page in `App.tsx`, with "Copy
+details" and "Back to tracks". A crash on any one page can no longer black
+out the whole window. Static analysis of `SettingsPage.tsx`/
+`useLibraryIndex.ts` found every empty-index field already null-guarded, so
+the exact 09-30 trigger is unconfirmed — this is the safety net regardless of
+cause.
+
+**Workstream A — the Library is one permanent folder.** New single
+`libraryFolder` setting (bumped `CURRENT_SETTINGS_VERSION`, migrated from the
+first existing `library_root` row), defaulting to
+`C:\Users\sopas\Music\Collection`. Deleted `addLibraryRoot` and the
+`lastFolder` root-seeding — roots are now always exactly
+`[settings.libraryFolder]`. `set_library_roots([])` rejects with an error
+instead of wiping the index (the exact 09-30 bug, now impossible). "Clear
+Index" moved under an Advanced fold requiring the user to type `CLEAR`. An
+unplugged/offline Library folder keeps its rows ("showing last known
+library") instead of pruning them as deleted — fixed a related bug found
+while verifying this. Sidebar now reads "Library (N)" vs "Working batch (N)"
+distinctly. Deferred: a filesystem watcher for external file changes, and a
+"new" badge for batch-only genres in the picker (disproportionate re-plumbing
+for a cosmetic marker).
+
+**Workstream B — removed the "Genre" toolbar button**, the owner didn't use
+it. Deleted `runGenre`/`onGenre`, the genre mode of `ManualAIDialog`, and the
+whole Rust side (`ai_genre_prompt`, `ai_map_genre_batch`,
+`claude_genre_batch`) after confirming nothing else called them. Settings →
+Genres card (detect/merge near-duplicate spellings) is untouched — different
+feature.
+
+**Workstream C — right-click open everywhere.** Pulled the track table's
+inline context menu into a shared `TrackContextMenu` (`useTrackContextMenu`
+hook + `trackMenuItems()` helper), wired into the track table, the Library
+search dock, and YT-import matched rows. Items: Open, **Add to working
+batch** (routes through `filesApi.importPaths`, fixing the "in the index but
+not loaded" gap), Reveal in Explorer, Copy path, Inspect tags. Multi-select
+wording ("Open N songs") only applies within the track table's own
+selection — the search dock and YT-import rows have no multi-select state to
+hang it off yet.
+
+**Workstream F — per-task Claude CLI model + effort.** Replaced the single
+`claudeModel` setting with `claudeTasks: { clean, playlist }`, each a
+model+effort pair (bumped `CURRENT_SETTINGS_VERSION`). Defaults: Clean =
+sonnet/low (factual recall, fast), Playlist = sonnet/medium (judgment over
+hundreds of tracks). `run_prompt` gained `--effort`. Found and fixed a real
+bug while wiring usage reporting: the Claude-backend `emit_usage` sent
+`promptTokens`/`completionTokens`/`songs`, but the frontend's `ai-usage`
+listener (shared with the Ollama path) expected
+`promptEvalCount`/`evalCount`/`tracks` — so Claude-backend AI usage was
+silently never recorded until now. Also fixed `emit_usage` to pick the
+`modelUsage` entry with the most output tokens instead of the first key.
+
+**Workstream D0 — Rekordbox BPM/key into the Library.** New
+`rekordbox_track` table in `library-index.sqlite` (path, bpm, key,
+imported_at), LEFT JOINed onto `library_track` by case-insensitive path.
+Settings → Library card: "Rekordbox XML: `<path>` [Choose…] [Re-import]",
+auto re-imports at launch if the XML's mtime changed. BPM and Key now show as
+optional columns in the track table and search dock. Verified via unit tests
+only — no live Rekordbox XML export was available in this environment.
+
+**Workstream D — AI playlists from the Library.** New "AI Playlists" tab on
+the YT Music Import page (not a separate page, per the owner's decision):
+filter the Library pool by genre/year/BPM/key/artist/rating, free-text
+instructions, split into named sets (presets or custom), one compact prompt
+line per track sent to whichever AI backend is configured (Ollama/Claude
+CLI/Manual), strict-JSON response parsed to keep **only** track ids that were
+actually in the pool — any id the AI didn't have is dropped and reported,
+never guessed. Results are editable per set (reorder, remove, add from
+search) with the shared `TrackContextMenu`, exported via the existing
+`.m3u8`/Rekordbox XML builders. Simplified/deferred: no per-set target-count
+sizing (presets just name the sets), "suggested to add" is copy-to-clipboard
+text rather than a one-click import button, and playlist sessions aren't
+saved/reopenable yet (would need a new sqlite session shape).
+
+**Verification.** `npm test` 132/132, `cargo test` 101 passed, `npm run
+build` clean, across every workstream. No live `npm run tauri dev` GUI
+session or live AI-backend round trip was run in this environment — the
+owner should click through Settings, open a batch outside the Library,
+re-index, and run an AI playlist against the real Collection with at least
+one real backend before relying on this release.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
