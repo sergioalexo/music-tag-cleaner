@@ -1995,6 +1995,7 @@ This rewrites the genre tag on ${
                   }
                 })();
               }}
+              onAddToBatch={(paths) => void filesApi.importPaths(paths)}
             />
           ) : page === "components" ? (
             <ComponentsPage

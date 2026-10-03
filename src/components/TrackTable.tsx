@@ -1,21 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { TrackContextMenu, trackMenuItems, useTrackContextMenu, type MenuEntry } from "./TrackContextMenu";
 import {
   AlertTriangle,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
-  ClipboardCopy,
   ExternalLink,
   Filter,
-  FolderOpen,
   Headphones,
   ImageOff,
   ImagePlus,
-  Info,
   Layers,
   Link2,
   Loader2,
@@ -958,27 +955,13 @@ export function TrackTable({
   // through the whole (sorted/filtered) list, not just the virtualized window.
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
 
-  // Right-click row menu ("Open with…", Reveal, Convert, …). Positioned at the
-  // pointer; closed on any outside click, Escape, or scroll.
-  const [menu, setMenu] = useState<{ x: number; y: number; file: AudioFile } | null>(null);
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
-    window.addEventListener("click", close);
-    window.addEventListener("contextmenu", close);
-    window.addEventListener("resize", close);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("contextmenu", close);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [menu]);
+  // Right-click row menu ("Open with…", Reveal, Convert, …) — state and
+  // closing behavior live in the shared hook; this table adds its own
+  // extra items (Open with…, Convert, Delete) on top of the common ones.
+  const { menu, openMenu, closeMenu } = useTrackContextMenu();
 
   const runMenuAction = (fn: () => unknown) => {
-    setMenu(null);
+    closeMenu();
     void Promise.resolve(fn()).catch((e) => console.error("row action failed:", e));
   };
 
@@ -1857,10 +1840,9 @@ export function TrackTable({
                     data-path={f.path}
                     className={cn("border-b border-border/50 transition-colors", rowBg)}
                     onClick={(e) => handleRowClick(e, f.path)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setMenu({ x: e.clientX, y: e.clientY, file: f });
-                    }}
+                    onContextMenu={(e) =>
+                      openMenu(e, rowSel.has(f.path) && rowSel.size > 1 ? [...rowSel] : [f.path])
+                    }
                   >
                     <td
                       className={cn("sticky left-0 z-10 cursor-pointer px-2", rh.py, stickyBg)}
@@ -2241,67 +2223,39 @@ export function TrackTable({
       )}
 
       {menu &&
-        createPortal(
-          <div
-            className="fixed z-[60] min-w-[200px] overflow-hidden rounded-md border bg-popover py-1 text-sm shadow-lg"
-            style={{
-              left: Math.min(menu.x, window.innerWidth - 220),
-              top: Math.min(menu.y, window.innerHeight - 300),
-            }}
-            onClick={(e) => e.stopPropagation()}
-            onContextMenu={(e) => e.preventDefault()}
-          >
-            {(
-              [
-                { icon: Play, label: "Open", run: () => openPath(menu.file.path) },
-                {
-                  icon: ExternalLink,
-                  label: "Open with…",
-                  run: () => invoke("open_with", { path: menu.file.path }),
-                },
-                {
-                  icon: FolderOpen,
-                  label: "Reveal in File Explorer",
-                  run: () => revealItemInDir(menu.file.path),
-                },
-                {
-                  icon: ClipboardCopy,
-                  label: "Copy path",
-                  run: () => navigator.clipboard.writeText(menu.file.path),
-                },
-                null,
-                onConvertFile
-                  ? { icon: Repeat, label: "Convert…", run: () => onConvertFile(menu.file) }
-                  : null,
-                { icon: Info, label: "Inspect tags", run: () => onInspect(menu.file) },
-                null,
-                {
-                  icon: Trash2,
-                  label: "Delete (Recycle Bin)",
-                  run: () => onDeleteFile(menu.file),
-                  danger: true,
-                },
-              ] as ({ icon: typeof Play; label: string; run: () => unknown; danger?: boolean } | null)[]
-            ).map((item, i) =>
-              item === null ? (
-                <div key={`sep${i}`} className="my-1 border-t" />
-              ) : (
-                <button
-                  key={item.label}
-                  onClick={() => runMenuAction(item.run)}
-                  className={cn(
-                    "flex w-full items-center gap-2.5 px-3 py-1.5 text-left hover:bg-accent",
-                    item.danger && "text-destructive hover:bg-destructive/10",
-                  )}
-                >
-                  <item.icon className="h-3.5 w-3.5 shrink-0" />
-                  {item.label}
-                </button>
-              ),
-            )}
-          </div>,
-          document.body,
-        )}
+        (() => {
+          const byPath = new Map(files.map((f) => [f.path, f]));
+          const first = byPath.get(menu.paths[0]);
+          const n = menu.paths.length;
+          const items: MenuEntry[] = [
+            ...trackMenuItems({
+              paths: menu.paths,
+              onInspect: first && n === 1 ? () => onInspect(first) : undefined,
+            }),
+          ];
+          // Single-file-only extras: a right-click inside a multi-selection
+          // only offers actions every shared menu item already supports.
+          if (first && n === 1) {
+            items.splice(1, 0, {
+              icon: ExternalLink,
+              label: "Open with…",
+              run: () => invoke("open_with", { path: first.path }),
+            });
+            if (onConvertFile) {
+              items.push(null, { icon: Repeat, label: "Convert…", run: () => onConvertFile(first) });
+            }
+          }
+          items.push(null, {
+            icon: Trash2,
+            label: n > 1 ? `Delete ${n} (Recycle Bin)` : "Delete (Recycle Bin)",
+            run: () =>
+              n > 1
+                ? Promise.all(menu.paths.map((p) => byPath.get(p)).filter((f): f is AudioFile => !!f).map((f) => onDeleteFile(f)))
+                : first && onDeleteFile(first),
+            danger: true,
+          });
+          return <TrackContextMenu menu={menu} items={items} onRun={runMenuAction} />;
+        })()}
     </div>
   );
 }

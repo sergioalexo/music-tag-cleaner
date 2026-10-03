@@ -5,6 +5,7 @@ import type { MatchCandidate } from "../lib/ytMatch";
 import { searchTracks } from "../lib/trackSearch";
 import { AudioPreview } from "./AudioPreview";
 import { cn } from "./ui";
+import { TrackContextMenu, trackMenuItems, useTrackContextMenu } from "./TrackContextMenu";
 
 /** Other candidates the matcher found for the currently-focused playlist
  * row — the "cycle through variants" arrows used to live in the row itself;
@@ -47,6 +48,8 @@ export function LibrarySearchPanel({
   onPick,
   onPickVariant,
   onDenyVariant,
+  onAddToBatch,
+  onInspect,
 }: {
   files: AudioFile[];
   tags: Record<string, TagData>;
@@ -65,7 +68,16 @@ export function LibrarySearchPanel({
   onPickVariant?: (path: string) => void;
   /** Rejects one alternate candidate outright (it never fits, so hide it). */
   onDenyVariant?: (path: string) => void;
+  /** Right-click → "Add to working batch". Omitted hides that menu item. */
+  onAddToBatch?: (paths: string[]) => unknown;
+  /** Right-click → "Inspect tags". */
+  onInspect?: (path: string) => unknown;
 }) {
+  const { menu, openMenu, closeMenu } = useTrackContextMenu();
+  const runMenuAction = (fn: () => unknown) => {
+    closeMenu();
+    void Promise.resolve(fn()).catch((e) => console.error("row action failed:", e));
+  };
   const [query, setQuery] = useState("");
   // The query is searched debounced, not on every keystroke: with a 4000+
   // track library, re-scoring the whole collection on each character is
@@ -120,6 +132,7 @@ export function LibrarySearchPanel({
       <div
         key={key}
         onDoubleClick={opts.onMatch}
+        onContextMenu={(e) => openMenu(e, [path])}
         title={`${path}\n\nPress Match (or double-click) to use this for the highlighted playlist row`}
         className="flex select-none items-center gap-2 rounded-md px-2 py-1 hover:bg-accent/50"
       >
@@ -255,6 +268,14 @@ export function LibrarySearchPanel({
             </div>
           )}
         </div>
+      )}
+
+      {menu && (
+        <TrackContextMenu
+          menu={menu}
+          items={trackMenuItems({ paths: menu.paths, onAddToBatch, onInspect })}
+          onRun={runMenuAction}
+        />
       )}
     </div>
   );

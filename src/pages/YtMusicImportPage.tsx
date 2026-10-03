@@ -49,6 +49,7 @@ import { parseImportInput, shortHash } from "../lib/ytListInput";
 import { buildM3u8, buildRekordboxPlaylistXml } from "../lib/rekordboxExport";
 import { Button, Card, CardHeader, cn } from "../components/ui";
 import { LibrarySearchPanel, type RowVariants } from "../components/LibrarySearchPanel";
+import { TrackContextMenu, trackMenuItems, useTrackContextMenu } from "../components/TrackContextMenu";
 
 function sanitizeFilenamePart(s: string): string {
   return s.replace(/[\\/:*?"<>|]+/g, " ").trim() || "playlist";
@@ -134,6 +135,7 @@ export function YtMusicImportPage({
   indexing,
   lastIndexedAt,
   onIndexNow,
+  onAddToBatch,
 }: {
   /** The whole collection: indexed tracks plus this session's loaded files. */
   files: AudioFile[];
@@ -147,11 +149,19 @@ export function YtMusicImportPage({
   lastIndexedAt?: number | null;
   /** Kicks off (or re-runs) the whole-library index by hand. */
   onIndexNow: () => void;
+  /** Right-click → "Add to working batch", for matched rows and the search dock. */
+  onAddToBatch?: (paths: string[]) => unknown;
 }) {
   const [ytdlp, setYtdlp] = useState<YtDlpInfo | null>(null);
   const [checkingYtdlp, setCheckingYtdlp] = useState(true);
   const [installing, setInstalling] = useState(false);
   const [installProgress, setInstallProgress] = useState<{ downloaded: number; total: number } | null>(null);
+
+  const { menu, openMenu, closeMenu } = useTrackContextMenu();
+  const runMenuAction = (fn: () => unknown) => {
+    closeMenu();
+    void Promise.resolve(fn()).catch((e) => console.error("row action failed:", e));
+  };
 
   /** The multi-line import box: a playlist URL, video links, and/or typed
    * song names, one per line — see `parseImportInput`. */
@@ -1335,6 +1345,7 @@ export function YtMusicImportPage({
                                 e.stopPropagation();
                                 onInspect(displayPath);
                               }}
+                              onContextMenu={(e) => openMenu(e, [displayPath])}
                               title={displayPath}
                             >
                               <div className="truncate text-xs hover:underline">{lib.title}</div>
@@ -1516,9 +1527,18 @@ export function YtMusicImportPage({
             const row = matches?.find((m) => m.entry.videoId === focusedId);
             if (row) denyCandidatePath(row, p);
           }}
+          onAddToBatch={onAddToBatch}
+          onInspect={onInspect}
         />
       )}
 
+      {menu && (
+        <TrackContextMenu
+          menu={menu}
+          items={trackMenuItems({ paths: menu.paths, onAddToBatch, onInspect })}
+          onRun={runMenuAction}
+        />
+      )}
     </div>
   );
 }
