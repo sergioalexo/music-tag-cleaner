@@ -1407,6 +1407,20 @@ pub async fn path_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
 }
 
+/// A file's modified time in Unix seconds, or `None` if it doesn't exist.
+/// Used to detect a changed Rekordbox XML export so it can be re-imported
+/// automatically at launch instead of only on request.
+#[tauri::command]
+pub async fn file_mtime_secs(path: String) -> Option<i64> {
+    std::fs::metadata(&path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
 fn set_text(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
     if let Some(v) = value {
         let v = v.trim();

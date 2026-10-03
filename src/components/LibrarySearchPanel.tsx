@@ -155,6 +155,13 @@ export function LibrarySearchPanel({
         <div className="hidden w-12 shrink-0 text-right text-[10px] text-muted-foreground lg:block">
           {tag?.year || "—"}
         </div>
+        <div
+          className="hidden w-16 shrink-0 text-right text-[10px] text-muted-foreground lg:block"
+          title={file?.key ? `Key: ${file.key}` : undefined}
+        >
+          {file?.bpm != null ? `${Math.round(file.bpm)} bpm` : "—"}
+          {file?.key ? ` · ${file.key}` : ""}
+        </div>
         <span className="shrink-0 rounded bg-secondary px-1 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
           {file?.format ?? ""}
         </span>

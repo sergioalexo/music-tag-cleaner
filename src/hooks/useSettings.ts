@@ -5,7 +5,7 @@ import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 12;
+export const CURRENT_SETTINGS_VERSION = 13;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -27,6 +27,8 @@ export const DEFAULT_SETTINGS: Settings = {
   djApp: { primary: "other", secondary: "other" },
   lastFolder: "",
   libraryFolder: "",
+  rekordboxXmlPath: "",
+  rekordboxXmlMtime: 0,
   theme: "system",
   visibleColumns: [
     "preview",
@@ -92,6 +94,8 @@ const STORE_FILE = "settings.json";
  * the single `claudeModel` into a model+effort pair per AI task
  * (`claudeTasks.clean` / `.playlist`) — a non-empty old `claudeModel`
  * becomes the Clean task's model, keeping the Clean task's default effort.
+ * v13 adds `rekordboxXmlPath`/`rekordboxXmlMtime` (D0), both filled in by the
+ * `{ ...DEFAULT_SETTINGS, ...saved }` merge — no migration logic needed.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };

@@ -11,6 +11,7 @@ import {
   type IndexSummary,
   type IndexedTrack,
   type LibraryStats,
+  type RekordboxTagSummary,
   type TagData,
 } from "../types";
 
@@ -135,6 +136,17 @@ export function useLibraryIndex(notify: Notify) {
     [refreshStats],
   );
 
+  /** Imports BPM/key from a Rekordbox XML export into the Library index
+   * (D0), then refreshes so the new columns/stats show up immediately. */
+  const importRekordboxTags = useCallback(
+    async (xmlPath: string) => {
+      const summary = await invoke<RekordboxTagSummary>("import_rekordbox_library_tags", { xmlPath });
+      await refresh();
+      return summary;
+    },
+    [refresh],
+  );
+
   const files = useMemo<AudioFile[]>(() => tracks.map(indexedToFile), [tracks]);
   const tags = useMemo<Record<string, TagData>>(() => {
     const out: Record<string, TagData> = {};
@@ -159,6 +171,7 @@ export function useLibraryIndex(notify: Notify) {
     clear,
     pathsWithGenre,
     reindexPaths,
+    importRekordboxTags,
   };
 }
 

@@ -302,6 +302,7 @@ function LibraryIndexCard({
   const { stats, indexing, progress } = libraryIndex;
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [clearConfirmText, setClearConfirmText] = useState("");
+  const [rbImporting, setRbImporting] = useState(false);
 
   const runIndex = async (rescanAll: boolean) => {
     try {
@@ -346,6 +347,34 @@ function LibraryIndexCard({
     await libraryIndex.clear();
     setClearConfirmText("");
     notify("Library index cleared", "info");
+  };
+
+  const chooseRekordboxXml = async () => {
+    const picked = await open({
+      title: "Select rekordbox.xml",
+      multiple: false,
+      filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
+    });
+    if (typeof picked !== "string") return;
+    onSave({ ...settings, rekordboxXmlPath: picked });
+    void reimportRekordboxXml(picked);
+  };
+
+  const reimportRekordboxXml = async (xmlPath: string) => {
+    setRbImporting(true);
+    try {
+      const summary = await libraryIndex.importRekordboxTags(xmlPath);
+      const mtime = await invoke<number | null>("file_mtime_secs", { path: xmlPath });
+      onSave({ ...settings, rekordboxXmlPath: xmlPath, rekordboxXmlMtime: mtime ?? 0 });
+      notify(
+        `Rekordbox BPM/key imported — ${summary.matched} of ${summary.libraryTrackCount} Library tracks matched (${summary.xmlEntries} entries in the XML)`,
+        "success",
+      );
+    } catch (e) {
+      notify(`Could not import Rekordbox BPM/key: ${e}`, "error");
+    } finally {
+      setRbImporting(false);
+    }
   };
 
   const pct =
@@ -437,6 +466,43 @@ function LibraryIndexCard({
             )}
           </p>
         )}
+
+        <div className="mt-3 border-t pt-3">
+          <div className="mb-1 text-sm font-medium">Rekordbox BPM/Key</div>
+          <p className="mb-2 text-xs text-muted-foreground">
+            Rekordbox's own BPM/key analysis, read from a collection export — in Rekordbox:
+            File → Export Collection in xml format.
+          </p>
+          <div className="mb-2 flex items-center gap-2">
+            {settings.rekordboxXmlPath ? (
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={settings.rekordboxXmlPath}>
+                {settings.rekordboxXmlPath}
+              </span>
+            ) : (
+              <span className="flex-1 text-xs text-muted-foreground">No rekordbox.xml chosen yet.</span>
+            )}
+            <Button variant="secondary" size="sm" onClick={chooseRekordboxXml} disabled={rbImporting}>
+              <FolderOpen />
+              Choose…
+            </Button>
+            {settings.rekordboxXmlPath && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => void reimportRekordboxXml(settings.rekordboxXmlPath)}
+                disabled={rbImporting}
+              >
+                {rbImporting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                {rbImporting ? "Importing…" : "Re-import"}
+              </Button>
+            )}
+          </div>
+          {stats && stats.trackCount > 0 && settings.rekordboxXmlPath && (
+            <p className="text-xs text-muted-foreground">
+              {stats.rekordboxMatched} of {stats.trackCount} Library tracks have Rekordbox BPM/key.
+            </p>
+          )}
+        </div>
 
         <div className="mt-3 border-t pt-3">
           {!advancedOpen ? (

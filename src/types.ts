@@ -7,6 +7,10 @@ export interface AudioFile {
   durationSecs?: number;
   bitrateKbps?: number;
   sampleRateHz?: number;
+  /** From a Rekordbox XML import (D0) — not file-tag data, so undefined
+   * until that's been run, and only ever present on a Library track. */
+  bpm?: number;
+  key?: string;
 }
 
 export interface TagData {
@@ -265,6 +269,11 @@ export interface Settings {
    * last opened to work on), which may or may not be inside it.
    */
   libraryFolder: string;
+  /** Path to a `rekordbox.xml` collection export, read for BPM/key (D0). */
+  rekordboxXmlPath: string;
+  /** The XML file's mtime (Unix seconds) as of the last successful import,
+   * so launch can re-import only when the export actually changed. */
+  rekordboxXmlMtime: number;
   /**
    * "system" follows the OS light/dark setting and is the default —
    * there is no in-app theme switcher any more. The explicit values are
@@ -545,6 +554,8 @@ export interface IndexedTrack {
   originalArtist?: string | null;
   trackId?: string | null;
   rating?: number | null;
+  bpm?: number | null;
+  key?: string | null;
 }
 
 export interface IndexSummary {
@@ -562,6 +573,15 @@ export interface LibraryStats {
   lastIndexedAt?: number | null;
   genreCount: number;
   artistCount: number;
+  /** Library tracks with a matching Rekordbox BPM/key row (D0). */
+  rekordboxMatched: number;
+}
+
+/** From `import_rekordbox_library_tags` (D0). */
+export interface RekordboxTagSummary {
+  matched: number;
+  libraryTrackCount: number;
+  xmlEntries: number;
 }
 
 export interface GenreCount {
@@ -606,6 +626,8 @@ export function indexedToFile(t: IndexedTrack): AudioFile {
     size: t.size,
     hasBackup: t.hasBackup,
     durationSecs: t.durationSecs ?? undefined,
+    bpm: t.bpm ?? undefined,
+    key: t.key ?? undefined,
   };
 }
 

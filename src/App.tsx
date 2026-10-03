@@ -191,6 +191,21 @@ export default function App() {
         } catch {
           // Settings' own index card still works for a manual run.
         }
+        // Re-import Rekordbox BPM/key only when the export actually
+        // changed since the last import — not on every launch.
+        if (settings.rekordboxXmlPath) {
+          try {
+            const mtime = await invoke<number | null>("file_mtime_secs", {
+              path: settings.rekordboxXmlPath,
+            });
+            if (mtime != null && mtime !== settings.rekordboxXmlMtime) {
+              await libraryIndex.importRekordboxTags(settings.rekordboxXmlPath);
+              void update((prev) => ({ ...prev, rekordboxXmlMtime: mtime }));
+            }
+          } catch {
+            // Settings' own Rekordbox row still works for a manual re-import.
+          }
+        }
         return;
       }
       // No Library folder ever configured — ask once, suggesting the

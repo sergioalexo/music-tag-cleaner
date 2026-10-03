@@ -99,6 +99,12 @@ CREATE TABLE IF NOT EXISTS yt_entry_meta (
     json TEXT NOT NULL,
     fetched_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rekordbox_track (
+    path_lower TEXT PRIMARY KEY,
+    bpm REAL,
+    key TEXT,
+    imported_at INTEGER NOT NULL
+);
 ";
 
 /// What the indexer extracts per file. Bump this whenever a row gains a
@@ -207,6 +213,10 @@ pub struct IndexedTrack {
     pub original_artist: Option<String>,
     pub track_id: Option<String>,
     pub rating: Option<u8>,
+    /// From a Rekordbox XML import (D0), joined in by path — not file-tag
+    /// data, so it's `None` for every track until that's been run once.
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -235,6 +245,9 @@ pub struct LibraryStats {
     pub last_indexed_at: Option<i64>,
     pub genre_count: i64,
     pub artist_count: i64,
+    /// Library tracks with a matching Rekordbox BPM/key row (D0). `None`
+    /// before any Rekordbox XML has ever been imported.
+    pub rekordbox_matched: i64,
 }
 
 // --- Roots -----------------------------------------------------------------
@@ -556,6 +569,8 @@ fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<IndexedTrack> {
         original_artist: r.get("original_artist")?,
         track_id: r.get("track_id")?,
         rating: r.get::<_, Option<i64>>("rating")?.map(|v| v as u8),
+        bpm: r.get("rb_bpm")?,
+        key: r.get("rb_key")?,
         path,
     })
 }
@@ -569,7 +584,12 @@ pub async fn library_tracks(app: AppHandle) -> Result<Vec<IndexedTrack>, String>
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&app)?;
         let mut stmt = conn
-            .prepare("SELECT * FROM library_track ORDER BY path")
+            .prepare(
+                "SELECT lt.*, rb.bpm AS rb_bpm, rb.key AS rb_key
+                 FROM library_track lt
+                 LEFT JOIN rekordbox_track rb ON LOWER(lt.path) = rb.path_lower
+                 ORDER BY lt.path",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], row_to_track)
@@ -614,7 +634,22 @@ pub async fn library_stats(app: AppHandle) -> Result<LibraryStats, String> {
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
             .collect();
-        Ok(LibraryStats { track_count, roots, last_indexed_at, genre_count, artist_count })
+        let rekordbox_matched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM library_track lt
+                 JOIN rekordbox_track rb ON LOWER(lt.path) = rb.path_lower",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(LibraryStats {
+            track_count,
+            roots,
+            last_indexed_at,
+            genre_count,
+            artist_count,
+            rekordbox_matched,
+        })
     })
     .await
     .map_err(|_| "Reading library stats failed unexpectedly".to_string())?
@@ -978,6 +1013,40 @@ mod tests {
         assert_eq!(stale, vec![&"C:/Online/a.mp3"]);
     }
 
+    /// Workstream D0: a Rekordbox row joins onto its Library track by a
+    /// case-insensitive path match, and a track with no Rekordbox row reads
+    /// back as `None` rather than failing the query.
+    #[test]
+    fn rekordbox_bpm_and_key_join_case_insensitively_by_path() {
+        let conn = mem_db();
+        insert(&conn, r"C:\Music\Song.mp3", Some("Techno"), None);
+        insert(&conn, r"C:\Music\Other.mp3", Some("Techno"), None);
+        conn.execute(
+            "INSERT INTO rekordbox_track (path_lower, bpm, key, imported_at) VALUES (?1, ?2, ?3, 100)",
+            params![r"c:\music\song.mp3", 128.0, "8A"],
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT lt.*, rb.bpm AS rb_bpm, rb.key AS rb_key
+                 FROM library_track lt
+                 LEFT JOIN rekordbox_track rb ON LOWER(lt.path) = rb.path_lower
+                 ORDER BY lt.path",
+            )
+            .unwrap();
+        let rows: Vec<IndexedTrack> =
+            stmt.query_map([], row_to_track).unwrap().filter_map(Result::ok).collect();
+
+        let other = rows.iter().find(|t| t.path.ends_with("Other.mp3")).unwrap();
+        assert_eq!(other.bpm, None);
+        assert_eq!(other.key, None);
+
+        let song = rows.iter().find(|t| t.path.ends_with("Song.mp3")).unwrap();
+        assert_eq!(song.bpm, Some(128.0));
+        assert_eq!(song.key.as_deref(), Some("8A"));
+    }
+
     #[test]
     fn a_row_round_trips_through_the_index_shape() {
         let conn = mem_db();
@@ -987,7 +1056,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let mut stmt = conn.prepare("SELECT * FROM library_track").unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT lt.*, rb.bpm AS rb_bpm, rb.key AS rb_key
+                 FROM library_track lt
+                 LEFT JOIN rekordbox_track rb ON LOWER(lt.path) = rb.path_lower",
+            )
+            .unwrap();
         let t = stmt.query_row([], row_to_track).unwrap();
         assert_eq!(t.filename, "x.mp3");
         assert_eq!(t.artist.as_deref(), Some("Boris Brejcha"));

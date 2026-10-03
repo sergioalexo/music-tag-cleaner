@@ -66,6 +66,9 @@ struct ParsedTrack {
     /// Whole seconds, straight from rekordbox's `TotalTime` attribute.
     total_time_secs: Option<i64>,
     average_bpm: Option<f64>,
+    /// Rekordbox's `Tonality` attribute, e.g. "8A" or "Fm" — whatever key
+    /// notation the user has Rekordbox set to export in. Not normalized here.
+    tonality: Option<String>,
     cues: CueData,
 }
 
@@ -139,6 +142,7 @@ fn track_from_attrs(e: &quick_xml::events::BytesStart) -> ParsedTrack {
         artist: attr_str(e, "Artist").unwrap_or_default(),
         total_time_secs: attr_i32(e, "TotalTime").map(|v| v as i64),
         average_bpm: attr_f64(e, "AverageBpm"),
+        tonality: attr_str(e, "Tonality").filter(|v| !v.is_empty()),
         cues: CueData::default(),
     }
 }
@@ -592,6 +596,88 @@ pub async fn get_cues_for_path(app: AppHandle, path: String) -> Result<Option<Cu
         .map_err(|_| "cue lookup task panicked".to_string())?
 }
 
+// --- BPM/key into the Library index (v0.15 D0): a separate, path-keyed
+// table (not the fingerprint-keyed `cues` one above) because this is read
+// back by `library_index.rs` with a plain SQL join against `library_track`,
+// where a fingerprint lookup per row would be far too slow to run on every
+// `library_tracks()` call.
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RekordboxTagSummary {
+    /// Library tracks that now have a matching Rekordbox row.
+    pub matched: usize,
+    /// Total tracks currently in the Library index.
+    pub library_track_count: usize,
+    /// `<TRACK>` entries read from the XML.
+    pub xml_entries: usize,
+}
+
+/// Normalizes a path for the case-insensitive join against `library_track`:
+/// Windows paths differ only by case between Rekordbox's export and the
+/// app's own `canonicalize`/`WalkDir` reads often enough that an exact match
+/// would silently miss real tracks.
+fn normalize_path_for_join(path: &str) -> String {
+    path.to_lowercase()
+}
+
+fn import_rekordbox_library_tags_blocking(
+    app: &AppHandle,
+    xml_path: &str,
+) -> Result<RekordboxTagSummary, String> {
+    let tracks = parse_rekordbox_xml(xml_path)?;
+    let xml_entries = tracks.len();
+
+    // `open_db` runs the shared schema, which already includes `rekordbox_track`.
+    let conn = super::library_index::open_db(app)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    conn.execute("DELETE FROM rekordbox_track", [])
+        .map_err(|e| e.to_string())?;
+    for t in &tracks {
+        if t.location.is_empty() || (t.average_bpm.is_none() && t.tonality.is_none()) {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO rekordbox_track (path_lower, bpm, key, imported_at) VALUES (?1, ?2, ?3, ?4)",
+            params![normalize_path_for_join(&t.location), t.average_bpm, t.tonality, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let library_track_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM library_track", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0) as usize;
+    let matched: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM library_track lt
+             JOIN rekordbox_track rb ON LOWER(lt.path) = rb.path_lower",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+
+    Ok(RekordboxTagSummary { matched, library_track_count, xml_entries })
+}
+
+/// Reads `AverageBpm`/`Tonality` out of a rekordbox.xml export and stores
+/// them keyed by (lowercased) file path, for `library_index.rs` to join
+/// against the Library on every read. Read-only against Rekordbox, same as
+/// the cue importer above; this only ever writes to our own sqlite file.
+#[tauri::command]
+pub async fn import_rekordbox_library_tags(
+    app: AppHandle,
+    xml_path: String,
+) -> Result<RekordboxTagSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || import_rekordbox_library_tags_blocking(&app, &xml_path))
+        .await
+        .map_err(|_| "Rekordbox BPM/key import task panicked".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +726,36 @@ mod tests {
             tracks.len()
         );
         assert!(!tracks.is_empty(), "a real export should have at least one track");
+    }
+
+    #[test]
+    fn normalize_path_for_join_lowercases_for_a_case_insensitive_match() {
+        assert_eq!(normalize_path_for_join(r"C:\Music\Song.flac"), r"c:\music\song.flac");
+    }
+
+    #[test]
+    fn parses_tonality_from_a_track_attribute() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="Coming Home" Artist="A-Trak" AverageBpm="123.00" Tonality="8A"
+           Location="file://localhost/C:/Users/sopas/Music/Collection/song.flac"/>
+  </COLLECTION>
+</DJ_PLAYLISTS>"#;
+        let dir = std::env::temp_dir().join(format!(
+            "mtc-rb-tonality-{:?}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml_path = dir.join("rekordbox.xml");
+        std::fs::write(&xml_path, xml).unwrap();
+
+        let tracks = parse_rekordbox_xml(xml_path.to_str().unwrap()).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].tonality.as_deref(), Some("8A"));
+        assert_eq!(tracks[0].average_bpm, Some(123.0));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
