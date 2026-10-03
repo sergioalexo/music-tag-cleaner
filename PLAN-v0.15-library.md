@@ -183,6 +183,55 @@ Rekordbox.
 
 ---
 
+## Workstream F: model and effort per AI task (Claude CLI backend)
+
+**Verified facts (2026-10-02):**
+- The app passes **no model and no effort** when `settings.claudeModel` is empty,
+  which is the owner's current setting (`claude_cli.rs:205`, `useAI.ts:221/263`).
+  The CLI then uses the owner's own Claude Code settings: `~/.claude/settings.json` has
+  `"model": "sonnet"` and `modelSettings.effortLevel: "low"`. So AI Clean runs on Sonnet at low effort today,
+  but only by accident. Changing the Claude Code default silently changes the app too.
+- The CLI supports `--model <alias|full id>`, `--effort <level>` and
+  `--fallback-model <model>` (checked with `claude --help`).
+- `emit_usage` (`claude_cli.rs:251`) labels the call with the **first** key of
+  `modelUsage`. The CLI can list a small helper model (Haiku) next to the main
+  one, so the usage dashboard may show the wrong model.
+
+**F1. Per-task settings.** Replace the single `claudeModel` with a model + effort pair for each task
+(bump `CURRENT_SETTINGS_VERSION` and migrate: a non-empty old `claudeModel` becomes the Clean model):
+
+| Task | Default model | Default effort | Why |
+|---|---|---|---|
+| AI Clean (artist/title/year/genre) | `sonnet` | `low` | Needs factual recall (original release year, main artist), and wrong answers get written into files. Low effort keeps it fast |
+| AI playlists (D) | `sonnet` | `medium` | Needs judgment on energy/flow across hundreds of tracks |
+
+- Model dropdown: Haiku / Sonnet / Opus / "Claude Code default" (sends no flag,
+  which is today's behaviour) / Custom (free text, for a full model id).
+- Effort dropdown: low / medium / high / "default". **Disable it when Haiku is selected**,
+  because Haiku 4.5 has no effort setting.
+- Hint under the playlist row: "Opus gives better sets but uses your plan's usage
+  faster."
+
+**F2. Pass them through.** `run_prompt` takes `effort: Option<&str>` and adds
+`--effort <level>` when it's set, the same way `--model` works. `claude_clean_batch` and
+the new playlist command each pass their own task's pair. Add a Rust test
+for the argument building (empty → no flag).
+
+**F3. Correct usage labels.** In `emit_usage`, pick the `modelUsage` entry with
+the most output tokens, not the first key. Optionally keep the per-model
+breakdown in the Logs page.
+
+**F4. Fewer tokens without lowering quality** (cheaper than switching to a smaller model):
+- AI playlists send one compact line per track (`id | artist | title | genre | year |
+  bpm | key`), never full tag dumps, and only the filtered pool (D2).
+- AI Clean keeps batching (`batchSize` 50). Check the prompt doesn't repeat
+  per-track boilerplate.
+- Show tokens per run in the result toast so the owner can compare settings.
+
+**Verify:** run AI Clean on the same 50 tracks with Haiku, Sonnet/low and Sonnet/medium.
+Compare the changed rows and tokens, and record the result in the ROADMAP entry. Confirm that
+`--effort` actually reaches the CLI (log the full command line in the debug log).
+
 ## Order and size
 
 | # | Workstream | Size |
@@ -191,8 +240,9 @@ Rekordbox.
 | 2 | A: Permanent Library (fixes the lost genres) | M |
 | 3 | B: Remove Genre button | S |
 | 4 | C: Right-click open everywhere | S–M |
-| 5 | D0: Rekordbox BPM/key into the Library | M |
-| 6 | D: AI playlists from the Library (tab on the YT import page) | L |
+| 5 | F: Model + effort per AI task | S |
+| 6 | D0: Rekordbox BPM/key into the Library | M |
+| 7 | D: AI playlists from the Library (tab on the YT import page) | L |
 
 After each one: `npm test`, `cargo test`, `npm run build`, add a ROADMAP entry, and bump to v0.15.0 at the end.
 
