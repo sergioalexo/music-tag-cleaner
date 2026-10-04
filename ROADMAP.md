@@ -2291,7 +2291,7 @@ ranking are untouched.
 FLAC beats MP3, bitrate, tag-completeness tie-break, reason strings),
 `npm run build`. **Not click-tested** (needs `npm run tauri dev`): playback,
 seeking, A/B switching, ghost tints, Apply suggestion, delete while playing.
-Unreleased; fold into the next version bump.
+Shipped in v0.16.0.
 
 ## Roadmap — v1.0
 
