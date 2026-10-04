@@ -167,6 +167,15 @@ export function useFiles(
     setSource(nextSource);
   };
 
+  /** The batch as a session tab keeps it while that tab is in the background. */
+  const snapshot = () => ({ files, selected: [...selected], source });
+
+  const restore = (s: { files: AudioFile[]; selected: string[]; source: SessionSource }) => {
+    setFiles(s.files);
+    setSelected(new Set(s.selected));
+    setSource(s.source);
+  };
+
   /** Re-reads file info (size, hasBackup, duration) for every loaded file. */
   const refresh = async () => {
     if (!filesRef.current.length) return;
@@ -242,6 +251,8 @@ export function useFiles(
     setManySelected,
     clearList,
     replaceWith,
+    snapshot,
+    restore,
     refresh,
     refreshPaths,
     remap,

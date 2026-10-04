@@ -42,7 +42,10 @@ import { ClearFieldsMenu } from "../components/ClearFieldsMenu";
 import { CapitalizationMenu } from "../components/CapitalizationMenu";
 import { LibrarySidebar, matchesSidebarFilter, type SidebarFilter } from "../components/LibrarySidebar";
 import { Button } from "../components/ui";
-import { decideGenreClick, type SessionSource } from "../lib/sessionTabs";
+import { decideGenreClick, tabTitle, type SessionSource } from "../lib/sessionTabs";
+import { SessionTabs } from "../components/SessionTabs";
+import { GenreSessionDialog, type GenreSessionChoice } from "../components/GenreSessionDialog";
+import type { SessionTabView } from "../hooks/useSessionTabs";
 import type { GenreCount } from "../types";
 
 /** Whether the open working batch is somewhere other than inside the
@@ -77,6 +80,19 @@ interface Props {
   libraryGenres: GenreCount[];
   /** Swaps the batch for a library genre; the caller guards unapplied previews. */
   onLoadGenre: (genre: string) => void;
+  /** Opens a library genre in a fresh session tab, leaving this one alone. */
+  onOpenGenreInNewTab: (genre: string) => void;
+  /** Forgets this session's list and undo history, then loads the genre. */
+  onReplaceWithGenre: (genre: string) => void;
+  tabs: SessionTabView[];
+  activeTabId: string;
+  /** Tab switching is off while a long action is running in the live tab. */
+  tabsLocked: boolean;
+  onSelectTab: (id: string) => void;
+  onNewTab: () => void;
+  onCloseTab: (id: string) => void;
+  /** Applied undo steps in the live session, for the genre dialog's warning. */
+  undoSteps: number;
   covers: Record<string, string | null>;
   unresolved: Set<string>;
   settings: Settings;
@@ -148,6 +164,15 @@ export function LibraryPage({
   libraryTags,
   libraryGenres,
   onLoadGenre,
+  onOpenGenreInNewTab,
+  onReplaceWithGenre,
+  tabs,
+  activeTabId,
+  tabsLocked,
+  onSelectTab,
+  onNewTab,
+  onCloseTab,
+  undoSteps,
   covers,
   unresolved,
   settings,
@@ -217,16 +242,36 @@ export function LibraryPage({
     [filesApi.files, libraryTags, sidebarFilter],
   );
   // A genre click normally loads that genre. A hand-built batch is never
-  // thrown away by one: until the session dialog exists it filters instead.
+  // thrown away by one: it asks (or follows the remembered answer) first.
+  const [genreDialog, setGenreDialog] = useState<string | null>(null);
+  const filterToGenre = (genre: string) =>
+    setSidebarFilter((f) => (f?.mode === "genre" && f.value === genre ? null : { mode: "genre", value: genre }));
   const onGenreClick = (genre: string) => {
-    const action = decideGenreClick({ source: filesApi.source, hasUnappliedPreview: false });
-    if (action === "manual") {
-      setSidebarFilter((f) => (f?.mode === "genre" && f.value === genre ? null : { mode: "genre", value: genre }));
-    } else {
-      setSidebarFilter(null);
-      onLoadGenre(genre);
-    }
+    const action = decideGenreClick({
+      source: filesApi.source,
+      hasUnappliedPreview: !!pending && previewMode !== "history",
+      manualChoice: settings.genreClickInManualSession,
+    });
+    if (action === "ask") return setGenreDialog(genre);
+    if (action === "filter") return filterToGenre(genre);
+    setSidebarFilter(null);
+    if (action === "new-tab") onOpenGenreInNewTab(genre);
+    else if (action === "replace") onReplaceWithGenre(genre);
+    else onLoadGenre(genre);
   };
+  const chooseForGenre = (genre: string, choice: GenreSessionChoice, remember: boolean) => {
+    setGenreDialog(null);
+    if (remember) onSaveSettings({ ...settings, genreClickInManualSession: choice });
+    if (choice === "filter") return filterToGenre(genre);
+    setSidebarFilter(null);
+    if (choice === "newTab") onOpenGenreInNewTab(genre);
+    else onReplaceWithGenre(genre);
+  };
+
+  // A filter narrows one tab's batch; it doesn't follow you to another tab.
+  useEffect(() => {
+    setSidebarFilter(null);
+  }, [activeTabId]);
   const trackGroups = useMemo(
     () => buildTrackGroups(filesApi.files, libraryTags, settings.trackIdDigits),
     [filesApi.files, libraryTags, settings.trackIdDigits],
@@ -624,62 +669,83 @@ export function LibraryPage({
           onWidthChange={(w) => onSaveSettings({ ...settings, sidebarWidth: w })}
           onCollapsedChange={(c) => onSaveSettings({ ...settings, sidebarCollapsed: c })}
         />
-        {pending && previewMode === "history" ? (
-          <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
-            <PreviewTable
-              rows={pending}
-              mode={previewMode}
-              busy={busy}
-              onRowsChange={onPendingChange}
-              onApply={onApplyPending}
-              onCancel={onCancelPending}
-            />
-          </div>
-        ) : (
-          <TrackTable
-            files={sidebarFilteredFiles}
-            tags={libraryTags}
-            covers={covers}
-            imageInfo={imageInfo}
-            onFetchImageInfo={onFetchImageInfo}
-            onSetCoverArt={onSetCoverArt}
-            onRemoveCoverArt={onRemoveCoverArt}
-            unresolved={unresolved}
-            selected={filesApi.selected}
-            visibleColumns={settings.visibleColumns}
-            columnWidths={settings.columnWidths}
-            highlightSymbols={settings.highlightSymbols}
-            flagExtraChars={settings.flagExtraChars}
-            fieldNaming={settings.fieldNaming}
-            rowHeight={settings.rowHeight}
-            genreOptions={genreOptions}
-            onToggle={filesApi.toggle}
-            onSetAll={filesApi.setAll}
-            onSetMany={filesApi.setManySelected}
-            onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
-            onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
-            onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
-            onEditField={onEditField}
-            onEditRawField={onEditRawField}
-            onEditRating={onEditRating}
-            onInspect={onInspect}
-            onAddGenre={onAddGenre}
-            onRenameGenre={onRenameGenre}
-            onConvertFile={onConvertFile}
-            trackIdFormats={tidFormats}
-            onDeleteFile={onDeleteFile}
-            onRenameFile={onRenameFile}
-            backupFieldId={backupFieldId}
-            shortcuts={shortcuts}
-            onTrack={onTrack}
-            pending={inlinePreview ? pending : null}
-            onPendingChange={onPendingChange}
-            previewMode={previewMode}
-            notify={notify}
-            logWheelEvents={logWheelEvents}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
+          <SessionTabs
+            tabs={tabs}
+            activeId={activeTabId}
+            disabled={tabsLocked}
+            onSelect={onSelectTab}
+            onNew={onNewTab}
+            onClose={onCloseTab}
           />
-        )}
+          {pending && previewMode === "history" ? (
+            <div className="min-h-0 flex-1 overflow-hidden rounded-lg border bg-card">
+              <PreviewTable
+                rows={pending}
+                mode={previewMode}
+                busy={busy}
+                onRowsChange={onPendingChange}
+                onApply={onApplyPending}
+                onCancel={onCancelPending}
+              />
+            </div>
+          ) : (
+            <TrackTable
+              files={sidebarFilteredFiles}
+              tags={libraryTags}
+              covers={covers}
+              imageInfo={imageInfo}
+              onFetchImageInfo={onFetchImageInfo}
+              onSetCoverArt={onSetCoverArt}
+              onRemoveCoverArt={onRemoveCoverArt}
+              unresolved={unresolved}
+              selected={filesApi.selected}
+              visibleColumns={settings.visibleColumns}
+              columnWidths={settings.columnWidths}
+              highlightSymbols={settings.highlightSymbols}
+              flagExtraChars={settings.flagExtraChars}
+              fieldNaming={settings.fieldNaming}
+              rowHeight={settings.rowHeight}
+              genreOptions={genreOptions}
+              onToggle={filesApi.toggle}
+              onSetAll={filesApi.setAll}
+              onSetMany={filesApi.setManySelected}
+              onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
+              onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
+              onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
+              onEditField={onEditField}
+              onEditRawField={onEditRawField}
+              onEditRating={onEditRating}
+              onInspect={onInspect}
+              onAddGenre={onAddGenre}
+              onRenameGenre={onRenameGenre}
+              onConvertFile={onConvertFile}
+              trackIdFormats={tidFormats}
+              onDeleteFile={onDeleteFile}
+              onRenameFile={onRenameFile}
+              backupFieldId={backupFieldId}
+              shortcuts={shortcuts}
+              onTrack={onTrack}
+              pending={inlinePreview ? pending : null}
+              onPendingChange={onPendingChange}
+              previewMode={previewMode}
+              notify={notify}
+              logWheelEvents={logWheelEvents}
+            />
+          )}
+        </div>
       </div>
+      {genreDialog && (
+        <GenreSessionDialog
+          genre={genreDialog}
+          sessionLabel={tabTitle(filesApi.source, filesApi.files.map((f) => f.path))}
+          fileCount={filesApi.files.length}
+          undoSteps={undoSteps}
+          hasPreview={inlinePreview}
+          onChoose={(choice, remember) => chooseForGenre(genreDialog, choice, remember)}
+          onCancel={() => setGenreDialog(null)}
+        />
+      )}
     </div>
   );
 }

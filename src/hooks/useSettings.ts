@@ -5,7 +5,7 @@ import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 13;
+export const CURRENT_SETTINGS_VERSION = 14;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -68,6 +68,7 @@ export const DEFAULT_SETTINGS: Settings = {
   convertPreset: "mp3-320",
   convertOutput: "alongside",
   stemOptions: DEFAULT_STEM_OPTIONS,
+  genreClickInManualSession: "ask",
 };
 
 const STORE_FILE = "settings.json";
@@ -105,6 +106,8 @@ function sanitizeNumbers<T extends object>(obj: T | undefined, defaults: T): T {
  * becomes the Clean task's model, keeping the Clean task's default effort.
  * v13 adds `rekordboxXmlPath`/`rekordboxXmlMtime` (D0), both filled in by the
  * `{ ...DEFAULT_SETTINGS, ...saved }` merge — no migration logic needed.
+ * v14 adds `genreClickInManualSession` (the remembered answer to the genre
+ * session dialog, default "ask"), filled in by the same merge.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };

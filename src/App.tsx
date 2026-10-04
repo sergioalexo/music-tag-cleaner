@@ -24,7 +24,7 @@ import { useLibraryIndex, mergeWithSession } from "./hooks/useLibraryIndex";
 import { useTags } from "./hooks/useTags";
 import { LibraryPage } from "./pages/LibraryPage";
 import { useGenreLoad } from "./hooks/useGenreLoad";
-import { decideGenreClick } from "./lib/sessionTabs";
+import { useSessionTabs } from "./hooks/useSessionTabs";
 import {
   applyCapitalization,
   applyReplacements,
@@ -316,20 +316,36 @@ export default function App() {
     notify,
   });
 
-  /** Library-sidebar genre click: swaps the batch, asking first only when an unapplied preview would be lost. */
-  const loadLibraryGenre = async (genre: string) => {
-    const action = decideGenreClick({
-      source: filesApi.source,
-      hasUnappliedPreview: !!pending && previewMode !== "history",
-    });
-    if (action === "confirm-load") {
-      const ok = await confirm(
-        "You have a preview that hasn't been applied. Opening this genre discards it.",
-        { title: "Open genre", kind: "warning" },
-      );
-      if (!ok) return;
+  /** Drops the open preview, asking first when it hasn't been applied. False = the user kept it. */
+  const releasePreview = async () => {
+    if (pending && previewMode !== "history") {
+      const ok = await confirm("You have a preview that hasn't been applied. Continuing discards it.", {
+        title: "Unapplied preview",
+        kind: "warning",
+      });
+      if (!ok) return false;
     }
     setPending(null);
+    return true;
+  };
+
+  const sessionTabs = useSessionTabs({
+    filesApi,
+    history,
+    cancelGenreLoad: genreLoad.cancel,
+    releasePreview,
+  });
+
+  // The three ways a library-genre click can land (the page picks which).
+  const loadLibraryGenre = async (genre: string) => {
+    if (await releasePreview()) await genreLoad.loadGenre(genre);
+  };
+  const openGenreInNewTab = async (genre: string) => {
+    if (await sessionTabs.openNewTab()) await genreLoad.loadGenre(genre);
+  };
+  const replaceWithGenre = async (genre: string) => {
+    if (!(await releasePreview())) return;
+    sessionTabs.resetHistory();
     await genreLoad.loadGenre(genre);
   };
 
@@ -1940,6 +1956,15 @@ This rewrites the genre tag on ${
               libraryTags={libraryTags}
               libraryGenres={libraryIndex.genres}
               onLoadGenre={(genre) => void loadLibraryGenre(genre)}
+              onOpenGenreInNewTab={(genre) => void openGenreInNewTab(genre)}
+              onReplaceWithGenre={(genre) => void replaceWithGenre(genre)}
+              tabs={sessionTabs.views}
+              activeTabId={sessionTabs.activeId}
+              tabsLocked={busy || filesApi.scanning || aiRunning || backupRunning}
+              onSelectTab={(id) => void sessionTabs.switchTo(id)}
+              onNewTab={() => void sessionTabs.openNewTab()}
+              onCloseTab={(id) => void sessionTabs.requestClose(id)}
+              undoSteps={history.index + 1}
               covers={covers}
               unresolved={unresolved}
               settings={settings}

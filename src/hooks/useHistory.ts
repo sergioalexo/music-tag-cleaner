@@ -20,6 +20,14 @@ export interface HistoryEntry {
 
 const HISTORY_LIMIT = 50;
 
+/** One session tab's undo/redo stacks, parked while another tab is active. */
+export interface HistorySnapshot {
+  history: HistoryEntry[];
+  redoStack: HistoryEntry[];
+}
+
+export const EMPTY_HISTORY: HistorySnapshot = { history: [], redoStack: [] };
+
 /** Synthetic `field` prefixes used for changes that aren't plain tag fields. */
 const COVER_ART_FIELD = "__coverArt";
 const RAW_FIELD_PREFIX = "__raw:";
@@ -147,6 +155,12 @@ export function useHistory({
     }
   };
 
+  const snapshot = (): HistorySnapshot => ({ history, redoStack });
+  const restore = (s: HistorySnapshot) => {
+    setHistory(s.history);
+    setRedoStack(s.redoStack);
+  };
+
   const undo = () => step(history[history.length - 1], false, "Undid");
   const redo = () => step(redoStack[redoStack.length - 1], true, "Redid");
 
@@ -200,6 +214,8 @@ export function useHistory({
 
   return {
     push,
+    snapshot,
+    restore,
     undo,
     redo,
     jumpTo,

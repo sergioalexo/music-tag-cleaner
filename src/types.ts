@@ -1,3 +1,5 @@
+import type { GenreClickChoice } from "./lib/sessionTabs";
+
 export interface AudioFile {
   path: string;
   filename: string;
@@ -331,6 +333,11 @@ export interface Settings {
   convertOutput: "alongside" | "subfolder";
   /** Last-used Demucs settings, so a repeat run needs no re-picking. */
   stemOptions: StemOptions;
+  /**
+   * What clicking a library genre does when the batch was built by hand:
+   * "ask" shows the session dialog; the others are its remembered answers.
+   */
+  genreClickInManualSession: GenreClickChoice;
 }
 
 /** Non-Latin scripts AI Clean can optionally transliterate — must match SCRIPTS in ai.rs. */
