@@ -2260,6 +2260,39 @@ machine):** that the shell-ext child really drops package identity (Task
 Manager -> Details -> "Package name" blank), taskbar grouping/icon after
 `build.ps1 -Install`, and the offline flows with the network adapter off.
 
+### 61. Duplicates page: click-to-play waveforms, Skip by default, suggestion as a hint
+
+**What/why.** Two problems on the Duplicates page. (1) There was no way to
+audition the files in a group, so deciding which copy to keep meant leaving
+the page. (2) A scan pre-selected Keep/Remove, so "Remove N to Recycle Bin"
+right after a scan deleted files nobody had reviewed.
+
+**How.** UI-only; `scan_duplicates`, `duplicates.rs` and `suggestKeeper()`'s
+ranking are untouched.
+- `src/pages/DuplicatesPage.tsx`: one shared `<audio>` for the page (groups
+  can hold hundreds of rows). Clicking/dragging a row's waveform
+  (`Waveform`'s existing `onSeek`) plays that file from there; a per-row
+  Play/Stop button, a playhead and elapsed/total time on the playing row;
+  clicking another row switches file at the clicked position (A/B). Joins
+  the app-wide single-player contract (`takeOverPlayback`/`releasePlayback`).
+  The audio is unloaded before a delete that includes the playing file and on
+  re-scan so the webview doesn't hold a handle on a file being recycled.
+  Space toggles the last-played row (not while focus is in an input/button).
+- Every row now starts at Skip. The suggestion (duplicate groups only; none
+  for "alternate") is shown as a faint green Keep / red Remove tint with a
+  "Suggested: ..." tooltip. A selected Keep is solid green. New per-group
+  "Apply suggestion" and a footer "Apply all suggestions". After a delete the
+  suggestion is recomputed for any group that shrank.
+- `src/lib/duplicates.ts` (new): `suggestKeeper`, `tagCompleteness` moved
+  out of the page unchanged, plus `suggestReason()` which explains the
+  ranking without altering it.
+
+**Verification.** `tsc --noEmit`, `npm test` (new `duplicates.test.ts`:
+FLAC beats MP3, bitrate, tag-completeness tie-break, reason strings),
+`npm run build`. **Not click-tested** (needs `npm run tauri dev`): playback,
+seeking, A/B switching, ghost tints, Apply suggestion, delete while playing.
+Unreleased; fold into the next version bump.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

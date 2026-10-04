@@ -2,54 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Copy, Loader2, Play, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, Loader2, Play, Square, Trash2, Wand2 } from "lucide-react";
 import type { AudioFile, DuplicateGroup, TagData } from "../types";
 import { formatBytes } from "../types";
 import { Button, Card, cn } from "../components/ui";
+import { COMPLETENESS_FIELDS, suggestKeeper, suggestReason, tagCompleteness } from "../lib/duplicates";
 import { Waveform } from "../components/Waveform";
 import { formatDuration, releasePlayback, takeOverPlayback } from "../components/AudioPreview";
 
 type RowState = "keep" | "remove" | "skip";
-
-const LOSSLESS = new Set(["flac", "wav", "aiff", "aif"]);
-const COMPLETENESS_FIELDS: (keyof TagData)[] = [
-  "title",
-  "artist",
-  "album",
-  "albumArtist",
-  "year",
-  "genre",
-  "trackNumber",
-];
-
-function tagCompleteness(t?: TagData): number {
-  if (!t) return 0;
-  const filled = COMPLETENESS_FIELDS.filter((k) => {
-    const v = t[k];
-    return typeof v === "string" && v.trim().length > 0;
-  }).length;
-  return filled + (t.hasCoverArt ? 1 : 0);
-}
-
-/** Highest quality → most complete tags → shortest/first path as a
- * deterministic tie-break (a true "oldest file" tie-break would need file
- * mtime surfaced to the frontend, which isn't wired up here). */
-function suggestKeeper(paths: string[], files: Record<string, AudioFile>, tags: Record<string, TagData>): string {
-  return [...paths].sort((a, b) => {
-    const fa = files[a];
-    const fb = files[b];
-    const rankA = fa && LOSSLESS.has(fa.format.toLowerCase()) ? 1 : 0;
-    const rankB = fb && LOSSLESS.has(fb.format.toLowerCase()) ? 1 : 0;
-    if (rankA !== rankB) return rankB - rankA;
-    const brA = fa?.bitrateKbps ?? 0;
-    const brB = fb?.bitrateKbps ?? 0;
-    if (brA !== brB) return brB - brA;
-    const tagA = tagCompleteness(tags[a]);
-    const tagB = tagCompleteness(tags[b]);
-    if (tagA !== tagB) return tagB - tagA;
-    return a.localeCompare(b);
-  })[0];
-}
 
 function fileFacts(f: AudioFile | undefined, t: TagData | undefined): string {
   if (!f) return "file no longer loaded";
@@ -82,6 +43,9 @@ export function DuplicatesPage({
   const [progress, setProgress] = useState<{ done: number; total: number; phase: string } | null>(null);
   const [groups, setGroups] = useState<DuplicateGroup[] | null>(null);
   const [rowStates, setRowStates] = useState<Record<string, RowState>>({});
+  // What the app would pick, shown as a ghost tint and never applied until the
+  // user clicks a button or "Apply suggestion". Duplicate groups only.
+  const [suggestions, setSuggestions] = useState<Record<string, "keep" | "remove">>({});
 
   const fileByPath = Object.fromEntries(files.map((f) => [f.path, f]));
 
@@ -163,6 +127,29 @@ export function DuplicatesPage({
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  const suggestGroup = (paths: string[]): Record<string, "keep" | "remove"> => {
+    const keeper = suggestKeeper(paths, fileByPath, tags);
+    return Object.fromEntries(paths.map((p) => [p, p === keeper ? "keep" : "remove"] as const));
+  };
+
+  /** Tooltip for a ghost-tinted button: why the app picked this. */
+  const suggestionTitle = (g: DuplicateGroup, p: string): string | undefined => {
+    const keeper = g.paths.find((q) => suggestions[q] === "keep");
+    if (!keeper) return undefined;
+    if (p === keeper) {
+      const runnerUp = suggestKeeper(g.paths.filter((q) => q !== keeper), fileByPath, tags);
+      return `Suggested: ${suggestReason(keeper, runnerUp, fileByPath, tags)}`;
+    }
+    return `Suggested: remove (kept file has ${suggestReason(keeper, p, fileByPath, tags)})`;
+  };
+
+  const applySuggestions = (toApply: DuplicateGroup[]) =>
+    setRowStates((prev) => {
+      const next = { ...prev };
+      for (const g of toApply) for (const p of g.paths) if (suggestions[p]) next[p] = suggestions[p];
+      return next;
+    });
+
   const scan = async () => {
     if (!files.length) return notify("No files loaded — select a folder in Library first", "info");
     setScanning(true);
@@ -177,17 +164,19 @@ export function DuplicatesPage({
       });
       unloadAudio();
       setGroups(result);
-      // Pre-select: keep the suggested keeper, remove everything else in
-      // "duplicate" groups; "alternate" groups default to Skip (never
-      // auto-suggested for deletion — different edits, not duplicates).
+      // Every row starts at Skip so nothing is marked for removal until the user
+      // clicks. The ranking still runs: for "duplicate" groups the suggested
+      // keeper is Keep and the rest Remove, shown as a faint hint. "alternate"
+      // groups (different edits, not duplicates) get no suggestion at all.
       const initial: Record<string, RowState> = {};
+      const sugg: Record<string, "keep" | "remove"> = {};
       for (const g of result) {
-        const keeper = suggestKeeper(g.paths, fileByPath, tags);
-        for (const p of g.paths) {
-          initial[p] = g.kind === "alternate" ? "skip" : p === keeper ? "keep" : "remove";
-        }
+        for (const p of g.paths) initial[p] = "skip";
+        if (g.kind === "alternate") continue;
+        Object.assign(sugg, suggestGroup(g.paths));
       }
       setRowStates(initial);
+      setSuggestions(sugg);
       if (!result.length) notify("No duplicates found", "success");
     } catch (e) {
       notify(String(e), "error");
@@ -209,12 +198,24 @@ export function DuplicatesPage({
     if (playingPath && toRemove.includes(playingPath)) unloadAudio();
     const ok = await onDelete(toRemove);
     if (ok) {
-      setGroups(
-        (prev) =>
-          prev
-            ?.map((g) => ({ ...g, paths: g.paths.filter((p) => !toRemove.includes(p)) }))
-            .filter((g) => g.paths.length > 1) ?? null,
-      );
+      const remaining =
+        groups
+          ?.map((g) => ({ ...g, paths: g.paths.filter((p) => !toRemove.includes(p)) }))
+          .filter((g) => g.paths.length > 1) ?? null;
+      setGroups(remaining);
+      // The old keeper may be the file that just got deleted, so recompute the
+      // suggestion for every duplicate group that shrank, not just drop paths.
+      setSuggestions((prev) => {
+        const next = { ...prev };
+        for (const p of toRemove) delete next[p];
+        for (const g of remaining ?? []) {
+          const before = groups?.find((o) => o.id === g.id);
+          if (g.kind === "duplicate" && before && before.paths.length !== g.paths.length) {
+            Object.assign(next, suggestGroup(g.paths));
+          }
+        }
+        return next;
+      });
       setRowStates((prev) => {
         const next = { ...prev };
         for (const p of toRemove) delete next[p];
@@ -287,6 +288,12 @@ export function DuplicatesPage({
                   <span className="text-xs text-muted-foreground">
                     {g.kind === "alternate" ? "different edit — never auto-suggested for removal" : `match score ${g.score.toFixed(1)}`}
                   </span>
+                  {g.kind !== "alternate" && (
+                    <Button variant="ghost" size="sm" className="ml-auto" onClick={() => applySuggestions([g])}>
+                      <Wand2 />
+                      Apply suggestion
+                    </Button>
+                  )}
                 </div>
                 <div className="space-y-1.5">
                   {g.paths.map((p) => {
@@ -313,9 +320,16 @@ export function DuplicatesPage({
                                   state === s
                                     ? s === "remove"
                                       ? "border-destructive bg-destructive text-destructive-foreground"
-                                      : "border-primary bg-primary text-primary-foreground"
-                                    : "border-input bg-background text-muted-foreground hover:bg-accent",
+                                      : s === "keep"
+                                        ? "border-emerald-600 bg-emerald-600 text-white"
+                                        : "border-primary bg-primary text-primary-foreground"
+                                    : suggestions[p] === s
+                                      ? s === "keep"
+                                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600/70 dark:text-emerald-400/70"
+                                        : "border-destructive/40 bg-destructive/10 text-destructive/70"
+                                      : "border-input bg-background text-muted-foreground hover:bg-accent",
                                 )}
+                                title={state !== s && suggestions[p] === s ? suggestionTitle(g, p) : undefined}
                               >
                                 {s}
                               </button>
@@ -356,6 +370,12 @@ export function DuplicatesPage({
               {toRemove.length} file{toRemove.length === 1 ? "" : "s"} marked for removal
               {toRemove.length > 0 && ` (${formatBytes(removeBytes)})`}
             </span>
+            {groups.some((g) => g.kind !== "alternate") && (
+              <Button variant="ghost" size="sm" className="mr-auto ml-3" onClick={() => applySuggestions(groups)}>
+                <Wand2 />
+                Apply all suggestions
+              </Button>
+            )}
             <Button variant="destructive" onClick={runDelete} disabled={toRemove.length === 0}>
               <Trash2 />
               Remove {toRemove.length || ""} to Recycle Bin
