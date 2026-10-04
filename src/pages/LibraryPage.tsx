@@ -42,6 +42,8 @@ import { ClearFieldsMenu } from "../components/ClearFieldsMenu";
 import { CapitalizationMenu } from "../components/CapitalizationMenu";
 import { LibrarySidebar, matchesSidebarFilter, type SidebarFilter } from "../components/LibrarySidebar";
 import { Button } from "../components/ui";
+import { decideGenreClick, type SessionSource } from "../lib/sessionTabs";
+import type { GenreCount } from "../types";
 
 /** Whether the open working batch is somewhere other than inside the
  * permanent Library folder — the status line in A6 only needs to show up
@@ -59,6 +61,7 @@ interface FilesApi {
   selected: Set<string>;
   selectedPaths: string[];
   scanning: boolean;
+  source: SessionSource;
   selectFolder: () => void;
   addFiles: () => void;
   toggle: (path: string) => void;
@@ -70,6 +73,10 @@ interface FilesApi {
 interface Props {
   filesApi: FilesApi;
   libraryTags: Record<string, TagData>;
+  /** Every genre in the library index (empty until one exists). */
+  libraryGenres: GenreCount[];
+  /** Swaps the batch for a library genre; the caller guards unapplied previews. */
+  onLoadGenre: (genre: string) => void;
   covers: Record<string, string | null>;
   unresolved: Set<string>;
   settings: Settings;
@@ -139,6 +146,8 @@ interface Props {
 export function LibraryPage({
   filesApi,
   libraryTags,
+  libraryGenres,
+  onLoadGenre,
   covers,
   unresolved,
   settings,
@@ -207,6 +216,17 @@ export function LibraryPage({
     () => filesApi.files.filter((f) => matchesSidebarFilter(f, libraryTags, sidebarFilter)),
     [filesApi.files, libraryTags, sidebarFilter],
   );
+  // A genre click normally loads that genre. A hand-built batch is never
+  // thrown away by one: until the session dialog exists it filters instead.
+  const onGenreClick = (genre: string) => {
+    const action = decideGenreClick({ source: filesApi.source, hasUnappliedPreview: false });
+    if (action === "manual") {
+      setSidebarFilter((f) => (f?.mode === "genre" && f.value === genre ? null : { mode: "genre", value: genre }));
+    } else {
+      setSidebarFilter(null);
+      onLoadGenre(genre);
+    }
+  };
   const trackGroups = useMemo(
     () => buildTrackGroups(filesApi.files, libraryTags, settings.trackIdDigits),
     [filesApi.files, libraryTags, settings.trackIdDigits],
@@ -597,6 +617,9 @@ export function LibraryPage({
           width={settings.sidebarWidth}
           collapsed={settings.sidebarCollapsed}
           filter={sidebarFilter}
+          libraryGenres={libraryGenres}
+          activeGenre={filesApi.source.kind === "genre" ? filesApi.source.genre : null}
+          onGenreClick={onGenreClick}
           onFilterChange={setSidebarFilter}
           onWidthChange={(w) => onSaveSettings({ ...settings, sidebarWidth: w })}
           onCollapsedChange={(c) => onSaveSettings({ ...settings, sidebarCollapsed: c })}

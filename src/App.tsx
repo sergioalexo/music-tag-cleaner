@@ -23,6 +23,8 @@ import { useSettings } from "./hooks/useSettings";
 import { useLibraryIndex, mergeWithSession } from "./hooks/useLibraryIndex";
 import { useTags } from "./hooks/useTags";
 import { LibraryPage } from "./pages/LibraryPage";
+import { useGenreLoad } from "./hooks/useGenreLoad";
+import { decideGenreClick } from "./lib/sessionTabs";
 import {
   applyCapitalization,
   applyReplacements,
@@ -304,6 +306,32 @@ export default function App() {
     },
   });
   const pushHistory = history.push;
+
+  const genreLoad = useGenreLoad({
+    libraryIndex,
+    filesApi,
+    tagsApi,
+    libraryTags,
+    setLibraryTags,
+    notify,
+  });
+
+  /** Library-sidebar genre click: swaps the batch, asking first only when an unapplied preview would be lost. */
+  const loadLibraryGenre = async (genre: string) => {
+    const action = decideGenreClick({
+      source: filesApi.source,
+      hasUnappliedPreview: !!pending && previewMode !== "history",
+    });
+    if (action === "confirm-load") {
+      const ok = await confirm(
+        "You have a preview that hasn't been applied. Opening this genre discards it.",
+        { title: "Open genre", kind: "warning" },
+      );
+      if (!ok) return;
+    }
+    setPending(null);
+    await genreLoad.loadGenre(genre);
+  };
 
   /** Read-only diff of every change applied so far this session, reusing the preview table. */
   const showHistoryCompare = () => {
@@ -1910,6 +1938,8 @@ This rewrites the genre tag on ${
             <LibraryPage
               filesApi={filesApi}
               libraryTags={libraryTags}
+              libraryGenres={libraryIndex.genres}
+              onLoadGenre={(genre) => void loadLibraryGenre(genre)}
               covers={covers}
               unresolved={unresolved}
               settings={settings}

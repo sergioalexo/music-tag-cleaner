@@ -10,7 +10,7 @@ import {
   User,
   X,
 } from "lucide-react";
-import type { AudioFile, TagData, TrackGroup } from "../types";
+import type { AudioFile, GenreCount, TagData, TrackGroup } from "../types";
 import { cn } from "./ui";
 
 export type SidebarMode = "folders" | "genres" | "artists" | "tracks";
@@ -134,6 +134,10 @@ function subtreeMatches(node: FolderNode, q: string): boolean {
  * table down to an exact match — a plain in-memory filter over what's
  * already loaded, never a disk rescan. A search box narrows the tree/list
  * itself, separate from the table's own row search.
+ *
+ * Genres is the exception: it lists every genre in the indexed library (not
+ * just the loaded files') and a click *loads* that genre as the batch via
+ * `onGenreClick`. Without an index it falls back to filtering the loaded files.
  */
 export function LibrarySidebar({
   files,
@@ -142,6 +146,9 @@ export function LibrarySidebar({
   width,
   collapsed,
   filter,
+  libraryGenres,
+  activeGenre,
+  onGenreClick,
   onFilterChange,
   onWidthChange,
   onCollapsedChange,
@@ -152,6 +159,11 @@ export function LibrarySidebar({
   width: number;
   collapsed: boolean;
   filter: SidebarFilter | null;
+  /** Every genre in the library index, with counts. Empty = no index yet. */
+  libraryGenres: GenreCount[];
+  /** The genre the current batch was loaded from, if it was loaded from one. */
+  activeGenre: string | null;
+  onGenreClick: (genre: string) => void;
   onFilterChange: (filter: SidebarFilter | null) => void;
   onWidthChange: (width: number) => void;
   onCollapsedChange: (collapsed: boolean) => void;
@@ -160,9 +172,12 @@ export function LibrarySidebar({
   const [query, setQuery] = useState("");
 
   const folderTree = useMemo(() => buildFolderTree(files), [files]);
+  // The index's list wins; tallying the loaded files only covers the case
+  // where there is no index to ask.
+  const useLibraryGenres = libraryGenres.length > 0;
   const genreCounts = useMemo(
-    () => tally(files.map((f) => tags[f.path]?.genre)),
-    [files, tags],
+    () => (useLibraryGenres ? libraryGenres : tally(files.map((f) => tags[f.path]?.genre))),
+    [useLibraryGenres, libraryGenres, files, tags],
   );
   const artistCounts = useMemo(
     () => tally(files.map((f) => tags[f.path]?.artist)),
@@ -311,6 +326,11 @@ export function LibrarySidebar({
                 />
               ))
           ))}
+        {mode === "genres" && !useLibraryGenres && (
+          <p className="px-1.5 py-1 text-[11px] text-muted-foreground">
+            Add a library folder in Settings to browse every genre.
+          </p>
+        )}
         {mode === "genres" &&
           (filteredGenres.length === 0 ? (
             <p className="px-1.5 py-2 text-xs text-muted-foreground">No genres found.</p>
@@ -318,10 +338,12 @@ export function LibrarySidebar({
             filteredGenres.map((g) => (
               <button
                 key={g.name}
-                onClick={() => select("genre", g.name)}
+                onClick={() => (useLibraryGenres ? onGenreClick(g.name) : select("genre", g.name))}
                 className={cn(
                   "flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-sm hover:bg-accent",
-                  filter?.mode === "genre" && filter.value === g.name && "bg-accent font-medium",
+                  (useLibraryGenres
+                    ? activeGenre === g.name || (filter?.mode === "genre" && filter.value === g.name)
+                    : filter?.mode === "genre" && filter.value === g.name) && "bg-accent font-medium",
                 )}
               >
                 <span className="min-w-0 flex-1 truncate">{g.name}</span>

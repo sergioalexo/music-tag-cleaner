@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AUDIO_EXTENSIONS, type AudioFile } from "../types";
+import { afterManualAdd, EMPTY_SOURCE, type SessionSource } from "../lib/sessionTabs";
 
 export interface NotifyOpts {
   /** Structured data to keep alongside the log line — shown expanded in the
@@ -24,6 +25,9 @@ export function useFiles(
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
+  // How the batch was built — decides whether a library-genre click may swap
+  // it silently (empty / genre) or has to respect work done by hand (manual).
+  const [source, setSource] = useState<SessionSource>(EMPTY_SOURCE);
   // Async callers (refresh/refreshPaths) run long after the render that created
   // them, so read the live list here instead of a captured `files` snapshot.
   const filesRef = useRef(files);
@@ -53,6 +57,7 @@ export function useFiles(
       setScanning(true);
       const found = await invoke<AudioFile[]>("scan_folder", { path: dir, recursive });
       merge(found);
+      if (found.length) setSource(afterManualAdd);
       onFolderPicked(dir);
       notify(
         found.length
@@ -78,6 +83,7 @@ export function useFiles(
       const paths = Array.isArray(picked) ? picked : [picked];
       const found = await invoke<AudioFile[]>("list_files", { paths });
       merge(found);
+      if (found.length) setSource(afterManualAdd);
       notify(`Added ${found.length} file${found.length === 1 ? "" : "s"}`, "success");
     } catch (e) {
       notify(String(e), "error");
@@ -106,6 +112,7 @@ export function useFiles(
       setScanning(true);
       const found = await invoke<AudioFile[]>("import_paths", { paths, recursive });
       merge(found);
+      if (found.length) setSource(afterManualAdd);
       notify(
         found.length
           ? `Added ${found.length} file${found.length === 1 ? "" : "s"}`
@@ -146,6 +153,18 @@ export function useFiles(
   const clearList = () => {
     setFiles([]);
     setSelected(new Set());
+    setSource(EMPTY_SOURCE);
+  };
+
+  /**
+   * Swaps the whole batch for `next` (a library-genre load). Nothing is
+   * ticked afterwards, unlike `merge`: a batch action must not be able to hit
+   * a whole genre by accident — tick or highlight what you mean.
+   */
+  const replaceWith = (next: AudioFile[], nextSource: SessionSource) => {
+    setFiles(next);
+    setSelected(new Set());
+    setSource(nextSource);
   };
 
   /** Re-reads file info (size, hasBackup, duration) for every loaded file. */
@@ -213,6 +232,7 @@ export function useFiles(
     selectedPaths,
     totalSize,
     scanning,
+    source,
     merge,
     selectFolder,
     addFiles,
@@ -221,6 +241,7 @@ export function useFiles(
     setAll,
     setManySelected,
     clearList,
+    replaceWith,
     refresh,
     refreshPaths,
     remap,
