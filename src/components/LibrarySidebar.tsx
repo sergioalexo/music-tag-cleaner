@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
 import {
+  ArrowDownAZ,
+  ArrowDownWideNarrow,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -29,6 +31,7 @@ interface FolderNode {
 }
 
 const SEP = /[/\\]/;
+const GENRE_SORT_KEY = "librarySidebar.genreSort";
 
 function buildFolderTree(files: AudioFile[]): FolderNode {
   const root: FolderNode = { name: "", fullPath: "", count: 0, children: new Map() };
@@ -170,15 +173,38 @@ export function LibrarySidebar({
 }) {
   const [mode, setMode] = useState<SidebarMode>("folders");
   const [query, setQuery] = useState("");
+  // A UI preference, not a setting: kept in localStorage so it survives a
+  // restart without a settings-version bump. Storage can throw (or be empty)
+  // in odd webview states, so every access is guarded.
+  const [genreSort, setGenreSort] = useState<"count" | "name">(() => {
+    try {
+      return localStorage.getItem(GENRE_SORT_KEY) === "name" ? "name" : "count";
+    } catch {
+      return "count";
+    }
+  });
+  const toggleGenreSort = () => {
+    const next = genreSort === "count" ? "name" : "count";
+    setGenreSort(next);
+    try {
+      localStorage.setItem(GENRE_SORT_KEY, next);
+    } catch {
+      /* not persisted — fine */
+    }
+  };
 
   const folderTree = useMemo(() => buildFolderTree(files), [files]);
   // The index's list wins; tallying the loaded files only covers the case
   // where there is no index to ask.
   const useLibraryGenres = libraryGenres.length > 0;
-  const genreCounts = useMemo(
-    () => (useLibraryGenres ? libraryGenres : tally(files.map((f) => tags[f.path]?.genre))),
-    [useLibraryGenres, libraryGenres, files, tags],
-  );
+  const genreCounts = useMemo(() => {
+    const list = useLibraryGenres ? libraryGenres : tally(files.map((f) => tags[f.path]?.genre));
+    return [...list].sort((a, b) =>
+      genreSort === "name"
+        ? a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true })
+        : b.count - a.count || a.name.localeCompare(b.name),
+    );
+  }, [useLibraryGenres, libraryGenres, files, tags, genreSort]);
   const artistCounts = useMemo(
     () => tally(files.map((f) => tags[f.path]?.artist)),
     [files, tags],
@@ -283,6 +309,19 @@ export function LibrarySidebar({
         {query && (
           <button onClick={() => setQuery("")} className="shrink-0 text-muted-foreground hover:text-foreground">
             <X className="h-3 w-3" />
+          </button>
+        )}
+        {mode === "genres" && (
+          <button
+            onClick={toggleGenreSort}
+            className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+            title={genreSort === "name" ? "Sorted A–Z (click to sort by track count)" : "Sorted by track count (click to sort A–Z)"}
+          >
+            {genreSort === "name" ? (
+              <ArrowDownAZ className="h-3.5 w-3.5" />
+            ) : (
+              <ArrowDownWideNarrow className="h-3.5 w-3.5" />
+            )}
           </button>
         )}
       </div>
