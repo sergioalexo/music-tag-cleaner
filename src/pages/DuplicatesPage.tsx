@@ -1,12 +1,13 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { Notify } from "../hooks/useFiles";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Copy, Loader2, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, Loader2, Play, Square, Trash2 } from "lucide-react";
 import type { AudioFile, DuplicateGroup, TagData } from "../types";
 import { formatBytes } from "../types";
 import { Button, Card, cn } from "../components/ui";
 import { Waveform } from "../components/Waveform";
+import { formatDuration, releasePlayback, takeOverPlayback } from "../components/AudioPreview";
 
 type RowState = "keep" | "remove" | "skip";
 
@@ -84,6 +85,84 @@ export function DuplicatesPage({
 
   const fileByPath = Object.fromEntries(files.map((f) => [f.path, f]));
 
+  // One shared <audio> for the whole page: groups can hold hundreds of rows, so
+  // an element per row (what <AudioPreview> does) is off the table.
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playingPath, setPlayingPath] = useState<string | null>(null);
+  const [lastPath, setLastPath] = useState<string | null>(null);
+  const [time, setTime] = useState(0);
+  const [dur, setDur] = useState(0);
+
+  // Stable identity on purpose: takeOverPlayback() compares stop functions by
+  // reference to decide whether the "active" player is someone else.
+  const stopPlayback = useCallback(() => {
+    const el = audioRef.current;
+    if (el) {
+      el.pause();
+      el.currentTime = 0;
+    }
+    setPlayingPath(null);
+    setTime(0);
+  }, []);
+
+  /** Release the webview's handle on the file (a playing/loaded file can't be
+   * recycled cleanly on Windows). Same reason App.tsx does it for Genre Mode. */
+  const unloadAudio = useCallback(() => {
+    stopPlayback();
+    const el = audioRef.current;
+    if (el) {
+      el.removeAttribute("src");
+      el.load();
+    }
+  }, [stopPlayback]);
+
+  useEffect(() => {
+    const el = audioRef.current;
+    return () => {
+      if (el) {
+        el.pause();
+        el.removeAttribute("src");
+      }
+      releasePlayback(stopPlayback);
+    };
+  }, [stopPlayback]);
+
+  const playAt = (path: string, fraction?: number) => {
+    const el = audioRef.current;
+    if (!el) return;
+    const url = convertFileSrc(path);
+    if (el.src !== url) {
+      el.src = url;
+      setTime(0);
+      setDur(fileByPath[path]?.durationSecs ?? 0);
+    }
+    // Prefer the already-known duration so the seek needs no metadata wait;
+    // a currentTime set before metadata loads is queued by the webview.
+    const d = fileByPath[path]?.durationSecs || (Number.isFinite(el.duration) ? el.duration : 0);
+    if (fraction != null && d) {
+      el.currentTime = fraction * d;
+      setTime(fraction * d);
+    }
+    takeOverPlayback(stopPlayback);
+    el.play().catch(() => {});
+    setPlayingPath(path);
+    setLastPath(path);
+  };
+
+  // Space toggles the row that last played (not while typing / on a button).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || !lastPath) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.closest("input, textarea, select, button, [contenteditable]") || t.isContentEditable)) return;
+      e.preventDefault();
+      if (playingPath) stopPlayback();
+      else playAt(lastPath);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   const scan = async () => {
     if (!files.length) return notify("No files loaded — select a folder in Library first", "info");
     setScanning(true);
@@ -96,6 +175,7 @@ export function DuplicatesPage({
       const result = await invoke<DuplicateGroup[]>("scan_duplicates", {
         paths: files.map((f) => f.path),
       });
+      unloadAudio();
       setGroups(result);
       // Pre-select: keep the suggested keeper, remove everything else in
       // "duplicate" groups; "alternate" groups default to Skip (never
@@ -118,12 +198,15 @@ export function DuplicatesPage({
     }
   };
 
+  const playDur = dur || (playingPath ? fileByPath[playingPath]?.durationSecs ?? 0 : 0);
+
   const toRemove = Object.entries(rowStates)
     .filter(([, s]) => s === "remove")
     .map(([p]) => p);
   const removeBytes = toRemove.reduce((sum, p) => sum + (fileByPath[p]?.size ?? 0), 0);
 
   const runDelete = async () => {
+    if (playingPath && toRemove.includes(playingPath)) unloadAudio();
     const ok = await onDelete(toRemove);
     if (ok) {
       setGroups(
@@ -142,6 +225,13 @@ export function DuplicatesPage({
 
   return (
     <div className="flex h-full flex-col gap-4 p-6">
+      <audio
+        ref={audioRef}
+        preload="none"
+        onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
+        onEnded={stopPlayback}
+      />
       <div className="flex items-end justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-xl font-bold">Duplicates</h1>
@@ -232,7 +322,27 @@ export function DuplicatesPage({
                             ))}
                           </div>
                         </div>
-                        <Waveform path={p} height={22} className="mt-1" />
+                        <div className="mt-1 flex items-center gap-2">
+                          <button
+                            onClick={() => (playingPath === p ? stopPlayback() : playAt(p, undefined))}
+                            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-input bg-background text-muted-foreground hover:bg-accent"
+                            title={playingPath === p ? "Stop" : "Play"}
+                          >
+                            {playingPath === p ? <Square className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                          </button>
+                          <Waveform
+                            path={p}
+                            height={32}
+                            className="min-w-0 flex-1"
+                            onSeek={(fr) => playAt(p, fr)}
+                            progress={playingPath === p && playDur ? time / playDur : undefined}
+                          />
+                          {playingPath === p && (
+                            <span className="w-20 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+                              {formatDuration(time)} / {formatDuration(playDur)}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
