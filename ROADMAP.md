@@ -2293,6 +2293,49 @@ FLAC beats MP3, bitrate, tag-completeness tie-break, reason strings),
 seeking, A/B switching, ghost tints, Apply suggestion, delete while playing.
 Shipped in v0.16.0.
 
+### 62. Library sidebar: browse every genre, load it as the batch, session tabs
+
+**Status: unreleased feature on the `genre-sessions` branch** (three commits,
+not merged, not tagged, no version bump). Per the project notes the next
+release should also cover the backlog batch already on `master`; the five
+"(backlog item)" fixes since v0.13.2 are already folded into an earlier
+numbered entry above, so only check that nothing newer was left out when the
+release entry is written.
+
+**What/why.** The sidebar's Genres list only tallied the files already loaded,
+so you had to load a folder before you could see which genres exist, and a
+click only filtered what was there. Now Genres lists every genre in the library
+index, and a click loads that genre's tracks as the batch, so you can flick
+through genres. A batch you built by hand (folder, files, drop, "Open with",
+YouTube "Add to batch") is never thrown away by a click.
+
+**How.** UI-only; no Rust changes (`library_genres` and
+`library_paths_with_genre` already existed).
+- `useFiles` records a `source` (`empty` | `genre` | `manual`); adding files
+  by hand always makes it `manual`. `replaceWith()` swaps the batch and ticks
+  nothing.
+- `useGenreLoad`: paints the rows at once from the index, then re-reads real
+  tags in chunks. A generation counter drops anything from a superseded click,
+  so fast toggling can't mix rows. Rows the index lists but the disk no longer
+  has are dropped (only after `path_exists` confirms) with one toast.
+- Session tabs are snapshot-and-swap (`useSessionTabs`): only the active tab
+  is live in `useFiles`/`useHistory`; the others park files, selection,
+  source and undo stacks. The tag cache stays global (it is keyed by path).
+  Closing a tab with undo steps asks first; switching is locked while a long
+  action runs. Tabs are not persisted across restarts.
+- A genre click in a manual session opens `GenreSessionDialog` (new tab /
+  replace / filter, "Remember my choice"). The remembered answer is
+  `settings.genreClickInManualSession` (settings v14), changeable in Settings
+  → Library. An unapplied preview is confirmed before any swap discards it.
+- Pure rules live in `src/lib/sessionTabs.ts` (+ Vitest): the click decision
+  tree, tab titles, the manual-add flip, tab closing.
+
+**Verification.** `tsc --noEmit`, `npm test`, `npm run build` and
+`cargo test` pass. **Not click-tested** (needs `npm run tauri dev`): the
+instant paint and background refresh, fast genre toggling, the dialog and each
+of its options, per-tab undo history, dropping files onto a genre tab, the
+missing-files toast, and the Settings control.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —

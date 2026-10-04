@@ -471,6 +471,29 @@ function LibraryIndexCard({
         )}
 
         <div className="mt-3 border-t pt-3">
+          <Row
+            label="Genre click in a hand-built batch"
+            hint="What clicking a genre in the Library sidebar does when you loaded the files yourself (folder, files, drop). Empty and genre sessions always just open the genre."
+          >
+            <select
+              className={cn(selectClass, "w-44")}
+              value={settings.genreClickInManualSession}
+              onChange={(e) =>
+                onSave({
+                  ...settings,
+                  genreClickInManualSession: e.target.value as Settings["genreClickInManualSession"],
+                })
+              }
+            >
+              <option value="ask">Ask each time</option>
+              <option value="newTab">Open in a new tab</option>
+              <option value="replace">Replace the session</option>
+              <option value="filter">Filter this batch</option>
+            </select>
+          </Row>
+        </div>
+
+        <div className="mt-3 border-t pt-3">
           <div className="mb-1 text-sm font-medium">Rekordbox BPM/Key</div>
           <p className="mb-2 text-xs text-muted-foreground">
             Rekordbox's own BPM/key analysis, read from a collection export — in Rekordbox:

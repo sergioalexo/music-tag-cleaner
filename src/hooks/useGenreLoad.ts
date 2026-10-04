@@ -1,4 +1,5 @@
 import { useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { TagData } from "../types";
 import type { Notify, useFiles } from "./useFiles";
 import type { LibraryIndexApi } from "./useLibraryIndex";
@@ -63,16 +64,31 @@ export function useGenreLoad({
     setLibraryTags((prev) => ({ ...seed, ...prev }));
 
     // Background refresh of the seeded rows, chunked like the table's own reader.
+    let gone = 0;
     for (let i = 0; i < toRead.length; i += TAG_READ_CHUNK) {
       const chunk = toRead.slice(i, i + TAG_READ_CHUNK);
       try {
         const { map } = await tagsApi.read(chunk);
         if (gen !== generation.current) return;
         setLibraryTags((prev) => ({ ...prev, ...map }));
+        // The index can outlive a file that was moved or deleted outside the
+        // app. An unreadable row is only dropped once it's confirmed missing —
+        // a corrupt file that still exists stays visible rather than vanishing.
+        const unread = chunk.filter((p) => !map[p]);
+        const missing: string[] = [];
+        for (const p of unread) if (!(await invoke<boolean>("path_exists", { path: p }))) missing.push(p);
+        if (gen !== generation.current) return;
+        if (missing.length) {
+          filesApi.removeFiles(missing);
+          gone += missing.length;
+        }
       } catch (e) {
         console.error("Failed to read tags for genre:", e);
         return;
       }
+    }
+    if (gone) {
+      notify(`${gone} file${gone === 1 ? "" : "s"} no longer exist${gone === 1 ? "s" : ""}; re-index to tidy up`, "info");
     }
   };
 
