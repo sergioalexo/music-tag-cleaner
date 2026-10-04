@@ -2293,14 +2293,11 @@ FLAC beats MP3, bitrate, tag-completeness tie-break, reason strings),
 seeking, A/B switching, ghost tints, Apply suggestion, delete while playing.
 Shipped in v0.16.0.
 
-### 62. Library sidebar: browse every genre, load it as the batch, session tabs
+### 62. Library sidebar: browse every genre, load it as the batch, session tabs — v0.17.0
 
-**Status: unreleased feature on the `genre-sessions` branch** (three commits,
-not merged, not tagged, no version bump). Per the project notes the next
-release should also cover the backlog batch already on `master`; the five
-"(backlog item)" fixes since v0.13.2 are already folded into an earlier
-numbered entry above, so only check that nothing newer was left out when the
-release entry is written.
+**Released as v0.17.0** (merged from the `genre-sessions` branch). The five
+"(backlog item)" fixes since v0.13.2 were already covered by an earlier
+release entry; nothing else on `master` was waiting on this release.
 
 **What/why.** The sidebar's Genres list only tallied the files already loaded,
 so you had to load a folder before you could see which genres exist, and a
@@ -2329,9 +2326,13 @@ YouTube "Add to batch") is never thrown away by a click.
   → Library. An unapplied preview is confirmed before any swap discards it.
 - Pure rules live in `src/lib/sessionTabs.ts` (+ Vitest): the click decision
   tree, tab titles, the manual-add flip, tab closing.
+- The Genres list can be sorted by track count (default) or A–Z, via a toggle
+  next to the genre search box. It's a UI preference kept in localStorage
+  (`librarySidebar.genreSort`), not a setting.
 
 **Verification.** `tsc --noEmit`, `npm test`, `npm run build` and
-`cargo test` pass. **Not click-tested** (needs `npm run tauri dev`): the
+`cargo test` pass. The owner tried it in `npm run tauri dev` before release
+(genre list and loading looked right). Not systematically click-tested (needs `npm run tauri dev`): the
 instant paint and background refresh, fast genre toggling, the dialog and each
 of its options, per-tab undo history, dropping files onto a genre tab, the
 missing-files toast, and the Settings control.
