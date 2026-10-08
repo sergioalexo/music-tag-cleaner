@@ -1,0 +1,48 @@
+name: ci
+
+# Type-check, unit tests and a production frontend build on every push and
+# pull request, so a broken master is caught before a release tag is pushed
+# (release.yml only runs on tags and takes ~14 minutes to fail).
+#
+# Windows only: it is the owner's platform, and several Rust tests exercise
+# Windows-specific paths (Explorer integration, the FAT32 formatter).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check and build the frontend
+        run: npm run build
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked

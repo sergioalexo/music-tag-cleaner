@@ -1,4 +1,4 @@
-import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
+import type { ComponentPropsWithRef, ReactNode } from "react";
 
 export function cn(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -20,15 +20,15 @@ const BUTTON_SIZES = {
   icon: "h-9 w-9",
 } as const;
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+/** `ref` is an ordinary prop in React 19 — no `forwardRef` wrapper needed. */
+export interface ButtonProps extends ComponentPropsWithRef<"button"> {
   variant?: keyof typeof BUTTON_VARIANTS;
   size?: keyof typeof BUTTON_SIZES;
 }
 
-export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant = "default", size = "default", ...props }, ref) => (
+export function Button({ className, variant = "default", size = "default", ...props }: ButtonProps) {
+  return (
     <button
-      ref={ref}
       className={cn(
         "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0",
         BUTTON_VARIANTS[variant],
@@ -37,9 +37,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       )}
       {...props}
     />
-  ),
-);
-Button.displayName = "Button";
+  );
+}
 
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
   return (

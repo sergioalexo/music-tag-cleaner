@@ -15,8 +15,8 @@ name = "music_tag_cleaner_shell"
 crate-type = ["cdylib"]
 
 [dependencies]
-windows-core = "0.61"
-windows = { version = "0.61", features = [
+windows-core = "0.62"
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_System_Com",
   "Win32_System_LibraryLoader",
