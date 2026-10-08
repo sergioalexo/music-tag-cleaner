@@ -2337,6 +2337,94 @@ instant paint and background refresh, fast genre toggling, the dialog and each
 of its options, per-tab undo history, dropping files onto a genre tab, the
 missing-files toast, and the Settings control.
 
+### 63. Code review: DJ-data preservation, ratings, parallel scans, dependency refresh — v0.18.0
+
+**Released as v0.18.0** (merged from the `code-review-fixes` branch). A
+whole-codebase review: bugs fixed, slow paths made parallel, every
+dependency brought up to date.
+
+**What/why — data-loss bugs (the important ones).**
+- **Every tag write wiped Serato/Traktor data and ratings.** lofty keeps the
+  ID3v2 frames it has no generic key for (GEOB, PRIV, POPM, RVA2, UFID, …) as
+  a hidden "companion" of the parsed tag. `write_tags_blocking` built each
+  write on a fresh `Tag::new`, so fixing one typo in a title deleted Serato's
+  hot cues/beatgrid/overview (GEOB), Traktor's PRIV block and the POPM rating.
+  Proven with a probe test before the fix (`TIT2 GEOB PRIV POPM` → `TIT2`).
+  The writer is now a diff on the file's own tag: unchanged fields are left
+  exactly as stored (multi-value artists, comment descriptions, date format),
+  changed ones are rewritten, unshown frames survive. Same fix in Restore
+  Backup and Standardize Containers.
+- **Custom TXXX / Vorbis fields were dropped on every edit** (checked
+  `Tag::push` drops `ItemKey::Unknown`) — including Serato's FLAC data
+  (`SERATO_MARKERS_V2`), and Restore Backup lost the Track ID.
+- **MP3 ratings were never read** (POPM lives in the companion), FLAC/OGG
+  4★ read back as 2★ (0–100 written, 0–255 read), and setting a rating on
+  M4A wrote nothing and wiped the old one. POPM is now read/written through
+  `Id3v2Tag`, keeping each frame's email and play count; bytes map to stars by
+  bands that fit both Rekordbox (51/102/…) and WMP (1/64/128/…) scales.
+- Clearing/editing the searchable-backup field was silently reverted; an
+  existing backup snapshot was deleted by any write with backups off;
+  undoing a raw "All Tags" clear did nothing (the field can now be recreated
+  by name, `item_key_from_name`); Convert stripped BPM/key/label from its output.
+- The displayed Comment is the plain one, not iTunes' `iTunNORM` hex.
+
+**Other bugs.** One panicking file dropped a whole thread's chunk of batch
+results (`par_map` now isolates panics per item); Rekordbox `percent_decode`
+panicked on `%` before a multi-byte char, and `location_to_path` broke every
+macOS import; BPM/key never joined for paths with non-ASCII capitals (SQLite
+`LOWER()` is ASCII-only — settings v15 forces one re-import); the index's
+offline-root guard used a string prefix (`C:\Music` swallowed `C:\Music2`);
+no SQLite busy timeout; enrichment cancel was undone by the next run (now a
+generation counter); yt-dlp had no socket timeout; a dropped download left a
+truncated `yt-dlp.exe`/ffmpeg as "installed" (shared `download.rs`, `.part` +
+rename); Claude CLI playlist prompts over ~32K chars failed on Windows (now
+piped through stdin above 8K); rename now refuses separators/device names;
+settings writes from stale render snapshots reverted concurrent changes
+(functional `update`/patch saves everywhere); `useFiles.refresh` dropped files
+added mid-refresh; undo/redo didn't reindex the Library; table sort with blank
+years was undefined (NaN comparator); `._` AppleDouble files listed as tracks;
+`.opus` (a Convert output) wasn't a recognised extension; first-launch Library
+prompt suggested a hard-coded `C:\Users\sopas\...` path; Rekordbox playlist
+XML broke on control characters in tags and doubled the slash in macOS
+`Location`s; history recorded changes whose write had failed, and left raw
+Clear Fields un-undoable (both fixed — raw clears now undo); renames, deletes
+and convert-and-delete never told the Library index, leaving ghost tracks
+(`reindex_paths` now drops rows for vanished files); the Library-root check
+assumed `\` separators; Ollama pulls garbled UTF-8 split across chunks and
+could hang forever on a stalled stream; one failed AI Clean batch discarded
+every finished batch, and an answer could overwrite another batch's track with
+an out-of-range index (`resultsForBatch`); the Stems dialog showed no progress
+during a separation (tqdm redraws with `\r`, the reader only split on `\n`).
+
+**Performance.** Duplicate fingerprinting and the O(n²) comparison run in
+parallel (were single-core); decode streams straight into the fingerprinter
+(bit-identical — tested, cue keys stay valid) and waveforms are computed while
+decoding (no 100 MB PCM buffers); Rekordbox cue import batches fingerprints
+and writes one transaction; `par_map` hands out work dynamically; Artwork
+column reads image headers only; thumbnails use a fast downscale; the track
+table re-renders per row scrolled, not per scroll event; sidebar resize saves
+on release (was a settings write per mousemove); `Intl.Collator` for sorts.
+
+**Dependencies.** React 19.3, Vite 8 (Rolldown — chunking moved to
+`codeSplitting.groups`), Vitest 5, TypeScript 7, Tauri 2.12 + plugins,
+lucide, Tailwind 4.3.3; Rust: reqwest 0.13 (rustls/ring shared with the
+updater — one HTTP stack instead of two, no aws-lc C build), base64 0.23,
+windows 0.62 (app + shell-ext, one copy with Tauri), lofty **0.22** (see
+backlog for why not 0.25). CI: Node 22 (20 is EOL), actions v5, Rust + npm
+caching in `release.yml`, new `ci.yml` (build + tests on every push).
+
+**Verification.** `npm run build`, `npm test` (160), `cargo test` (130) pass;
+`cargo check` is warning-free. The new writer was also run over **all 4,735
+real mp3s in the owner's Music folder** (temp copies only — the ignored test
+`real_library_write_preserves_every_frame`, `MTC_TEST_DIR=...`): every frame
+preserved, artist/comment/rating unchanged. It surfaced one real regression,
+fixed before shipping: a recorder file's COMM frame with language `[0,0,0]`,
+which lofty refuses to write once unchanged frames are kept verbatim —
+`repair_item_languages` resets invalid languages to `XXX`. None of those files
+carried GEOB/PRIV/POPM frames, so those paths are covered by synthetic tests.
+New regression tests cover each data bug on real MP3/FLAC files. Not
+click-tested in `npm run tauri dev` yet.
+
 ## Roadmap — v1.0
 
 v0.6 through v0.9 are complete (items 1–37). Everything below is v1.0 —
@@ -2501,6 +2589,13 @@ must never lock someone out of editing their own files.
 
 ## Backlog (unscheduled)
 
+- **lofty 0.24+ migration.** 0.24 removed `ItemKey::Unknown`, so the
+  generic `Tag` can no longer carry custom keys — the private TXXX:TRACKID,
+  the TAGBACKUP snapshot and every `Unknown(...)` raw field. Upgrading means
+  porting the tag layer to each format's own API (`Id3v2Tag` TXXX,
+  `VorbisComments`, MP4 freeform atoms, APE), keeping the `key_name` strings
+  stored in settings (`raw:` clear-field picks, column widths) stable. Pinned
+  to 0.22 in `Cargo.toml` until then (2026-10-07).
 - ~~Optional one-click "move Track Number ids into Track ID" for pre-v4
   libraries~~ — done 2026-09-26: `buildTrackIdMigrationPreview()`
   (`standardize.ts`) scans every loaded file for a Track Number that

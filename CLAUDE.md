@@ -54,8 +54,19 @@ verified) — that's the project's convention.
 - Claude CLI: the copy bundled with the Claude desktop app is usually **not
   signed in** for standalone use; errors come back as `is_error: true` in the
   JSON body, not via exit code. The native installer (`irm .../install.ps1`)
-  puts `claude.exe` under `%USERPROFILE%\.local\bin`, which is not on `PATH`
-  by default and is not one of the locations `find_claude()` checks yet.
+  puts `claude.exe` under `%USERPROFILE%\.local\bin` (not on `PATH` by
+  default; `find_claude()` checks it). Prompts over ~8K chars go via stdin —
+  Windows caps a command line at 32,767 chars.
+- **Tag writes must start from the file's own parsed tag, never `Tag::new`.**
+  lofty keeps frames it can't map (GEOB = Serato cues/beatgrid, PRIV =
+  Traktor, POPM ratings, RVA2, UFID) as a hidden companion of the parsed
+  `Tag`; a fresh tag silently deletes them. `write_tags_blocking` is a diff:
+  only changed curated fields are rewritten. Custom keys need
+  `insert_unchecked`/`push_unchecked` — the checked variants drop
+  `ItemKey::Unknown`. ID3v2 POPM is only reachable via `Id3v2Tag::from(tag)`.
+- lofty is pinned to 0.22: 0.24 removed `ItemKey::Unknown` (see ROADMAP backlog).
+- `files::par_map(items, f, on_panic)` isolates a panicking file to one
+  result; batch commands must return exactly one result per input path.
 - Demucs runs as `python -m demucs` in the user's own Python; never pass `-j` on CUDA.
 - Large collections (4000+ files) are normal. Anything that renders one element
   per library track, or runs per-keystroke work over the whole library, must be
