@@ -16,7 +16,10 @@ use crate::models::{
     TagReadResult, WriteProgress, WriteRawFieldItem, WriteResult, WriteTagsItem,
 };
 
-pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
+/// Mirrored by `AUDIO_EXTENSIONS` in `src/types.ts`. `opus` is here because
+/// Convert can produce it — without it the app couldn't list its own output.
+pub const AUDIO_EXTENSIONS: &[&str] =
+    &["mp3", "flac", "ogg", "opus", "aac", "m4a", "wav", "aiff", "aif"];
 
 const FILE_OP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -63,21 +66,69 @@ fn worker_threads() -> usize {
         .clamp(1, 8)
 }
 
-pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// Per-file error for a file whose parse or write panicked inside lofty or an
+/// image decoder (see `par_map`).
+pub(crate) const CRASHED: &str =
+    "This file could not be processed: it made the tag parser crash, so it is probably damaged";
+
+/// Runs `f`, turning a panic into `on_panic`'s result. lofty and the image
+/// decoders can panic on malformed input; one bad file must cost exactly one
+/// result, not the whole batch.
+fn guarded<T, R>(item: &T, f: &impl Fn(&T) -> R, on_panic: &impl Fn(&T) -> R) -> R {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item)))
+        .unwrap_or_else(|_| on_panic(item))
+}
+
+/// Maps `f` over `items` on `worker_threads()` threads and returns the
+/// results in input order, exactly one per item.
+///
+/// Work is handed out one item at a time from a shared counter rather than in
+/// fixed chunks: file sizes (and cloud placeholders, and slow USB drives)
+/// vary wildly, and a fixed split left most threads idle while one chewed
+/// through a chunk of big FLACs.
+///
+/// A panic while processing an item is caught and replaced with
+/// `on_panic(item)`. Previously a panic took down its whole thread's chunk,
+/// whose results then silently vanished — the batch came back shorter than
+/// its input, breaking every caller that promises one result per path.
+pub(crate) fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+    on_panic: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     if items.len() <= 16 {
-        return items.iter().map(&f).collect();
+        return items.iter().map(|item| guarded(item, &f, &on_panic)).collect();
     }
-    let threads = worker_threads();
-    let chunk = items.len().div_ceil(threads.min(items.len()));
+    let next = AtomicUsize::new(0);
+    let threads = worker_threads().min(items.len());
+    let mut slots: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();
     std::thread::scope(|s| {
-        items
-            .chunks(chunk)
-            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<_>>()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        done.push((i, guarded(item, &f, &on_panic)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (i, r) in worker.join().unwrap_or_default() {
+                slots[i] = Some(r);
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .zip(items)
+        .map(|(slot, item)| slot.unwrap_or_else(|| on_panic(item)))
+        .collect()
 }
 
 /// Canonical, format-independent name for a tag key. Used for the
@@ -129,18 +180,9 @@ fn read_without_pictures(path: &Path) -> Option<lofty::file::TaggedFile> {
         .ok()
 }
 
-fn file_info(path: &Path) -> AudioFile {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let tagged = read_without_pictures(path);
-    let has_backup = tagged
-        .as_ref()
-        .map(|t| find_backup_in_file(t).is_some())
-        .unwrap_or(false);
-    let duration_secs = tagged
-        .as_ref()
-        .map(|t| t.properties().duration().as_secs_f64());
-    let bitrate_kbps = tagged.as_ref().and_then(|t| t.properties().audio_bitrate());
-    let sample_rate_hz = tagged.as_ref().and_then(|t| t.properties().sample_rate());
+/// Listing-only info for a file whose parse crashed: still listed, so the
+/// user sees it and gets a per-file error when they act on it.
+fn file_info_unparsed(path: &Path) -> AudioFile {
     AudioFile {
         path: path.to_string_lossy().to_string(),
         filename: path
@@ -152,12 +194,42 @@ fn file_info(path: &Path) -> AudioFile {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default(),
-        size,
-        has_backup,
-        duration_secs,
-        bitrate_kbps,
-        sample_rate_hz,
+        size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        has_backup: false,
+        duration_secs: None,
+        bitrate_kbps: None,
+        sample_rate_hz: None,
     }
+}
+
+fn file_info(path: &Path) -> AudioFile {
+    let mut info = file_info_unparsed(path);
+    if let Some(tagged) = read_without_pictures(path) {
+        let props = tagged.properties();
+        info.has_backup = find_backup_in_file(&tagged).is_some();
+        info.duration_secs = Some(props.duration().as_secs_f64());
+        info.bitrate_kbps = props.audio_bitrate();
+        info.sample_rate_hz = props.sample_rate();
+    }
+    info
+}
+
+/// Every audio file under `root` (just its direct children unless `recursive`).
+///
+/// Skips macOS AppleDouble companions (`._Track.mp3`): a USB stick that has
+/// been near a Mac is full of them, they carry the audio extension but hold
+/// only Finder metadata, and each one surfaced as an unreadable "track".
+fn audio_files_under(root: &Path, recursive: bool) -> impl Iterator<Item = std::path::PathBuf> {
+    WalkDir::new(root)
+        .max_depth(if recursive { usize::MAX } else { 1 })
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().is_file()
+                && is_audio(e.path())
+                && !e.file_name().to_string_lossy().starts_with("._")
+        })
+        .map(|e| e.into_path())
 }
 
 // scan_folder / list_files / import_paths each parse every file they touch, so
@@ -170,15 +242,8 @@ pub async fn scan_folder(path: String, recursive: bool) -> Result<Vec<AudioFile>
         if !root.is_dir() {
             return Err(format!("Not a folder: {path}"));
         }
-        let max_depth = if recursive { usize::MAX } else { 1 };
-        let paths: Vec<std::path::PathBuf> = WalkDir::new(root)
-            .max_depth(max_depth)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-            .map(|e| e.into_path())
-            .collect();
-        let mut files = par_map(&paths, |p| file_info(p));
+        let paths: Vec<std::path::PathBuf> = audio_files_under(root, recursive).collect();
+        let mut files = par_map(&paths, |p| file_info(p), |p| file_info_unparsed(p));
         files.sort_by_cached_key(|f| f.path.to_lowercase());
         Ok(files)
     })
@@ -188,34 +253,35 @@ pub async fn scan_folder(path: String, recursive: bool) -> Result<Vec<AudioFile>
 
 #[tauri::command]
 pub async fn list_files(paths: Vec<String>) -> Vec<AudioFile> {
-    tauri::async_runtime::spawn_blocking(move || par_map(&paths, |p| file_info(Path::new(p))))
-        .await
-        .unwrap_or_default()
+    tauri::async_runtime::spawn_blocking(move || {
+        par_map(
+            &paths,
+            |p| file_info(Path::new(p)),
+            |p| file_info_unparsed(Path::new(p)),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Imports a mix of files and folders (as produced by a drag-and-drop),
-/// recursing into any folders. Non-audio paths are ignored.
+/// recursing into any folders. Non-audio paths are ignored, and a file that
+/// is reached twice (dropped alongside the folder that holds it) is listed once.
 #[tauri::command]
 pub async fn import_paths(paths: Vec<String>, recursive: bool) -> Vec<AudioFile> {
     tauri::async_runtime::spawn_blocking(move || {
-        let max_depth = if recursive { usize::MAX } else { 1 };
         let mut targets: Vec<std::path::PathBuf> = Vec::new();
         for p in paths {
             let path = Path::new(&p);
             if path.is_dir() {
-                targets.extend(
-                    WalkDir::new(path)
-                        .max_depth(max_depth)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().is_file() && is_audio(e.path()))
-                        .map(|e| e.into_path()),
-                );
+                targets.extend(audio_files_under(path, recursive));
             } else if path.is_file() && is_audio(path) {
                 targets.push(path.to_path_buf());
             }
         }
-        par_map(&targets, |p| file_info(p))
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert(t.clone()));
+        par_map(&targets, |p| file_info(p), |p| file_info_unparsed(p))
     })
     .await
     .unwrap_or_default()
@@ -223,7 +289,18 @@ pub async fn import_paths(paths: Vec<String>, recursive: bool) -> Vec<AudioFile>
 
 pub fn read_tags_impl(path: &str) -> Result<TagData, String> {
     let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-    Ok(tag_data_of(&tagged))
+    Ok(tag_data_from(tagged))
+}
+
+/// The raw field names of `tags` outside the curated set — the `keep_extra`
+/// that preserves every other field through a `write_tags_blocking` call
+/// (the Rust twin of `preserveExtras` in `useTags.ts`).
+pub(crate) fn extra_field_keys(tags: &TagData) -> Vec<String> {
+    tags.all_fields
+        .keys()
+        .filter(|k| !crate::commands::library_index::KEPT_FIELD_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Everything the library index stores about one file, from a single parse.
@@ -241,38 +318,86 @@ pub(crate) fn read_for_index(path: &str) -> Result<IndexRow, String> {
     let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let duration_secs = Some(tagged.properties().duration().as_secs_f64()).filter(|d| *d > 0.0);
     let has_backup = find_backup_in_file(&tagged).is_some();
-    Ok(IndexRow { tags: tag_data_of(&tagged), duration_secs, has_backup })
+    Ok(IndexRow { tags: tag_data_from(tagged), duration_secs, has_backup })
 }
 
-/// Pulls the curated fields out of an already-parsed file.
-pub(crate) fn tag_data_of(tagged: &lofty::file::TaggedFile) -> TagData {
-    let mut data = TagData::default();
-    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-        return data;
-    };
+/// Curated fields of a parsed file, including an ID3v2 POPM star rating.
+///
+/// Takes the file by value because the rating needs it: lofty keeps POPM
+/// (like GEOB, PRIV, RVA2…) out of the generic `Tag` as a format-specific
+/// "companion" frame, so it is only visible after converting the tag back
+/// into an `Id3v2Tag` — which consumes it. Reading through the generic
+/// accessors alone meant an MP3's rating (Rekordbox's included) was never read.
+pub(crate) fn tag_data_from(mut tagged: lofty::file::TaggedFile) -> TagData {
+    let mut data = tag_data_of(&tagged);
+    if data.rating.is_none()
+        && tagged
+            .primary_tag()
+            .is_some_and(|t| t.tag_type() == TagType::Id3v2 && t.has_format_specific_items())
+    {
+        if let Some(tag) = tagged.remove(TagType::Id3v2) {
+            data.rating = popm_stars(&tag.into()).filter(|s| *s > 0);
+        }
+    }
+    data
+}
 
-    data.title = tag.title().map(|c| c.to_string());
-    data.artist = tag.artist().map(|c| c.to_string());
-    data.album = tag.album().map(|c| c.to_string());
-    data.album_artist = get_text(tag, &ItemKey::AlbumArtist);
-    data.track_number = join_total(
-        get_text(tag, &ItemKey::TrackNumber),
-        get_text(tag, &ItemKey::TrackTotal),
-    );
-    data.disc_number = join_total(
-        get_text(tag, &ItemKey::DiscNumber),
-        get_text(tag, &ItemKey::DiscTotal),
-    );
-    data.year = get_text(tag, &ItemKey::RecordingDate)
+/// Pulls the curated fields out of an already-parsed file (without the ID3v2
+/// POPM rating — see `tag_data_from`).
+pub(crate) fn tag_data_of(tagged: &lofty::file::TaggedFile) -> TagData {
+    tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .map(tag_data_of_tag)
+        .unwrap_or_default()
+}
+
+/// The year as the app shows it: the full recording date when there is one,
+/// else the bare year field.
+fn year_of(tag: &Tag) -> Option<String> {
+    get_text(tag, &ItemKey::RecordingDate)
         .or_else(|| get_text(tag, &ItemKey::Year))
-        .or_else(|| tag.year().map(|y| y.to_string()));
-    data.genre = tag.genre().map(|c| c.to_string());
-    data.comment = tag.comment().map(|c| c.to_string());
-    data.composer = get_text(tag, &ItemKey::Composer);
-    data.original_artist = get_text(tag, &ItemKey::OriginalArtist);
-    data.track_id = get_text(tag, &track_id_key());
-    data.rating = read_rating(tag);
-    data.has_cover_art = !tag.pictures().is_empty();
+        .or_else(|| tag.year().map(|y| y.to_string()))
+}
+
+/// The comment the app shows and edits: the first one without a description.
+///
+/// ID3v2 files routinely carry machine-written COMM frames with descriptions —
+/// iTunes' `iTunNORM` (volume) and `iTunSMPB` (gapless playback info), media
+/// players' custom slots — ahead of the real comment. Showing whichever came
+/// first put hex gibberish in the Comment column.
+fn displayed_comment(tag: &Tag) -> Option<&TagItem> {
+    let comments = || tag.items().filter(|i| *i.key() == ItemKey::Comment);
+    comments()
+        .find(|i| i.description().is_empty())
+        .or_else(|| comments().next())
+        .filter(|i| text_of(i.value()).is_some_and(|t| !t.is_empty()))
+}
+
+fn tag_data_of_tag(tag: &Tag) -> TagData {
+    let mut data = TagData {
+        title: tag.title().map(|c| c.to_string()),
+        artist: tag.artist().map(|c| c.to_string()),
+        album: tag.album().map(|c| c.to_string()),
+        album_artist: get_text(tag, &ItemKey::AlbumArtist),
+        track_number: join_total(
+            get_text(tag, &ItemKey::TrackNumber),
+            get_text(tag, &ItemKey::TrackTotal),
+        ),
+        disc_number: join_total(
+            get_text(tag, &ItemKey::DiscNumber),
+            get_text(tag, &ItemKey::DiscTotal),
+        ),
+        year: year_of(tag),
+        genre: tag.genre().map(|c| c.to_string()),
+        comment: displayed_comment(tag).and_then(|i| text_of(i.value())),
+        composer: get_text(tag, &ItemKey::Composer),
+        original_artist: get_text(tag, &ItemKey::OriginalArtist),
+        track_id: get_text(tag, &track_id_key()),
+        rating: read_rating(tag),
+        has_cover_art: !tag.pictures().is_empty(),
+        all_fields: Default::default(),
+    };
 
     let backup_name = format!("Unknown({BACKUP_KEY})");
     for item in tag.items() {
@@ -306,77 +431,121 @@ fn join_total(num: Option<String>, total: Option<String>) -> Option<String> {
     }
 }
 
-/// A POPM rating byte (0-255) to 0-5 stars, using the Rekordbox 51/star scale.
+/// A POPM rating byte (0-255) to 0-5 stars.
+///
+/// Bands rather than `byte / 51`: players disagree on the byte for each star —
+/// Rekordbox and Traktor write 51/102/153/204/255, Windows Media Player and
+/// MusicBee 1/64/128/196/255 — and plain division turned WMP's two stars (64)
+/// into one and dropped any byte under 26 to "unrated". These bands put both
+/// conventions on the right star. 1-5 are taken as literal star counts, which
+/// a few taggers write.
 fn stars_from_popm_byte(n: u32) -> u8 {
-    let stars = if n == 0 {
-        0
-    } else if n <= 5 {
-        n
-    } else {
-        ((n as f32) / 51.0).round() as u32
-    };
-    stars.min(5) as u8
-}
-
-/// Parses a POPM frame body ("email\0<rating><counter>") to stars.
-fn popm_to_stars(bytes: &[u8]) -> u8 {
-    match bytes.iter().position(|&b| b == 0) {
-        Some(pos) => bytes
-            .get(pos + 1)
-            .map(|&r| stars_from_popm_byte(r as u32))
-            .unwrap_or(0),
-        None => 0,
+    match n {
+        0 => 0,
+        1..=5 => n as u8,
+        6..=63 => 1,
+        64..=127 => 2,
+        128..=185 => 3,
+        186..=229 => 4,
+        _ => 5,
     }
 }
 
-/// Reads a rating (0-5 stars) from a POPM binary frame (ID3) or a numeric
-/// RATING text comment (Vorbis/MP4, 0-100 scale). Returns None if unrated.
-fn read_rating(tag: &Tag) -> Option<u8> {
-    if let Some(item) = tag.get(&ItemKey::Popularimeter) {
-        let stars = match item.value() {
-            ItemValue::Binary(bytes) => popm_to_stars(bytes),
-            ItemValue::Text(s) => s
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .map(stars_from_popm_byte)
-                .unwrap_or(0),
-            _ => 0,
-        };
-        return (stars > 0).then_some(stars);
-    }
-    let rating_key = ItemKey::from_key(tag.tag_type(), "RATING");
-    if let Some(s) = get_text(tag, &rating_key) {
-        if let Ok(n) = s.trim().parse::<u32>() {
-            let stars = if n <= 5 {
-                n
-            } else {
-                ((n as f32) / 20.0).round() as u32
-            };
-            return (stars > 0).then_some(stars.min(5) as u8);
+/// The byte written for `stars` — Rekordbox's scale, which every band above
+/// (and every other player) reads back as the same star count.
+fn popm_byte(stars: u8) -> u8 {
+    (stars.min(5) as u16 * 51) as u8
+}
+
+/// A text rating as written outside ID3v2 (Vorbis `RATING`, MP4 `rate`,
+/// RIFF `IRTD`): 1-5 is a star count, anything larger is on the 0-100 scale
+/// this app (and most taggers) write.
+fn stars_from_text_rating(s: &str) -> Option<u8> {
+    let n = s.trim().parse::<f64>().ok().filter(|n| *n > 0.0)?;
+    let stars = if n <= 5.0 { n.round() } else { (n / 20.0).round() };
+    Some((stars as u8).clamp(1, 5))
+}
+
+/// Stars from the first rated POPM frame of an ID3v2 tag.
+fn popm_stars(tag: &lofty::id3::v2::Id3v2Tag) -> Option<u8> {
+    tag.into_iter().find_map(|frame| match frame {
+        lofty::id3::v2::Frame::Popularimeter(p) if p.rating > 0 => {
+            Some(stars_from_popm_byte(p.rating as u32))
         }
-    }
-    None
+        _ => None,
+    })
 }
 
-/// Writes a 0-5 star rating: a POPM binary frame for ID3v2, or a numeric
-/// RATING comment (0-100) for other formats. Clears the rating when 0.
-fn write_rating(tag: &mut Tag, tag_type: TagType, stars: u8) {
-    tag.remove_key(&ItemKey::Popularimeter);
-    let rating_key = ItemKey::from_key(tag_type, "RATING");
-    tag.remove_key(&rating_key);
+/// Reads a rating (1-5 stars) from the generic tag: a text rating (Vorbis,
+/// MP4, RIFF) or, should a format hand it over that way, a raw POPM body.
+/// ID3v2's own POPM frames are read by `tag_data_from`. `None` when unrated.
+fn read_rating(tag: &Tag) -> Option<u8> {
+    let rating_key = ItemKey::Unknown("RATING".to_string());
+    tag.items()
+        .filter(|i| *i.key() == ItemKey::Popularimeter || *i.key() == rating_key)
+        .find_map(|item| match item.value() {
+            ItemValue::Text(s) => stars_from_text_rating(s),
+            ItemValue::Binary(bytes) => {
+                // POPM body: "email" + NUL + rating byte + play counter.
+                let pos = bytes.iter().position(|&b| b == 0)?;
+                let stars = stars_from_popm_byte(*bytes.get(pos + 1)? as u32);
+                (stars > 0).then_some(stars)
+            }
+            ItemValue::Locator(_) => None,
+        })
+}
+
+/// Sets every POPM frame's rating to `stars` (0 clears), keeping each frame's
+/// email and play counter; adds one when the file has none. Leaves the frames
+/// byte-for-byte alone when the star count isn't actually changing, so an
+/// unrelated edit never rewrites another player's rating byte.
+fn set_popm_rating(tag: &mut lofty::id3::v2::Id3v2Tag, stars: u8) {
+    use lofty::id3::v2::{Frame, PopularimeterFrame};
+
+    if popm_stars(tag).unwrap_or(0) == stars {
+        return;
+    }
+    let mut frames: Vec<PopularimeterFrame<'static>> = (&*tag)
+        .into_iter()
+        .filter_map(|f| match f {
+            Frame::Popularimeter(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    tag.retain(|f| !matches!(f, Frame::Popularimeter(_)));
+    if frames.is_empty() {
+        if stars == 0 {
+            return;
+        }
+        frames.push(PopularimeterFrame::new(String::new(), 0, 0));
+    }
+    for mut frame in frames {
+        frame.rating = popm_byte(stars);
+        tag.insert(Frame::Popularimeter(frame));
+    }
+}
+
+/// Writes a 0-5 star rating as a text rating on the 0-100 scale (0 clears),
+/// for every format except ID3v2 (see `set_popm_rating`). Unchanged star
+/// counts are left exactly as they are on disk.
+fn set_text_rating(tag: &mut Tag, stars: u8) {
+    if read_rating(tag).unwrap_or(0) == stars {
+        return;
+    }
+    let rating_key = ItemKey::Unknown("RATING".to_string());
+    tag.retain(|i| *i.key() != ItemKey::Popularimeter && *i.key() != rating_key);
     if stars == 0 {
         return;
     }
-    if tag_type == TagType::Id3v2 {
-        let byte = (stars.min(5) as u16 * 51) as u8;
-        // POPM body: empty email + null terminator + rating byte + 4-byte counter.
-        let bytes = vec![0u8, byte, 0, 0, 0, 0];
-        tag.insert(TagItem::new(ItemKey::Popularimeter, ItemValue::Binary(bytes)));
+    let value = ItemValue::Text((stars.min(5) as u16 * 20).to_string());
+    // Vorbis (RATING), MP4 (rate) and RIFF INFO (IRTD) have a native key;
+    // anything else gets a plain RATING field rather than nothing at all.
+    let key = if ItemKey::Popularimeter.map_key(tag.tag_type(), false).is_some() {
+        ItemKey::Popularimeter
     } else {
-        let val = (stars.min(5) as u16 * 20).to_string();
-        tag.insert(TagItem::new(rating_key, ItemValue::Text(val)));
-    }
+        rating_key
+    };
+    tag.insert_unchecked(TagItem::new(key, value));
 }
 
 /// Resolves the human-readable "searchable backup" target field.
@@ -425,18 +594,26 @@ pub async fn read_tags(path: String) -> Result<TagData, String> {
 pub async fn read_tags_batch(paths: Vec<String>) -> Vec<TagReadResult> {
     let fallback: Vec<String> = paths.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        par_map(&paths, |p| match read_tags_impl(p) {
-            Ok(tags) => TagReadResult {
-                path: p.clone(),
-                tags: Some(tags),
-                error: None,
+        par_map(
+            &paths,
+            |p| match read_tags_impl(p) {
+                Ok(tags) => TagReadResult {
+                    path: p.clone(),
+                    tags: Some(tags),
+                    error: None,
+                },
+                Err(e) => TagReadResult {
+                    path: p.clone(),
+                    tags: None,
+                    error: Some(e),
+                },
             },
-            Err(e) => TagReadResult {
+            |p| TagReadResult {
                 path: p.clone(),
                 tags: None,
-                error: Some(e),
+                error: Some(CRASHED.to_string()),
             },
-        })
+        )
     })
     .await;
 
@@ -452,19 +629,37 @@ pub async fn read_tags_batch(paths: Vec<String>) -> Vec<TagReadResult> {
     })
 }
 
-/// Writes the common fields in `tags`, dropping everything else.
-/// `keep_extra` lists canonical key names (see `key_name`) of non-common
-/// fields to carry over from the existing tag — used both to honor
-/// unchecked removals in the strip preview and to preserve everything
-/// when stripping is disabled. The backup (if requested) is captured from
-/// the file's current state before anything is overwritten; an existing
-/// backup is never replaced.
+/// Writes the curated fields in `tags` over the file's existing tag.
+///
+/// `keep_extra` lists canonical key names (see `key_name`) of the other text
+/// fields to carry over — every other text field is stripped. That is the
+/// strip/"Clear Fields" mechanism: a raw field is removed by leaving it out.
+///
+/// The write is a *diff* against what is on disk, built on the file's own
+/// parsed tag rather than a blank one:
+///
+/// * A curated field whose value didn't change is left exactly as stored —
+///   multi-value artists, comment languages and descriptions, the original
+///   date format all survive an unrelated edit.
+/// * Everything the app doesn't show and can't edit survives untouched: lofty
+///   keeps frames it has no generic key for (GEOB, PRIV, POPM, RVA2, UFID, …)
+///   as a format-specific companion of the parsed tag. Building the new tag
+///   from `Tag::new` dropped all of them on every write — Serato's hot cues,
+///   beatgrid and overview (GEOB), Traktor's PRIV block and every POPM rating
+///   were wiped by something as small as fixing a typo in a title.
+/// * Binary items and the app's own backup snapshot are never stripped.
+///
+/// The JSON backup (when `backup` is set) is captured from the file's current
+/// state before anything changes; an existing snapshot is always kept, whether
+/// or not this write asked for one.
 ///
 /// `backup_field` (when Some) writes "file name | | artist | | title | | year"
-/// (from the pre-change values) into a chosen field — Composer by default,
-/// or OriginalArtist / Comment — so the original identity stays searchable
-/// in DJ software. A non-empty target is never overwritten, so the oldest
-/// snapshot (or any real data already there) wins.
+/// (from the pre-change values) into a chosen field — Composer by default, or
+/// OriginalArtist / Comment / … — so the original identity stays searchable in
+/// DJ software. It is only written when that field is empty both before and
+/// after this write: existing data there (an older snapshot included) is never
+/// overwritten by it, while a value the user deliberately typed into, or
+/// cleared from, that field is honoured.
 #[tauri::command]
 pub async fn write_tags(
     path: String,
@@ -480,6 +675,156 @@ pub async fn write_tags(
     .await
 }
 
+/// Keys the curated `TagData` fields are written to. A write diffs each of
+/// these against the file instead of stripping it with the other fields.
+fn is_curated_key(key: &ItemKey) -> bool {
+    matches!(
+        key,
+        ItemKey::TrackTitle
+            | ItemKey::TrackArtist
+            | ItemKey::AlbumTitle
+            | ItemKey::AlbumArtist
+            | ItemKey::TrackNumber
+            | ItemKey::TrackTotal
+            | ItemKey::DiscNumber
+            | ItemKey::DiscTotal
+            | ItemKey::RecordingDate
+            | ItemKey::Year
+            | ItemKey::Genre
+            | ItemKey::Comment
+            | ItemKey::Composer
+            | ItemKey::OriginalArtist
+            | ItemKey::Popularimeter
+    ) || matches!(key, ItemKey::Unknown(k) if k == "TRACKID" || k == "RATING")
+}
+
+/// `Some(trimmed)` for a value worth writing, `None` for absent/blank.
+fn non_blank(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Rewrites one curated field — but only if it changed. `keys` are every key
+/// the field may be stored under (the first is the one written).
+///
+/// The comparison is on the raw values, not trimmed ones, so a pass whose only
+/// change is trimming stray whitespace still gets written.
+fn write_field(tag: &mut Tag, keys: &[ItemKey], old: &Option<String>, new: &Option<String>) {
+    let blank_to_none = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+    if blank_to_none(old) == blank_to_none(new) {
+        return;
+    }
+    tag.retain(|i| !keys.contains(i.key()));
+    if let Some(v) = non_blank(new) {
+        // `insert_unchecked`, not `insert`/`insert_text`: the checked path runs
+        // `ItemKey::re_map` with `allow_unknown: false`, which silently drops
+        // any `ItemKey::Unknown` (our private TRACKID field among them) before
+        // it is even added. The format's writer still rejects a genuinely
+        // out-of-spec key at save time.
+        tag.insert_unchecked(TagItem::new(keys[0].clone(), ItemValue::Text(v.to_string())));
+    }
+}
+
+/// Track/disc "n/total" counterpart of `write_field`.
+fn write_numbered(
+    tag: &mut Tag,
+    num_key: ItemKey,
+    total_key: ItemKey,
+    old: &Option<String>,
+    new: &Option<String>,
+) {
+    let blank_to_none = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+    if blank_to_none(old) == blank_to_none(new) {
+        return;
+    }
+    tag.retain(|i| *i.key() != num_key && *i.key() != total_key);
+    let Some(v) = non_blank(new) else { return };
+    let (n, t) = match v.split_once('/') {
+        Some((n, t)) => (n.trim(), t.trim()),
+        None => (v, ""),
+    };
+    if !n.is_empty() {
+        tag.insert_text(num_key, n.to_string());
+    }
+    if !t.is_empty() {
+        tag.insert_text(total_key, t.to_string());
+    }
+}
+
+/// The comment counterpart of `write_field`: replaces only the comment the app
+/// displays (see `displayed_comment`), leaving iTunes' `iTunNORM`/`iTunSMPB`
+/// and other described, machine-written comments in place.
+fn write_comment(tag: &mut Tag, old: &Option<String>, new: &Option<String>) {
+    let blank_to_none = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+    if blank_to_none(old) == blank_to_none(new) {
+        return;
+    }
+    let has_plain = tag
+        .items()
+        .any(|i| *i.key() == ItemKey::Comment && i.description().is_empty());
+    let mut removed_fallback = false;
+    tag.retain(|i| {
+        if *i.key() != ItemKey::Comment {
+            return true;
+        }
+        if has_plain {
+            return !i.description().is_empty();
+        }
+        // No plain comment: the one displayed was the first comment of all.
+        if removed_fallback {
+            return true;
+        }
+        removed_fallback = true;
+        false
+    });
+    if let Some(v) = non_blank(new) {
+        tag.push_unchecked(TagItem::new(ItemKey::Comment, ItemValue::Text(v.to_string())));
+    }
+}
+
+/// Gives every comment/lyrics item an ID3v2-valid language. lofty refuses to
+/// write a COMM/USLT whose language isn't three ASCII letters, and some
+/// recorders store `[0, 0, 0]`. A blank-slate write used to drop such a frame
+/// (and its text) silently; a write that keeps unchanged items has to repair
+/// it instead, or the whole edit fails. "XXX" is ID3's "unknown language".
+fn repair_item_languages(tag: &mut Tag) {
+    for key in [ItemKey::Comment, ItemKey::Lyrics] {
+        let valid = |lang: &[u8; 3]| lang.iter().all(u8::is_ascii_alphabetic);
+        if tag.items().all(|i| *i.key() != key || valid(i.lang())) {
+            continue;
+        }
+        let items: Vec<TagItem> = tag.take(&key).collect();
+        for mut item in items {
+            if !valid(item.lang()) {
+                item.set_lang(*b"XXX");
+            }
+            tag.push_unchecked(item);
+        }
+    }
+}
+
+/// Saves `tag` to `path`, applying `rating` (stars; `None` leaves the rating
+/// alone). ID3v2 goes through `Id3v2Tag` so its POPM frames can be edited in
+/// place — they live in the tag's format-specific companion, out of reach of
+/// the generic API.
+fn save_tag(mut tag: Tag, rating: Option<u8>, path: &str) -> Result<(), String> {
+    repair_item_languages(&mut tag);
+    if tag.tag_type() == TagType::Id3v2 {
+        let mut id3: lofty::id3::v2::Id3v2Tag = tag.into();
+        if let Some(stars) = rating {
+            set_popm_rating(&mut id3, stars);
+        }
+        return id3
+            .save_to_path(path, WriteOptions::default())
+            .map_err(|e| e.to_string());
+    }
+    let mut tag = tag;
+    if let Some(stars) = rating {
+        set_text_rating(&mut tag, stars);
+    }
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(|e| e.to_string())
+}
+
 pub(crate) fn write_tags_blocking(
     path: &str,
     tags: TagData,
@@ -488,110 +833,137 @@ pub(crate) fn write_tags_blocking(
     preserve_art: bool,
     backup_field: Option<String>,
 ) -> Result<(), String> {
-    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-    // Prefer the format's canonical tag so fields aren't lost to a limited
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    // Always the format's canonical tag, so fields aren't lost to a limited
     // secondary tag (e.g. ID3v1) that happened to be present.
-    let tag_type = tagged
-        .primary_tag()
-        .map(|t| t.tag_type())
-        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
-    let old_tag = tagged.primary_tag().or_else(|| tagged.first_tag()).cloned();
+    let tag_type = tagged.file_type().primary_tag_type();
 
-    let mut new_tag = Tag::new(tag_type);
-    set_text(&mut new_tag, ItemKey::TrackTitle, &tags.title);
-    set_text(&mut new_tag, ItemKey::TrackArtist, &tags.artist);
-    set_text(&mut new_tag, ItemKey::AlbumTitle, &tags.album);
-    set_text(&mut new_tag, ItemKey::AlbumArtist, &tags.album_artist);
-    set_text(&mut new_tag, ItemKey::RecordingDate, &tags.year);
-    set_text(&mut new_tag, ItemKey::Genre, &tags.genre);
-    set_text(&mut new_tag, ItemKey::Comment, &tags.comment);
-    set_numbered(
-        &mut new_tag,
-        ItemKey::TrackNumber,
-        ItemKey::TrackTotal,
-        &tags.track_number,
-    );
-    set_numbered(
-        &mut new_tag,
-        ItemKey::DiscNumber,
-        ItemKey::DiscTotal,
-        &tags.disc_number,
-    );
-    set_text(&mut new_tag, ItemKey::Composer, &tags.composer);
-    set_text(&mut new_tag, ItemKey::OriginalArtist, &tags.original_artist);
-    set_text(&mut new_tag, track_id_key(), &tags.track_id);
-    if let Some(stars) = tags.rating {
-        write_rating(&mut new_tag, tag_type, stars);
-    }
-
-    // Searchable backup: written into the chosen field only when it (and any
-    // existing data there) is empty, so the original snapshot is never lost.
-    if let Some(field) = backup_field.as_deref() {
-        let key = backup_item_key(field);
-        let old_val = old_tag.as_ref().and_then(|t| get_text(t, &key));
-        if let Some(v) = old_val {
-            new_tag.insert_text(key, v); // preserve whatever is already there
-        } else if new_tag.get(&key).is_none() {
-            let (artist, title, year) = match old_tag.as_ref() {
-                Some(old) => (
-                    old.artist().map(|c| c.to_string()),
-                    old.title().map(|c| c.to_string()),
-                    get_text(old, &ItemKey::RecordingDate)
-                        .or_else(|| get_text(old, &ItemKey::Year))
-                        .or_else(|| old.year().map(|y| y.to_string())),
-                ),
-                None => (None, None, None),
-            };
-            // Always write — the filename slot alone is a valid backup.
-            new_tag.insert_text(key, build_searchable_backup(path, artist, title, year));
-        }
-    }
-
-    if let Some(ref old) = old_tag {
-        if !keep_extra.is_empty() {
-            for item in old.items() {
-                if keep_extra.iter().any(|k| *k == key_name(item.key())) {
-                    new_tag.push(item.clone());
-                }
-            }
-        }
-        if preserve_art {
-            for pic in old.pictures() {
-                new_tag.push_picture(pic.clone());
-            }
-        }
-    }
-
-    if backup {
-        let backup_str = find_backup_in_file(&tagged)
-            .unwrap_or_else(|| make_backup_string(old_tag.as_ref(), tag_type));
-        // `insert` (checked) silently drops ItemKey::Unknown keys the format
-        // doesn't already map — see the comment on `set_text` — which meant
-        // this JSON snapshot never actually made it into ID3v2 files, and
-        // "Restore Backup" had nothing to restore from.
-        new_tag.insert_unchecked(TagItem::new(
-            ItemKey::Unknown(BACKUP_KEY.to_string()),
-            ItemValue::Text(backup_str),
-        ));
-    }
-
-    // Drop secondary tag formats (ID3v1, APE, ...) so stripped fields
-    // cannot linger in them.
+    // Everything needed from the pre-change state, taken before the tag is
+    // reused as the base of the new one.
+    let source = tagged.primary_tag().or_else(|| tagged.first_tag());
+    let backup_blob = find_backup_in_file(&tagged)
+        .or_else(|| backup.then(|| make_backup_string(source, tag_type)));
+    let backup_key = backup_field.as_deref().map(backup_item_key);
+    let old_backup_value = backup_key
+        .as_ref()
+        .and_then(|k| source.and_then(|t| get_text(t, k)));
+    let identity = source.map(|t| {
+        (
+            t.artist().map(|c| c.to_string()),
+            t.title().map(|c| c.to_string()),
+            year_of(t),
+        )
+    });
+    // A file carrying only a secondary tag (an mp3 with just ID3v1): that tag
+    // is the source of the kept fields and art for the new primary one.
+    let secondary_only = if tagged.primary_tag().is_none() {
+        tagged.first_tag().cloned()
+    } else {
+        None
+    };
     let other_types: Vec<TagType> = tagged
         .tags()
         .iter()
         .map(|t| t.tag_type())
         .filter(|t| *t != tag_type)
         .collect();
+
+    let (mut tag, old) = match tagged.remove(tag_type) {
+        Some(primary) => {
+            let old = tag_data_of_tag(&primary);
+            (primary, old)
+        }
+        // Fresh tag: nothing on disk to diff against, so every field is new.
+        None => (Tag::new(tag_type), TagData::default()),
+    };
     drop(tagged);
+
+    // 1. Strip: drop the text fields that are neither curated nor kept.
+    let keep: std::collections::HashSet<String> = keep_extra.into_iter().collect();
+    let blob_key = ItemKey::Unknown(BACKUP_KEY.to_string());
+    tag.retain(|item| {
+        is_curated_key(item.key())
+            || *item.key() == blob_key
+            || matches!(item.value(), ItemValue::Binary(_))
+            || keep.contains(&key_name(item.key()))
+    });
+    if let Some(ref secondary) = secondary_only {
+        for item in secondary.items() {
+            if keep.contains(&key_name(item.key())) {
+                tag.push_unchecked(item.clone());
+            }
+        }
+    }
+
+    // 2. Cover art.
+    if !preserve_art {
+        while !tag.pictures().is_empty() {
+            tag.remove_picture(0);
+        }
+    } else if let Some(ref secondary) = secondary_only {
+        for pic in secondary.pictures() {
+            tag.push_picture(pic.clone());
+        }
+    }
+
+    // 3. Curated fields that changed.
+    write_field(&mut tag, &[ItemKey::TrackTitle], &old.title, &tags.title);
+    write_field(&mut tag, &[ItemKey::TrackArtist], &old.artist, &tags.artist);
+    write_field(&mut tag, &[ItemKey::AlbumTitle], &old.album, &tags.album);
+    write_field(&mut tag, &[ItemKey::AlbumArtist], &old.album_artist, &tags.album_artist);
+    write_field(
+        &mut tag,
+        &[ItemKey::RecordingDate, ItemKey::Year],
+        &old.year,
+        &tags.year,
+    );
+    write_field(&mut tag, &[ItemKey::Genre], &old.genre, &tags.genre);
+    write_comment(&mut tag, &old.comment, &tags.comment);
+    write_numbered(
+        &mut tag,
+        ItemKey::TrackNumber,
+        ItemKey::TrackTotal,
+        &old.track_number,
+        &tags.track_number,
+    );
+    write_numbered(
+        &mut tag,
+        ItemKey::DiscNumber,
+        ItemKey::DiscTotal,
+        &old.disc_number,
+        &tags.disc_number,
+    );
+    write_field(&mut tag, &[ItemKey::Composer], &old.composer, &tags.composer);
+    write_field(
+        &mut tag,
+        &[ItemKey::OriginalArtist],
+        &old.original_artist,
+        &tags.original_artist,
+    );
+    write_field(&mut tag, &[track_id_key()], &old.track_id, &tags.track_id);
+
+    // 4. Searchable backup — only into a field that is empty before and after.
+    if let Some(key) = backup_key {
+        if old_backup_value.is_none() && get_text(&tag, &key).is_none() {
+            let (artist, title, year) = identity.unwrap_or_default();
+            tag.insert_text(key, build_searchable_backup(path, artist, title, year));
+        }
+    }
+
+    // 5. The JSON snapshot. See `write_field` for why this is unchecked.
+    tag.retain(|i| *i.key() != blob_key);
+    if let Some(blob) = backup_blob {
+        tag.insert_unchecked(TagItem::new(blob_key, ItemValue::Text(blob)));
+    }
+
+    // 6. Drop secondary tag formats (ID3v1, APE, ...) so stripped fields
+    // cannot linger in them.
     for tt in other_types {
         Tag::new(tt)
             .remove_from_path(path)
             .map_err(|e| e.to_string())?;
     }
-    new_tag
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| e.to_string())
+    save_tag(tag, tags.rating, path)
 }
 
 /// Writes many files in one call, across `par_map`'s threads.
@@ -621,24 +993,31 @@ pub async fn write_tags_batch(
         let done = AtomicUsize::new(0);
         // Report ~50 times over the run, never more often than every file.
         let step = (total / 50).max(1);
-        par_map(&items, |item| {
-            let result = write_tags_blocking(
-                &item.path,
-                item.tags.clone(),
-                backup,
-                item.keep_extra.clone(),
-                preserve_art,
-                backup_field.clone(),
-            );
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % step == 0 || n == total {
-                let _ = app.emit("write-progress", WriteProgress { done: n, total });
-            }
-            WriteResult {
+        par_map(
+            &items,
+            |item| {
+                let result = write_tags_blocking(
+                    &item.path,
+                    item.tags.clone(),
+                    backup,
+                    item.keep_extra.clone(),
+                    preserve_art,
+                    backup_field.clone(),
+                );
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % step == 0 || n == total {
+                    let _ = app.emit("write-progress", WriteProgress { done: n, total });
+                }
+                WriteResult {
+                    path: item.path.clone(),
+                    error: result.err(),
+                }
+            },
+            |item| WriteResult {
                 path: item.path.clone(),
-                error: result.err(),
-            }
-        })
+                error: Some(CRASHED.to_string()),
+            },
+        )
     })
     .await;
 
@@ -659,10 +1038,17 @@ pub async fn write_tags_batch(
 pub async fn write_raw_fields_batch(items: Vec<WriteRawFieldItem>) -> Vec<WriteResult> {
     let fallback: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
     tauri::async_runtime::spawn_blocking(move || {
-        par_map(&items, |item| WriteResult {
-            path: item.path.clone(),
-            error: write_raw_field_blocking(&item.path, &item.field_key, &item.value).err(),
-        })
+        par_map(
+            &items,
+            |item| WriteResult {
+                path: item.path.clone(),
+                error: write_raw_field_blocking(&item.path, &item.field_key, &item.value).err(),
+            },
+            |item| WriteResult {
+                path: item.path.clone(),
+                error: Some(CRASHED.to_string()),
+            },
+        )
     })
     .await
     .unwrap_or_else(|_| {
@@ -683,10 +1069,17 @@ pub async fn write_raw_fields_batch(items: Vec<WriteRawFieldItem>) -> Vec<WriteR
 pub async fn backup_files_batch(paths: Vec<String>, backup_field: String) -> Vec<WriteResult> {
     let fallback = paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        par_map(&paths, |p| WriteResult {
-            path: p.clone(),
-            error: backup_file_blocking(p, &backup_field).err(),
-        })
+        par_map(
+            &paths,
+            |p| WriteResult {
+                path: p.clone(),
+                error: backup_file_blocking(p, &backup_field).err(),
+            },
+            |p| WriteResult {
+                path: p.clone(),
+                error: Some(CRASHED.to_string()),
+            },
+        )
     })
     .await
     .unwrap_or_else(|_| {
@@ -712,21 +1105,30 @@ pub async fn write_raw_field(path: String, field_key: String, value: String) -> 
 
 fn write_raw_field_blocking(path: &str, field_key: &str, value: &str) -> Result<(), String> {
     let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-    let tag_type = tagged
-        .primary_tag()
-        .map(|t| t.tag_type())
-        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
-    let Some(tag) = tagged.tag_mut(tag_type) else {
-        return Ok(());
-    };
-    let Some(existing_key) = tag
+    let tag_type = tagged.file_type().primary_tag_type();
+    let value = value.trim();
+    if tagged.tag(tag_type).is_none() {
+        if value.is_empty() {
+            return Ok(()); // No tag, so nothing to clear.
+        }
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged
+        .tag_mut(tag_type)
+        .ok_or_else(|| "Could not access the file's tag".to_string())?;
+    let existing_key = tag
         .items()
         .find(|item| key_name(item.key()) == field_key)
-        .map(|item| item.key().clone())
-    else {
-        return Ok(()); // Field no longer present — nothing to write or clear.
+        .map(|item| item.key().clone());
+    let existing_key = match existing_key {
+        Some(key) => key,
+        None if value.is_empty() => return Ok(()), // Already gone.
+        // Not on the file any more — typically undoing a Clear Fields of this
+        // very column. Recreate it from its name; returning Ok without writing
+        // (as before) made that undo silently do nothing.
+        None => item_key_from_name(field_key)
+            .ok_or_else(|| format!("Can't recreate the field \"{field_key}\" on this file"))?,
     };
-    let value = value.trim();
     if value.is_empty() {
         tag.remove_key(&existing_key);
     } else {
@@ -738,6 +1140,122 @@ fn write_raw_field_blocking(path: &str, field_key: &str, value: &str) -> Result<
     tagged
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())
+}
+
+/// The `ItemKey` whose `key_name` is `name` — the inverse of `key_name`, so a
+/// raw field can be recreated by name once it is gone from the file (undoing
+/// a Clear Fields of an "All Tags" column). The arms are every variant of
+/// lofty 0.22's `ItemKey`; `item_key_names_round_trip` checks them.
+fn item_key_from_name(name: &str) -> Option<ItemKey> {
+    if let Some(inner) = name.strip_prefix("Unknown(").and_then(|s| s.strip_suffix(')')) {
+        return Some(ItemKey::Unknown(inner.to_string()));
+    }
+    Some(match name {
+        "AlbumTitle" => ItemKey::AlbumTitle,
+        "SetSubtitle" => ItemKey::SetSubtitle,
+        "ShowName" => ItemKey::ShowName,
+        "ContentGroup" => ItemKey::ContentGroup,
+        "TrackTitle" => ItemKey::TrackTitle,
+        "TrackSubtitle" => ItemKey::TrackSubtitle,
+        "OriginalAlbumTitle" => ItemKey::OriginalAlbumTitle,
+        "OriginalArtist" => ItemKey::OriginalArtist,
+        "OriginalLyricist" => ItemKey::OriginalLyricist,
+        "AlbumTitleSortOrder" => ItemKey::AlbumTitleSortOrder,
+        "AlbumArtistSortOrder" => ItemKey::AlbumArtistSortOrder,
+        "TrackTitleSortOrder" => ItemKey::TrackTitleSortOrder,
+        "TrackArtistSortOrder" => ItemKey::TrackArtistSortOrder,
+        "ShowNameSortOrder" => ItemKey::ShowNameSortOrder,
+        "ComposerSortOrder" => ItemKey::ComposerSortOrder,
+        "AlbumArtist" => ItemKey::AlbumArtist,
+        "TrackArtist" => ItemKey::TrackArtist,
+        "TrackArtists" => ItemKey::TrackArtists,
+        "Arranger" => ItemKey::Arranger,
+        "Writer" => ItemKey::Writer,
+        "Composer" => ItemKey::Composer,
+        "Conductor" => ItemKey::Conductor,
+        "Director" => ItemKey::Director,
+        "Engineer" => ItemKey::Engineer,
+        "Lyricist" => ItemKey::Lyricist,
+        "MixDj" => ItemKey::MixDj,
+        "MixEngineer" => ItemKey::MixEngineer,
+        "MusicianCredits" => ItemKey::MusicianCredits,
+        "Performer" => ItemKey::Performer,
+        "Producer" => ItemKey::Producer,
+        "Publisher" => ItemKey::Publisher,
+        "Label" => ItemKey::Label,
+        "InternetRadioStationName" => ItemKey::InternetRadioStationName,
+        "InternetRadioStationOwner" => ItemKey::InternetRadioStationOwner,
+        "Remixer" => ItemKey::Remixer,
+        "DiscNumber" => ItemKey::DiscNumber,
+        "DiscTotal" => ItemKey::DiscTotal,
+        "TrackNumber" => ItemKey::TrackNumber,
+        "TrackTotal" => ItemKey::TrackTotal,
+        "Popularimeter" => ItemKey::Popularimeter,
+        "ParentalAdvisory" => ItemKey::ParentalAdvisory,
+        "RecordingDate" => ItemKey::RecordingDate,
+        "Year" => ItemKey::Year,
+        "ReleaseDate" => ItemKey::ReleaseDate,
+        "OriginalReleaseDate" => ItemKey::OriginalReleaseDate,
+        "Isrc" => ItemKey::Isrc,
+        "Barcode" => ItemKey::Barcode,
+        "CatalogNumber" => ItemKey::CatalogNumber,
+        "Work" => ItemKey::Work,
+        "Movement" => ItemKey::Movement,
+        "MovementNumber" => ItemKey::MovementNumber,
+        "MovementTotal" => ItemKey::MovementTotal,
+        "MusicBrainzRecordingId" => ItemKey::MusicBrainzRecordingId,
+        "MusicBrainzTrackId" => ItemKey::MusicBrainzTrackId,
+        "MusicBrainzReleaseId" => ItemKey::MusicBrainzReleaseId,
+        "MusicBrainzReleaseGroupId" => ItemKey::MusicBrainzReleaseGroupId,
+        "MusicBrainzArtistId" => ItemKey::MusicBrainzArtistId,
+        "MusicBrainzReleaseArtistId" => ItemKey::MusicBrainzReleaseArtistId,
+        "MusicBrainzWorkId" => ItemKey::MusicBrainzWorkId,
+        "FlagCompilation" => ItemKey::FlagCompilation,
+        "FlagPodcast" => ItemKey::FlagPodcast,
+        "FileType" => ItemKey::FileType,
+        "FileOwner" => ItemKey::FileOwner,
+        "TaggingTime" => ItemKey::TaggingTime,
+        "Length" => ItemKey::Length,
+        "OriginalFileName" => ItemKey::OriginalFileName,
+        "OriginalMediaType" => ItemKey::OriginalMediaType,
+        "EncodedBy" => ItemKey::EncodedBy,
+        "EncoderSoftware" => ItemKey::EncoderSoftware,
+        "EncoderSettings" => ItemKey::EncoderSettings,
+        "EncodingTime" => ItemKey::EncodingTime,
+        "ReplayGainAlbumGain" => ItemKey::ReplayGainAlbumGain,
+        "ReplayGainAlbumPeak" => ItemKey::ReplayGainAlbumPeak,
+        "ReplayGainTrackGain" => ItemKey::ReplayGainTrackGain,
+        "ReplayGainTrackPeak" => ItemKey::ReplayGainTrackPeak,
+        "AudioFileUrl" => ItemKey::AudioFileUrl,
+        "AudioSourceUrl" => ItemKey::AudioSourceUrl,
+        "CommercialInformationUrl" => ItemKey::CommercialInformationUrl,
+        "CopyrightUrl" => ItemKey::CopyrightUrl,
+        "TrackArtistUrl" => ItemKey::TrackArtistUrl,
+        "RadioStationUrl" => ItemKey::RadioStationUrl,
+        "PaymentUrl" => ItemKey::PaymentUrl,
+        "PublisherUrl" => ItemKey::PublisherUrl,
+        "Genre" => ItemKey::Genre,
+        "InitialKey" => ItemKey::InitialKey,
+        "Color" => ItemKey::Color,
+        "Mood" => ItemKey::Mood,
+        "Bpm" => ItemKey::Bpm,
+        "IntegerBpm" => ItemKey::IntegerBpm,
+        "CopyrightMessage" => ItemKey::CopyrightMessage,
+        "License" => ItemKey::License,
+        "PodcastDescription" => ItemKey::PodcastDescription,
+        "PodcastSeriesCategory" => ItemKey::PodcastSeriesCategory,
+        "PodcastUrl" => ItemKey::PodcastUrl,
+        "PodcastGlobalUniqueId" => ItemKey::PodcastGlobalUniqueId,
+        "PodcastKeywords" => ItemKey::PodcastKeywords,
+        "Comment" => ItemKey::Comment,
+        "Description" => ItemKey::Description,
+        "Language" => ItemKey::Language,
+        "Script" => ItemKey::Script,
+        "Lyrics" => ItemKey::Lyrics,
+        "AppleXid" => ItemKey::AppleXid,
+        "AppleId3v2ContentGroup" => ItemKey::AppleId3v2ContentGroup,
+        _ => return None,
+    })
 }
 
 /// Explicit backup of a single file. Always (re)writes the searchable
@@ -850,8 +1368,11 @@ fn read_cover_thumbnail_blocking(path: &str, size: u32) -> Result<Option<String>
         return Ok(None);
     };
     let img = image::load_from_memory(pic.data()).map_err(|e| e.to_string())?;
+    // `thumbnail` is a fast area-averaging downscale: several times quicker
+    // than a filtered `resize` for the big reductions a table cell needs
+    // (a 3000px cover down to 64px), and indistinguishable at that size.
     let thumb = if img.dimensions().0.max(img.dimensions().1) > size {
-        img.resize(size, size, image::imageops::FilterType::Triangle)
+        img.thumbnail(size, size)
     } else {
         img
     };
@@ -879,10 +1400,17 @@ fn read_cover_thumbnail_blocking(path: &str, size: u32) -> Result<Option<String>
 pub async fn read_cover_thumbnails(paths: Vec<String>, size: u32) -> Vec<CoverThumbnail> {
     let fallback = paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        par_map(&paths, |p| CoverThumbnail {
-            path: p.clone(),
-            data_url: read_cover_thumbnail_blocking(p, size).ok().flatten(),
-        })
+        par_map(
+            &paths,
+            |p| CoverThumbnail {
+                path: p.clone(),
+                data_url: read_cover_thumbnail_blocking(p, size).ok().flatten(),
+            },
+            |p| CoverThumbnail {
+                path: p.clone(),
+                data_url: None,
+            },
+        )
     })
     .await
     .unwrap_or_else(|_| {
@@ -911,10 +1439,17 @@ pub async fn image_info(path: String) -> Result<Option<ImageInfo>, String> {
 pub async fn image_info_batch(paths: Vec<String>) -> Vec<ImageInfoResult> {
     let fallback = paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        par_map(&paths, |p| ImageInfoResult {
-            path: p.clone(),
-            info: image_info_blocking(p).ok().flatten(),
-        })
+        par_map(
+            &paths,
+            |p| ImageInfoResult {
+                path: p.clone(),
+                info: image_info_blocking(p).ok().flatten(),
+            },
+            |p| ImageInfoResult {
+                path: p.clone(),
+                info: None,
+            },
+        )
     })
     .await
     .unwrap_or_else(|_| {
@@ -938,37 +1473,50 @@ fn image_info_blocking(path: &str) -> Result<Option<ImageInfo>, String> {
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| "image/jpeg".to_string());
     let size_bytes = pic.data().len() as u64;
-    let (width, height) = image::load_from_memory(pic.data())
-        .map(|img| {
-            use image::GenericImageView;
-            img.dimensions()
-        })
-        .unwrap_or((0, 0));
+    let (width, height) = image_dimensions(pic.data()).unwrap_or((0, 0));
     Ok(Some(ImageInfo { mime, size_bytes, width, height }))
 }
 
-fn mime_from_extension(image_path: &str) -> lofty::picture::MimeType {
-    match Path::new(image_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-        .as_str()
-    {
-        "png" => lofty::picture::MimeType::Png,
-        "gif" => lofty::picture::MimeType::Gif,
-        "bmp" => lofty::picture::MimeType::Bmp,
-        _ => lofty::picture::MimeType::Jpeg,
+/// Pixel size read from the image header alone. The Artwork column asks for
+/// this on every row, and fully decoding a 3000×3000 cover just to learn its
+/// size cost tens of milliseconds a track.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// The MIME type of known artwork bytes, from their signature.
+fn sniff_cover_mime(bytes: &[u8]) -> Option<lofty::picture::MimeType> {
+    use lofty::picture::MimeType;
+    match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Jpeg => Some(MimeType::Jpeg),
+        image::ImageFormat::Png => Some(MimeType::Png),
+        image::ImageFormat::Gif => Some(MimeType::Gif),
+        image::ImageFormat::Bmp => Some(MimeType::Bmp),
+        _ => None,
     }
 }
 
-fn mime_from_data_url_type(mime_str: &str) -> lofty::picture::MimeType {
-    match mime_str {
-        "image/png" => lofty::picture::MimeType::Png,
-        "image/gif" => lofty::picture::MimeType::Gif,
-        "image/bmp" => lofty::picture::MimeType::Bmp,
-        _ => lofty::picture::MimeType::Jpeg,
+/// Artwork from a user-chosen image file, ready to embed.
+///
+/// The type comes from the bytes, not the extension — a ".jpg" saved from a
+/// web page is often really a PNG or WebP, and labelling it by name embedded
+/// a picture whose declared type was wrong. Formats DJ software can't show
+/// (WebP above all) are re-encoded as JPEG rather than embedded unreadable.
+fn prepare_cover(bytes: Vec<u8>) -> Result<(lofty::picture::MimeType, Vec<u8>), String> {
+    if let Some(mime) = sniff_cover_mime(&bytes) {
+        return Ok((mime, bytes));
     }
+    let img = image::load_from_memory(&bytes)
+        .map_err(|_| "That file isn't an image the app can read (JPEG, PNG, GIF, BMP or WebP)".to_string())?;
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+        .encode_image(&img.to_rgb8())
+        .map_err(|e| format!("Could not convert the image to JPEG: {e}"))?;
+    Ok((lofty::picture::MimeType::Jpeg, out))
 }
 
 /// Embeds `bytes` as the file's sole cover art, replacing any existing picture.
@@ -1018,7 +1566,7 @@ fn remove_all_pictures(path: &str) -> Result<(), String> {
 pub async fn set_cover_art(path: String, image_path: String) -> Result<(), String> {
     run_blocking(move || {
         let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
-        let mime = mime_from_extension(&image_path);
+        let (mime, bytes) = prepare_cover(bytes)?;
         embed_picture_bytes(&path, mime, bytes)
     })
     .await
@@ -1048,7 +1596,12 @@ pub async fn restore_cover_art(path: String, data_url: Option<String>) -> Result
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| e.to_string())?;
-        embed_picture_bytes(&path, mime_from_data_url_type(mime_str), bytes)
+        // Undo/redo must put back exactly what was there, so the bytes are
+        // never re-encoded here; the declared type is only a fallback for a
+        // format the signature check doesn't know.
+        let mime = sniff_cover_mime(&bytes)
+            .unwrap_or_else(|| lofty::picture::MimeType::from_str(mime_str));
+        embed_picture_bytes(&path, mime, bytes)
     })
     .await
 }
@@ -1168,15 +1721,48 @@ pub async fn rename_file(path: String, new_stem: String) -> Result<String, Strin
     run_blocking(move || rename_file_blocking(&path, &new_stem)).await
 }
 
+/// Validates and tidies a new file name (without extension).
+///
+/// The UI already builds names from letters, digits and spaces only, but this
+/// is the last line of defence before the filesystem: a separator would move
+/// the file into another folder, and Windows refuses reserved device names
+/// (`CON`, `NUL`, `COM1`…), names ending in a dot or space, and components
+/// over 255 characters.
+fn safe_file_stem(raw: &str) -> Result<String, String> {
+    const MAX_CHARS: usize = 200; // leaves room for " (n)" and the extension
+    let stem = raw.trim().trim_end_matches(['.', ' ']);
+    if stem.is_empty() {
+        return Err("New name is empty".into());
+    }
+    if let Some(c) = stem
+        .chars()
+        .find(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control())
+    {
+        return Err(format!("A file name can't contain {c:?}"));
+    }
+    let base = stem.split('.').next().unwrap_or(stem).trim().to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        return Err(format!("\"{stem}\" is a name Windows reserves for devices"));
+    }
+    Ok(if stem.chars().count() > MAX_CHARS {
+        let cut: String = stem.chars().take(MAX_CHARS).collect();
+        cut.trim_end_matches(['.', ' ']).to_string()
+    } else {
+        stem.to_string()
+    })
+}
+
 fn rename_file_blocking(path: &str, new_stem: &str) -> Result<String, String> {
     let src = Path::new(path);
     if !src.is_file() {
         return Err(format!("File not found: {path}"));
     }
-    let stem = new_stem.trim();
-    if stem.is_empty() {
-        return Err("New name is empty".into());
-    }
+    let stem = safe_file_stem(new_stem)?;
+    let stem = stem.as_str();
     let parent = src.parent().unwrap_or_else(|| Path::new("."));
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -1235,7 +1821,7 @@ fn rename_file_blocking(path: &str, new_stem: &str) -> Result<String, String> {
 /// Returns whether the file actually needed rewriting, so the caller can report
 /// how much of the library was already standard.
 fn standardize_container_blocking(path: &str) -> Result<bool, String> {
-    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let target = tagged.file_type().primary_tag_type();
     let present: Vec<TagType> = tagged.tags().iter().map(|t| t.tag_type()).collect();
 
@@ -1244,32 +1830,21 @@ fn standardize_container_blocking(path: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let primary = tagged
-        .primary_tag()
-        .or_else(|| tagged.first_tag())
-        .cloned();
-    let mut new_tag = Tag::new(target);
-    if let Some(ref old) = primary {
-        // `insert_unchecked` rather than `insert`, so keys the target format
-        // has no standard mapping for — the app's own backup JSON among them —
-        // survive the move instead of being quietly dropped.
-        for item in old.items() {
-            new_tag.insert_unchecked(item.clone());
-        }
-        for pic in old.pictures() {
-            new_tag.push_picture(pic.clone());
-        }
-    }
+    // The canonical tag is kept as it is — its format-specific frames (GEOB,
+    // PRIV, POPM, …) included, which a blank tag would drop. Without one, the
+    // first secondary becomes the base: `insert_unchecked`/`push_unchecked`
+    // rather than the checked variants, so keys the target format has no
+    // standard mapping for — the app's own backup JSON among them — survive
+    // the move instead of being quietly dropped.
+    let mut new_tag = tagged.remove(target).unwrap_or_else(|| Tag::new(target));
+    let held: std::collections::HashSet<String> =
+        new_tag.items().map(|i| key_name(i.key())).collect();
 
     // Fold in anything only a secondary container knows about.
-    let primary_type = primary.as_ref().map(|t| t.tag_type());
     for tag in tagged.tags() {
-        if Some(tag.tag_type()) == primary_type {
-            continue;
-        }
         for item in tag.items() {
-            if new_tag.get(item.key()).is_none() {
-                new_tag.insert_unchecked(item.clone());
+            if !held.contains(&key_name(item.key())) {
+                new_tag.push_unchecked(item.clone());
             }
         }
         if new_tag.pictures().is_empty() {
@@ -1286,6 +1861,7 @@ fn standardize_container_blocking(path: &str) -> Result<bool, String> {
             .remove_from_path(path)
             .map_err(|e| e.to_string())?;
     }
+    repair_item_languages(&mut new_tag);
     new_tag
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())?;
@@ -1305,14 +1881,18 @@ pub async fn standardize_tag_containers(
     tauri::async_runtime::spawn_blocking(move || {
         let done = AtomicUsize::new(0);
         let step = (total / 50).max(1);
-        let results = par_map(&paths, |path| {
-            let outcome = standardize_container_blocking(path);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % step == 0 || n == total {
-                let _ = app.emit("write-progress", WriteProgress { done: n, total });
-            }
-            (path.clone(), outcome)
-        });
+        let results = par_map(
+            &paths,
+            |path| {
+                let outcome = standardize_container_blocking(path);
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % step == 0 || n == total {
+                    let _ = app.emit("write-progress", WriteProgress { done: n, total });
+                }
+                (path.clone(), outcome)
+            },
+            |path| (path.clone(), Err(CRASHED.to_string())),
+        );
         let mut out = ContainerSweepResult {
             converted: 0,
             already: 0,
@@ -1388,16 +1968,17 @@ pub async fn open_with(path: String) -> Result<(), String> {
     .await
 }
 
-/// Generic text file write, used for exporting settings to a user-chosen path.
+/// Generic text file write, used for exporting settings, match logs and
+/// playlists to a user-chosen path.
 #[tauri::command]
 pub async fn write_text_file(path: String, contents: String) -> Result<(), String> {
-    std::fs::write(&path, contents).map_err(|e| e.to_string())
+    run_blocking(move || std::fs::write(&path, contents).map_err(|e| e.to_string())).await
 }
 
 /// Generic text file read, used for importing a previously exported settings file.
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    run_blocking(move || std::fs::read_to_string(&path).map_err(|e| e.to_string())).await
 }
 
 /// Whether a path exists on disk. Used for the first-launch Library prompt,
@@ -1419,42 +2000,6 @@ pub async fn file_mtime_secs(path: String) -> Option<i64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64)
-}
-
-fn set_text(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
-    if let Some(v) = value {
-        let v = v.trim();
-        if !v.is_empty() {
-            // `Tag::insert_text` goes through `Tag::insert`, which calls
-            // `ItemKey::re_map` with `allow_unknown: false` — so it silently
-            // drops any `ItemKey::Unknown` (e.g. our private TRACKID field)
-            // that isn't in the format's own key map, *before* the item is
-            // even added to the tag. `insert_unchecked` is lofty's documented
-            // way to write such keys; the format-specific writer still
-            // rejects a genuinely out-of-spec key at save time, so this
-            // doesn't bypass validation, just the redundant pre-check that
-            // has no entry for private keys anyway.
-            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(v.to_string())));
-        }
-    }
-}
-
-fn set_numbered(tag: &mut Tag, num_key: ItemKey, total_key: ItemKey, value: &Option<String>) {
-    let Some(v) = value else { return };
-    let v = v.trim();
-    if v.is_empty() {
-        return;
-    }
-    if let Some((n, t)) = v.split_once('/') {
-        if !n.trim().is_empty() {
-            tag.insert_text(num_key, n.trim().to_string());
-        }
-        if !t.trim().is_empty() {
-            tag.insert_text(total_key, t.trim().to_string());
-        }
-    } else {
-        tag.insert_text(num_key, v.to_string());
-    }
 }
 
 #[cfg(test)]
@@ -1550,6 +2095,18 @@ mod tests {
         // Exactly one file in the dir (the renamed one), not a stale duplicate.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_refuses_names_the_filesystem_would_misread() {
+        assert!(safe_file_stem("Artist - Title").is_ok());
+        assert_eq!(safe_file_stem("  Title. . ").unwrap(), "Title");
+        for bad in ["", "  ", "..\\escape", "a/b", "what?", "con", "Lpt1", "NUL.tar"] {
+            assert!(safe_file_stem(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(safe_file_stem("Console").is_ok(), "only exact device names are reserved");
+        let long = "x".repeat(400);
+        assert_eq!(safe_file_stem(&long).unwrap().chars().count(), 200);
     }
 
     #[test]
@@ -1698,5 +2255,666 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Tag writes must not destroy what the app doesn't manage -------------
+
+    use lofty::id3::v2::{
+        BinaryFrame, CommentFrame, ExtendedTextFrame, Frame, FrameId, Id3v2Tag,
+        PopularimeterFrame, PrivateFrame,
+    };
+    use lofty::TextEncoding;
+    use std::borrow::Cow;
+
+    /// The file's ID3v2 tag, read through the format-specific API so frames the
+    /// generic `Tag` keeps out of sight (GEOB, PRIV, POPM) are visible.
+    fn id3_of(path: &str) -> Id3v2Tag {
+        let mut file = std::fs::File::open(path).unwrap();
+        let mp3 = <lofty::mpeg::MpegFile as lofty::file::AudioFile>::read_from(
+            &mut file,
+            lofty::config::ParseOptions::new(),
+        )
+        .unwrap();
+        mp3.id3v2().cloned().expect("file should carry an ID3v2 tag")
+    }
+
+    fn frames_with_id<'a>(tag: &'a Id3v2Tag, id: &str) -> Vec<&'a Frame<'static>> {
+        tag.into_iter().filter(|f| f.id().as_str() == id).collect()
+    }
+
+    /// An mp3 shaped like one from a working DJ library: Serato's GEOB data,
+    /// Traktor's PRIV block, a Rekordbox POPM rating with a play count, a
+    /// custom TXXX field, an iTunes `iTunNORM` comment ahead of the real one,
+    /// and a two-value artist.
+    fn dj_library_mp3(dir: &Path) -> String {
+        let path = dir.join("dj.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+        let mut t = Id3v2Tag::new();
+        t.set_title("Kerala".into());
+        t.set_artist("Bonobo\0Totally Enormous".into());
+        t.insert(Frame::Binary(BinaryFrame::new(
+            FrameId::Valid(Cow::Borrowed("GEOB")),
+            b"\0application/octet-stream\0\0Serato Markers2\0cue-data".to_vec(),
+        )));
+        t.insert(Frame::Private(PrivateFrame::new("TRAKTOR4".into(), vec![1, 2, 3])));
+        t.insert(Frame::Popularimeter(PopularimeterFrame::new("rekordbox".into(), 204, 7)));
+        t.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::UTF8,
+            "CUSTOMFIELD".into(),
+            "keep me".into(),
+        )));
+        t.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            "iTunNORM".into(),
+            " 00000A2B 00000B3C".into(),
+        )));
+        t.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            String::new(),
+            "Peak time".into(),
+        )));
+        t.save_to_path(&p, WriteOptions::default()).unwrap();
+        p
+    }
+
+    /// The `keepExtra` the UI sends for an ordinary edit: every raw field
+    /// outside the curated set (mirrors `preserveExtras` in useTags.ts).
+    fn ui_keep_extra(tags: &TagData) -> Vec<String> {
+        const CURATED: &[&str] = &[
+            "TrackTitle", "TrackArtist", "AlbumTitle", "AlbumArtist", "TrackNumber",
+            "TrackTotal", "DiscNumber", "DiscTotal", "Year", "RecordingDate", "Genre",
+            "Comment", "OriginalArtist", "Composer", "Popularimeter", "Unknown(TRACKID)",
+        ];
+        tags.all_fields
+            .keys()
+            .filter(|k| !CURATED.contains(&k.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_keeps_serato_traktor_rating_and_custom_frames() {
+        let dir = scratch("djframes");
+        let p = dj_library_mp3(&dir);
+
+        let tags = read_tags_impl(&p).unwrap();
+        let keep = ui_keep_extra(&tags);
+        let mut edited = tags.clone();
+        edited.title = Some("Kerala (Original Mix)".into());
+        write_tags_blocking(&p, edited, false, keep, true, None).unwrap();
+
+        let id3 = id3_of(&p);
+        assert_eq!(id3.title().as_deref(), Some("Kerala (Original Mix)"));
+        assert_eq!(frames_with_id(&id3, "GEOB").len(), 1, "Serato GEOB data was dropped");
+        assert_eq!(frames_with_id(&id3, "PRIV").len(), 1, "Traktor PRIV data was dropped");
+        let popm: Vec<_> = id3
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Popularimeter(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(popm.len(), 1, "POPM rating was dropped");
+        assert_eq!((popm[0].email.as_str(), popm[0].rating, popm[0].counter), ("rekordbox", 204, 7));
+
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(
+            back.all_fields.get("Unknown(CUSTOMFIELD)").map(String::as_str),
+            Some("keep me"),
+            "a kept custom TXXX field was dropped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unchanged_fields_are_left_as_stored() {
+        let dir = scratch("unchanged");
+        let p = dj_library_mp3(&dir);
+
+        let tags = read_tags_impl(&p).unwrap();
+        assert_eq!(tags.artist.as_deref(), Some("Bonobo"));
+        assert_eq!(
+            tags.comment.as_deref(),
+            Some("Peak time"),
+            "the plain comment, not iTunes' iTunNORM, is the one shown"
+        );
+        let keep = ui_keep_extra(&tags);
+        let mut edited = tags.clone();
+        edited.genre = Some("Downtempo".into());
+        write_tags_blocking(&p, edited, false, keep, true, None).unwrap();
+
+        let back = lofty::read_from_path(&p).unwrap();
+        let tag = back.primary_tag().unwrap();
+        let artists: Vec<_> = tag.get_strings(&ItemKey::TrackArtist).collect();
+        assert_eq!(artists, ["Bonobo", "Totally Enormous"], "second artist was lost");
+        let comments: Vec<_> = tag
+            .items()
+            .filter(|i| *i.key() == ItemKey::Comment)
+            .map(|i| (i.description().to_string(), text_of(i.value()).unwrap()))
+            .collect();
+        assert!(comments.contains(&("iTunNORM".into(), " 00000A2B 00000B3C".into())));
+        assert!(comments.contains(&(String::new(), "Peak time".into())));
+
+        // Editing the comment replaces only the plain one.
+        let tags = read_tags_impl(&p).unwrap();
+        let keep = ui_keep_extra(&tags);
+        let mut edited = tags.clone();
+        edited.comment = Some("Closing track".into());
+        write_tags_blocking(&p, edited, false, keep, true, None).unwrap();
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.comment.as_deref(), Some("Closing track"));
+        assert!(back.all_fields["Comment"].contains("00000A2B"), "iTunNORM was dropped");
+        assert!(!back.all_fields["Comment"].contains("Peak time"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stripping_removes_only_fields_left_out_of_keep_extra() {
+        let dir = scratch("strip");
+        let p = dj_library_mp3(&dir);
+
+        let tags = read_tags_impl(&p).unwrap();
+        write_tags_blocking(&p, tags, false, vec![], true, None).unwrap();
+
+        let back = read_tags_impl(&p).unwrap();
+        assert!(!back.all_fields.contains_key("Unknown(CUSTOMFIELD)"), "strip didn't strip");
+        assert_eq!(frames_with_id(&id3_of(&p), "GEOB").len(), 1, "strip took the Serato data");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mp3_popm_rating_is_read_and_rewritten_in_place() {
+        let dir = scratch("popm");
+        let p = dj_library_mp3(&dir);
+
+        let tags = read_tags_impl(&p).unwrap();
+        assert_eq!(tags.rating, Some(4), "Rekordbox's 204 is four stars");
+
+        let mut edited = tags.clone();
+        edited.rating = Some(2);
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, None).unwrap();
+        assert_eq!(read_tags_impl(&p).unwrap().rating, Some(2));
+        let id3 = id3_of(&p);
+        let popm: Vec<_> = id3
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Popularimeter(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(popm.len(), 1);
+        assert_eq!((popm[0].email.as_str(), popm[0].rating, popm[0].counter), ("rekordbox", 102, 7));
+
+        let mut cleared = read_tags_impl(&p).unwrap();
+        cleared.rating = Some(0);
+        write_tags_blocking(&p, cleared.clone(), false, ui_keep_extra(&cleared), true, None).unwrap();
+        assert_eq!(read_tags_impl(&p).unwrap().rating, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Found on a real recorder file: a COMM frame with language [0, 0, 0].
+    /// Keeping unchanged frames verbatim made lofty refuse the whole write.
+    #[test]
+    fn a_comment_with_a_null_language_does_not_block_an_edit() {
+        let dir = scratch("nulllang");
+        let path = dir.join("rec.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+        {
+            let mut t = Id3v2Tag::new();
+            t.set_title("REC".into());
+            t.insert(Frame::Comment(CommentFrame::new(
+                TextEncoding::Latin1,
+                *b"eng",
+                String::new(),
+                "recorded live".into(),
+            )));
+            t.save_to_path(&p, WriteOptions::default()).unwrap();
+        }
+        // Patch the COMM frame's language bytes to NUL, as the recorder wrote them.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let comm = bytes.windows(4).position(|w| w == b"COMM").unwrap();
+        let lang = comm + 10 + 1; // frame header, then the encoding byte
+        assert_eq!(&bytes[lang..lang + 3], b"eng");
+        bytes[lang..lang + 3].copy_from_slice(&[0, 0, 0]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let tags = read_tags_impl(&p).unwrap();
+        let mut edited = tags.clone();
+        edited.title = Some("REC (edited)".into());
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, None)
+            .expect("an invalid comment language must not fail the write");
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.title.as_deref(), Some("REC (edited)"));
+        assert_eq!(back.comment.as_deref(), Some("recorded live"), "the comment text was lost");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rating_a_bare_mp3_adds_a_popm_frame() {
+        let dir = scratch("popmnew");
+        let path = dir.join("bare.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+
+        let tags = TagData { rating: Some(5), ..TagData::default() };
+        write_tags_blocking(&p, tags, false, vec![], true, None).unwrap();
+        assert_eq!(read_tags_impl(&p).unwrap().rating, Some(5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn popm_bytes_map_to_the_star_every_player_means() {
+        // Rekordbox / Traktor scale.
+        for (byte, stars) in [(51, 1), (102, 2), (153, 3), (204, 4), (255, 5)] {
+            assert_eq!(stars_from_popm_byte(byte), stars, "rekordbox byte {byte}");
+        }
+        // Windows Media Player / MusicBee scale.
+        for (byte, stars) in [(1, 1), (64, 2), (128, 3), (196, 4), (255, 5)] {
+            assert_eq!(stars_from_popm_byte(byte), stars, "wmp byte {byte}");
+        }
+        assert_eq!(stars_from_popm_byte(0), 0);
+        assert_eq!(stars_from_popm_byte(20), 1, "a low byte is rated, not unrated");
+        for stars in 1..=5u8 {
+            assert_eq!(stars_from_popm_byte(popm_byte(stars) as u32), stars);
+        }
+    }
+
+    #[test]
+    fn text_ratings_round_trip_on_the_0_100_scale() {
+        for tag_type in [TagType::VorbisComments, TagType::Mp4Ilst, TagType::Ape] {
+            for stars in 1..=5u8 {
+                let mut tag = Tag::new(tag_type);
+                set_text_rating(&mut tag, stars);
+                assert_eq!(read_rating(&tag), Some(stars), "{tag_type:?} {stars}");
+            }
+            let mut tag = Tag::new(tag_type);
+            set_text_rating(&mut tag, 3);
+            set_text_rating(&mut tag, 0);
+            assert_eq!(read_rating(&tag), None, "{tag_type:?} clear");
+        }
+        // Other taggers' conventions.
+        assert_eq!(stars_from_text_rating("4"), Some(4));
+        assert_eq!(stars_from_text_rating("80"), Some(4));
+        assert_eq!(stars_from_text_rating("100"), Some(5));
+        assert_eq!(stars_from_text_rating("0"), None);
+        assert_eq!(stars_from_text_rating("junk"), None);
+    }
+
+    /// A FLAC file with STREAMINFO (16-bit stereo 44.1kHz), a PADDING block
+    /// and a few bytes standing in for audio frames: enough for lofty to read
+    /// and write Vorbis comments. (lofty 0.22's writer indexes past the end of
+    /// a file that stops right after its metadata, which no real FLAC does.)
+    fn minimal_flac_bytes() -> Vec<u8> {
+        let mut b = b"fLaC".to_vec();
+        b.extend_from_slice(&[0x00, 0x00, 0x00, 0x22]); // STREAMINFO, 34 bytes
+        b.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]); // min/max block size 4096
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // min/max frame size unknown
+        b.extend_from_slice(&[0x0A, 0xC4, 0x42, 0xF0, 0, 0, 0, 0]); // 44100 Hz, 2 ch, 16 bit
+        b.extend_from_slice(&[0u8; 16]); // MD5
+        b.extend_from_slice(&[0x81, 0x00, 0x00, 0x10]); // last block, PADDING, 16 bytes
+        b.extend_from_slice(&[0u8; 16]);
+        b.extend_from_slice(&[0xFF, 0xF8]); // frame sync
+        b.extend_from_slice(&[0u8; 62]);
+        b
+    }
+
+    #[test]
+    fn flac_rating_and_custom_fields_survive_edits() {
+        let dir = scratch("flac");
+        let path = dir.join("track.flac");
+        std::fs::write(&path, minimal_flac_bytes()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+        {
+            let mut tag = Tag::new(TagType::VorbisComments);
+            tag.insert_text(ItemKey::TrackTitle, "Kerala".into());
+            // Serato keeps its FLAC cue data in Vorbis comments like this one.
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown("SERATO_MARKERS_V2".into()),
+                ItemValue::Text("YXBwbGljYXRpb24v".into()),
+            ));
+            tag.save_to_path(&p, WriteOptions::default()).unwrap();
+        }
+
+        let tags = read_tags_impl(&p).unwrap();
+        let mut edited = tags.clone();
+        edited.rating = Some(4);
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, None).unwrap();
+
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.rating, Some(4), "four stars must read back as four, not two");
+        assert_eq!(
+            back.all_fields.get("Unknown(SERATO_MARKERS_V2)").map(String::as_str),
+            Some("YXBwbGljYXRpb24v"),
+            "Serato's FLAC data was dropped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn searchable_backup_fills_an_empty_field_and_never_overrides_the_user() {
+        let dir = scratch("backupfield");
+        let p = dj_library_mp3(&dir);
+
+        // Empty Composer: the searchable backup goes in, from pre-change values.
+        let tags = read_tags_impl(&p).unwrap();
+        let mut edited = tags.clone();
+        edited.title = Some("Renamed".into());
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, Some("Composer".into()))
+            .unwrap();
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.composer.as_deref(), Some("dj | | Bonobo | | Kerala | | "));
+
+        // An unrelated edit leaves the existing backup alone.
+        let mut edited = back.clone();
+        edited.title = Some("Renamed again".into());
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&back), true, Some("Composer".into()))
+            .unwrap();
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.composer.as_deref(), Some("dj | | Bonobo | | Kerala | | "));
+
+        // Clearing the backup field on purpose (Clear Fields warns first) works.
+        let mut edited = back.clone();
+        edited.composer = None;
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&back), true, Some("Composer".into()))
+            .unwrap();
+        assert_eq!(read_tags_impl(&p).unwrap().composer, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_existing_snapshot_survives_a_write_that_did_not_ask_for_one() {
+        let dir = scratch("keepsnapshot");
+        let p = dj_library_mp3(&dir);
+
+        let tags = read_tags_impl(&p).unwrap();
+        write_tags_blocking(&p, tags.clone(), true, ui_keep_extra(&tags), true, None).unwrap();
+        let tags = read_tags_impl(&p).unwrap();
+        let mut edited = tags.clone();
+        edited.title = Some("Changed".into());
+        write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, None).unwrap();
+
+        let tagged = lofty::read_from_path(&p).unwrap();
+        assert!(find_backup_in_file(&tagged).is_some(), "the original snapshot was deleted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_brings_back_custom_fields_and_keeps_dj_frames() {
+        let dir = scratch("restore");
+        let p = dj_library_mp3(&dir);
+        let mut seeded = read_tags_impl(&p).unwrap();
+        seeded.track_id = Some("000042".into());
+        write_tags_blocking(&p, seeded.clone(), false, ui_keep_extra(&seeded), true, None)
+            .unwrap();
+
+        // Snapshot, then wreck the tags.
+        let tags = read_tags_impl(&p).unwrap();
+        let mut wrecked = tags.clone();
+        wrecked.title = Some("WRONG".into());
+        wrecked.track_id = None;
+        write_tags_blocking(&p, wrecked, true, vec![], true, None).unwrap();
+        assert!(!read_tags_impl(&p).unwrap().all_fields.contains_key("Unknown(CUSTOMFIELD)"));
+
+        crate::commands::backup::restore_from_backup_blocking(&p).unwrap();
+
+        let back = read_tags_impl(&p).unwrap();
+        assert_eq!(back.title.as_deref(), Some("Kerala"));
+        assert_eq!(back.track_id.as_deref(), Some("000042"), "Track ID lost on restore");
+        assert_eq!(
+            back.all_fields.get("Unknown(CUSTOMFIELD)").map(String::as_str),
+            Some("keep me"),
+            "custom field lost on restore"
+        );
+        let id3 = id3_of(&p);
+        assert_eq!(frames_with_id(&id3, "GEOB").len(), 1, "restore took the Serato data");
+        assert_eq!(back.rating, Some(4), "restore took the rating");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn par_map_keeps_order_and_isolates_a_panicking_item() {
+        let items: Vec<u32> = (0..500).collect();
+        let out = par_map(
+            &items,
+            |n| {
+                if *n == 137 {
+                    panic!("simulated parser crash");
+                }
+                n * 2
+            },
+            |_| u32::MAX,
+        );
+        assert_eq!(out.len(), items.len(), "a panic must not shorten the batch");
+        for (i, v) in out.iter().enumerate() {
+            let expected = if i == 137 { u32::MAX } else { i as u32 * 2 };
+            assert_eq!(*v, expected, "item {i}");
+        }
+    }
+
+    #[test]
+    fn item_key_names_round_trip() {
+        const NAMES: &[&str] = &[
+        "AlbumTitle",
+        "SetSubtitle",
+        "ShowName",
+        "ContentGroup",
+        "TrackTitle",
+        "TrackSubtitle",
+        "OriginalAlbumTitle",
+        "OriginalArtist",
+        "OriginalLyricist",
+        "AlbumTitleSortOrder",
+        "AlbumArtistSortOrder",
+        "TrackTitleSortOrder",
+        "TrackArtistSortOrder",
+        "ShowNameSortOrder",
+        "ComposerSortOrder",
+        "AlbumArtist",
+        "TrackArtist",
+        "TrackArtists",
+        "Arranger",
+        "Writer",
+        "Composer",
+        "Conductor",
+        "Director",
+        "Engineer",
+        "Lyricist",
+        "MixDj",
+        "MixEngineer",
+        "MusicianCredits",
+        "Performer",
+        "Producer",
+        "Publisher",
+        "Label",
+        "InternetRadioStationName",
+        "InternetRadioStationOwner",
+        "Remixer",
+        "DiscNumber",
+        "DiscTotal",
+        "TrackNumber",
+        "TrackTotal",
+        "Popularimeter",
+        "ParentalAdvisory",
+        "RecordingDate",
+        "Year",
+        "ReleaseDate",
+        "OriginalReleaseDate",
+        "Isrc",
+        "Barcode",
+        "CatalogNumber",
+        "Work",
+        "Movement",
+        "MovementNumber",
+        "MovementTotal",
+        "MusicBrainzRecordingId",
+        "MusicBrainzTrackId",
+        "MusicBrainzReleaseId",
+        "MusicBrainzReleaseGroupId",
+        "MusicBrainzArtistId",
+        "MusicBrainzReleaseArtistId",
+        "MusicBrainzWorkId",
+        "FlagCompilation",
+        "FlagPodcast",
+        "FileType",
+        "FileOwner",
+        "TaggingTime",
+        "Length",
+        "OriginalFileName",
+        "OriginalMediaType",
+        "EncodedBy",
+        "EncoderSoftware",
+        "EncoderSettings",
+        "EncodingTime",
+        "ReplayGainAlbumGain",
+        "ReplayGainAlbumPeak",
+        "ReplayGainTrackGain",
+        "ReplayGainTrackPeak",
+        "AudioFileUrl",
+        "AudioSourceUrl",
+        "CommercialInformationUrl",
+        "CopyrightUrl",
+        "TrackArtistUrl",
+        "RadioStationUrl",
+        "PaymentUrl",
+        "PublisherUrl",
+        "Genre",
+        "InitialKey",
+        "Color",
+        "Mood",
+        "Bpm",
+        "IntegerBpm",
+        "CopyrightMessage",
+        "License",
+        "PodcastDescription",
+        "PodcastSeriesCategory",
+        "PodcastUrl",
+        "PodcastGlobalUniqueId",
+        "PodcastKeywords",
+        "Comment",
+        "Description",
+        "Language",
+        "Script",
+        "Lyrics",
+        "AppleXid",
+        "AppleId3v2ContentGroup",
+        ];
+        for name in NAMES {
+            let key = item_key_from_name(name).unwrap_or_else(|| panic!("no key for {name}"));
+            assert_eq!(key_name(&key), *name);
+        }
+        assert_eq!(
+            item_key_from_name("Unknown(SERATO_MARKERS_V2)"),
+            Some(ItemKey::Unknown("SERATO_MARKERS_V2".into()))
+        );
+        assert_eq!(item_key_from_name("NotAKey"), None);
+    }
+
+    #[test]
+    fn undoing_a_raw_field_removal_recreates_it() {
+        let dir = scratch("rawundo");
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, minimal_mp3_bytes()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+        {
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.insert_text(ItemKey::TrackTitle, "Kerala".into());
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown("CUSTOMFIELD".into()),
+                ItemValue::Text("v1".into()),
+            ));
+            tag.insert_text(ItemKey::IntegerBpm, "122".into());
+            tag.save_to_path(&p, WriteOptions::default()).unwrap();
+        }
+        for (field, value) in [("Unknown(CUSTOMFIELD)", "v1"), ("IntegerBpm", "122")] {
+            write_raw_field_blocking(&p, field, "").unwrap();
+            assert!(!read_tags_impl(&p).unwrap().all_fields.contains_key(field), "{field} not removed");
+            write_raw_field_blocking(&p, field, value).unwrap();
+            assert_eq!(
+                read_tags_impl(&p).unwrap().all_fields.get(field).map(String::as_str),
+                Some(value),
+                "{field} not recreated"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Opt-in check of the tag writer against real files: copies up to
+    /// `MTC_TEST_LIMIT` (default 200) mp3s from `MTC_TEST_DIR` to a scratch
+    /// folder, edits each copy's title the way the UI does, and asserts every
+    /// other ID3v2 frame survived. The originals are only ever read.
+    ///   MTC_TEST_DIR="C:\Users\...\Music\Collection" cargo test real_library_write -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_library_write_preserves_every_frame() {
+        let dir = std::env::var("MTC_TEST_DIR").expect("set MTC_TEST_DIR");
+        let limit: usize = std::env::var("MTC_TEST_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        let scratch_dir = scratch("real-write");
+        let sources: Vec<std::path::PathBuf> = audio_files_under(Path::new(&dir), true)
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")))
+            .take(limit)
+            .collect();
+        let (mut checked, mut with_geob, mut with_priv, mut with_popm, mut rated) = (0, 0, 0, 0, 0);
+        let mut write_errors: Vec<String> = Vec::new();
+        for (i, src) in sources.iter().enumerate() {
+            let copy = scratch_dir.join(format!("{i}.mp3"));
+            std::fs::copy(src, &copy).unwrap();
+            let p = copy.to_str().unwrap().to_string();
+            let Ok(tags) = read_tags_impl(&p) else { continue };
+            let frame_ids = |path: &str| -> Vec<String> {
+                let mut ids: Vec<String> =
+                    id3_of(path).into_iter().map(|f| f.id().as_str().to_string()).collect();
+                ids.sort();
+                ids
+            };
+            let mut file = std::fs::File::open(&p).unwrap();
+            let has_id3 = <lofty::mpeg::MpegFile as lofty::file::AudioFile>::read_from(
+                &mut file,
+                lofty::config::ParseOptions::new(),
+            )
+            .map(|m| m.id3v2().is_some())
+            .unwrap_or(false);
+            drop(file);
+            if !has_id3 {
+                continue;
+            }
+            let before = frame_ids(&p);
+            with_geob += before.iter().any(|f| f == "GEOB") as usize;
+            with_priv += before.iter().any(|f| f == "PRIV") as usize;
+            with_popm += before.iter().any(|f| f == "POPM") as usize;
+            rated += tags.rating.is_some() as usize;
+
+            let mut edited = tags.clone();
+            edited.title = Some(format!("{} (edited)", tags.title.clone().unwrap_or_default()));
+            if let Err(e) = write_tags_blocking(&p, edited, false, ui_keep_extra(&tags), true, None) {
+                write_errors.push(format!("{}: {e}", src.display()));
+                continue;
+            }
+
+            let mut after = frame_ids(&p);
+            // The edit itself may add a TIT2 where there was none.
+            if !before.contains(&"TIT2".to_string()) {
+                after.retain(|f| f != "TIT2");
+            }
+            assert_eq!(before, after, "frames changed for {}", src.display());
+            let back = read_tags_impl(&p).unwrap();
+            assert_eq!(back.rating, tags.rating, "rating changed for {}", src.display());
+            assert_eq!(back.artist, tags.artist, "artist changed for {}", src.display());
+            assert_eq!(back.comment, tags.comment, "comment changed for {}", src.display());
+            checked += 1;
+        }
+        println!(
+            "checked {checked} real mp3s: {with_geob} with GEOB (Serato), {with_priv} with PRIV, \
+             {with_popm} with POPM, {rated} rated — every frame preserved"
+        );
+        for e in write_errors.iter().take(20) {
+            println!("WRITE ERROR {e}");
+        }
+        println!("{} write error(s)", write_errors.len());
+        assert!(checked > 0, "no mp3s with ID3v2 found under {dir}");
+        std::fs::remove_dir_all(&scratch_dir).ok();
     }
 }

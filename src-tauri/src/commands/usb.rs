@@ -457,7 +457,9 @@ pub struct SectorAligned<T> {
 const WRITE_BUFFER: usize = 1024 * 1024;
 
 impl<T: Read + Write + Seek> SectorAligned<T> {
-    /// For anything whose length seeking can discover — a file-backed image.
+    /// For anything whose length seeking can discover — a file-backed image
+    /// (the tests' stand-in for a USB stick).
+    #[cfg(test)]
     pub fn new(mut inner: T) -> io::Result<Self> {
         let len = inner.seek(SeekFrom::End(0))?;
         inner.seek(SeekFrom::Start(0))?;
@@ -628,6 +630,7 @@ impl<T: Read + Write + Seek> Seek for SectorAligned<T> {
 /// Split from all the Windows volume handling so it can be tested against a
 /// file-backed image instead of a real disk — the formatting logic is the part
 /// that has to be right, and it should never need a USB stick to verify.
+#[cfg(test)]
 pub fn format_fat32_into<T: Read + Write + Seek>(device: T, label: &str) -> Result<(), String> {
     let dev = SectorAligned::new(device).map_err(|e| format!("Device not readable: {e}"))?;
     format_fat32_prepared(dev, label)

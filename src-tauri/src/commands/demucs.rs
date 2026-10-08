@@ -20,7 +20,7 @@
 //! (frequently not on Windows, and never for a `--user` install), while
 //! `-m` works whenever the package is importable at all.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -188,6 +188,38 @@ fn emit_line(app: &AppHandle, event: &str, phase: &str, line: &str) {
     );
 }
 
+/// Calls `f` with each non-empty segment of `reader`'s output, split on `\n`
+/// *and* `\r`. Progress bars (tqdm in demucs and pip) redraw in place with a
+/// bare carriage return and only print `\n` when finished, so splitting on
+/// newlines alone delivered no progress at all until a bar completed — a
+/// whole separation's worth of silence.
+fn for_each_segment(reader: impl Read, mut f: impl FnMut(String)) {
+    let mut reader = BufReader::new(reader);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &b in &buf[..n] {
+            if b == b'\n' || b == b'\r' {
+                let line = String::from_utf8_lossy(&pending).trim_end().to_string();
+                pending.clear();
+                if !line.trim().is_empty() {
+                    f(line);
+                }
+            } else {
+                pending.push(b);
+            }
+        }
+    }
+    let line = String::from_utf8_lossy(&pending).trim_end().to_string();
+    if !line.trim().is_empty() {
+        f(line);
+    }
+}
+
 /// Streams a child's stdout+stderr line by line into `event`.
 ///
 /// pip and demucs both report progress on stderr and can run for many
@@ -212,19 +244,17 @@ fn run_streaming(
             let event = event.to_string();
             let phase = phase.to_string();
             s.spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    emit_line(&app, &event, &phase, &line);
-                }
+                for_each_segment(out, |line| emit_line(&app, &event, &phase, &line));
             });
         }
         if let Some(err) = stderr {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
+            for_each_segment(err, |line| {
                 emit_line(app, event, phase, &line);
                 tail.push(line);
                 if tail.len() > 20 {
                     tail.remove(0);
                 }
-            }
+            });
         }
     });
 
@@ -457,6 +487,17 @@ mod tests {
             jobs: 1,
             output_dir: String::new(),
         }
+    }
+
+    #[test]
+    fn progress_bars_redrawn_with_carriage_returns_arrive_as_separate_lines() {
+        let out = b" 10%|#   | 1/10\r 50%|#####   | 5/10\r100%|##########| 10/10\nDone\r\n";
+        let mut seen = Vec::new();
+        for_each_segment(&out[..], |l| seen.push(l));
+        assert_eq!(
+            seen,
+            [" 10%|#   | 1/10", " 50%|#####   | 5/10", "100%|##########| 10/10", "Done"]
+        );
     }
 
     #[test]

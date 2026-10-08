@@ -77,10 +77,17 @@ pub async fn restore_from_backup(path: String) -> Result<(), String> {
 pub async fn restore_from_backup_batch(paths: Vec<String>) -> Vec<crate::models::WriteResult> {
     let fallback = paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::commands::files::par_map(&paths, |p| crate::models::WriteResult {
-            path: p.clone(),
-            error: restore_from_backup_blocking(p).err(),
-        })
+        crate::commands::files::par_map(
+            &paths,
+            |p| crate::models::WriteResult {
+                path: p.clone(),
+                error: restore_from_backup_blocking(p).err(),
+            },
+            |p| crate::models::WriteResult {
+                path: p.clone(),
+                error: Some(crate::commands::files::CRASHED.to_string()),
+            },
+        )
     })
     .await
     .unwrap_or_else(|_| {
@@ -94,33 +101,42 @@ pub async fn restore_from_backup_batch(paths: Vec<String>) -> Vec<crate::models:
     })
 }
 
-fn restore_from_backup_blocking(path: &str) -> Result<(), String> {
-    let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+pub(crate) fn restore_from_backup_blocking(path: &str) -> Result<(), String> {
+    let mut tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let backup =
         find_backup_in_file(&tagged).ok_or_else(|| "No backup found in this file".to_string())?;
     let json = &backup[BACKUP_PREFIX.len()..];
     let data: BackupData =
         serde_json::from_str(json).map_err(|e| format!("Backup is corrupted: {e}"))?;
 
-    let tag_type = tagged
-        .primary_tag()
-        .map(|t| t.tag_type())
-        .or_else(|| tagged.first_tag().map(|t| t.tag_type()))
-        .unwrap_or_else(|| tagged.file_type().primary_tag_type());
+    // The snapshot's keys are native names for the format's canonical tag
+    // (`make_backup_string` is always called with it), so they must be read
+    // back against that same type.
+    let tag_type = tagged.file_type().primary_tag_type();
 
-    let mut restored = Tag::new(tag_type);
-    for item in data.items {
-        let key = ItemKey::from_key(tag_type, &item.key);
-        restored.push(TagItem::new(key, ItemValue::Text(item.value)));
-    }
-    // Cover art is preserved through strip/clean, so carry the current
-    // pictures over rather than losing them on restore.
-    if let Some(current) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-        for pic in current.pictures() {
-            restored.push_picture(pic.clone());
-        }
-    }
+    // Rebuilt on the file's current tag rather than a blank one: that keeps
+    // the cover art, any binary items, and the format-specific frames lofty
+    // holds outside the generic API (Serato's GEOB cue/beatgrid data,
+    // Traktor's PRIV block, POPM ratings) — none of which the snapshot holds,
+    // and all of which a blank tag silently dropped. Only the text fields are
+    // replaced by the snapshot's.
+    let mut restored = tagged.remove(tag_type).unwrap_or_else(|| Tag::new(tag_type));
     drop(tagged);
+    restored.retain(|item| matches!(item.value(), ItemValue::Binary(_)));
+    for item in data.items {
+        // Unchecked: a checked push drops every `ItemKey::Unknown`, which lost
+        // each custom field in the snapshot — the private Track ID included.
+        restored.push_unchecked(TagItem::new(
+            ItemKey::from_key(tag_type, &item.key),
+            ItemValue::Text(item.value),
+        ));
+    }
+    // Keep the snapshot itself, so a restore is repeatable and never leaves
+    // the file without its original state on record.
+    restored.insert_unchecked(TagItem::new(
+        ItemKey::Unknown(BACKUP_KEY.to_string()),
+        ItemValue::Text(backup),
+    ));
     restored
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| e.to_string())

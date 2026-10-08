@@ -17,23 +17,32 @@
 //! will be — it has to work from `title` and `duration` alone.
 
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Global cancel switch for `enrich_ytmusic_entries` — the owner may fetch a
-/// different playlist while one enrichment run is still in flight, and there
-/// is only ever one such run worth continuing.
+/// Generation counter for `enrich_ytmusic_entries` — the owner may fetch a
+/// different playlist while one enrichment run is still in flight, and only
+/// the newest run is worth continuing. Each run takes the next generation and
+/// its workers stop as soon as the counter moves past it (a new run started,
+/// or `cancel_ytmusic_enrich` was called).
+///
+/// It used to be a bool that every new run reset to `false`, which un-cancelled
+/// the run it was meant to replace: the old workers kept fetching and emitting
+/// into the new playlist's view.
 #[derive(Default)]
-pub struct EnrichCancelFlag(pub Arc<AtomicBool>);
+pub struct EnrichCancelFlag(pub Arc<AtomicU64>);
+
+/// Seconds yt-dlp waits on a silent socket before giving up. Without it a
+/// stalled request hangs its worker indefinitely.
+const YTDLP_SOCKET_TIMEOUT: &str = "20";
 
 #[cfg(target_os = "windows")]
 const YTDLP_EXE: &str = "yt-dlp.exe";
@@ -141,15 +150,9 @@ fn find_ytdlp(app: &AppHandle) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let p = dir.join(YTDLP_EXE);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    // Shared with FFmpeg's lookup, which also covers Homebrew on macOS — a
+    // `brew install yt-dlp` was invisible to an app launched from the Dock.
+    crate::commands::ffmpeg::on_path(YTDLP_EXE)
 }
 
 fn ytdlp_version(exe: &PathBuf) -> Option<String> {
@@ -208,31 +211,14 @@ pub async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
         .to_path_buf();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut resp = client
-        .get(YTDLP_ASSET_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Download failed: HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
-    let mut downloaded: u64 = 0;
-    let mut last_emitted: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Download failed: {e}"))? {
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        if downloaded - last_emitted >= 256 * 1024 {
-            last_emitted = downloaded;
-            emit_install_progress(&app, "downloading", downloaded, total);
-        }
-    }
-    drop(file);
+    let client = crate::commands::download::client()?;
+    let downloaded = crate::commands::download::download_to_file(
+        &client,
+        YTDLP_ASSET_URL,
+        &dest,
+        |done, total| emit_install_progress(&app, "downloading", done, total),
+    )
+    .await?;
 
     #[cfg(unix)]
     {
@@ -242,7 +228,7 @@ pub async fn install_ytdlp(app: AppHandle) -> Result<(), String> {
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
 
-    emit_install_progress(&app, "done", downloaded, total.max(downloaded));
+    emit_install_progress(&app, "done", downloaded, downloaded);
     Ok(())
 }
 
@@ -404,7 +390,15 @@ fn parse_video_json(raw: &str, video_id: &str) -> EntryMeta {
 fn fetch_one_video_meta(exe: &PathBuf, video_id: &str) -> EntryMeta {
     let url = format!("https://music.youtube.com/watch?v={video_id}");
     let mut cmd = Command::new(exe);
-    cmd.args(["-j", "--skip-download", "--no-warnings", "--no-playlist", &url]);
+    cmd.args([
+        "-j",
+        "--skip-download",
+        "--no-warnings",
+        "--no-playlist",
+        "--socket-timeout",
+        YTDLP_SOCKET_TIMEOUT,
+        &url,
+    ]);
     hide_console(&mut cmd);
     let output = match cmd.output() {
         Ok(o) => o,
@@ -477,8 +471,9 @@ pub async fn enrich_ytmusic_entries(
     cancel: tauri::State<'_, EnrichCancelFlag>,
     video_ids: Vec<String>,
 ) -> Result<(), String> {
-    cancel.0.store(false, Ordering::SeqCst);
-    let cancel_flag = Arc::clone(&cancel.0);
+    let generation = Arc::clone(&cancel.0);
+    let run = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let superseded = move || generation.load(Ordering::SeqCst) != run;
 
     let to_fetch = tauri::async_runtime::spawn_blocking({
         let app = app.clone();
@@ -500,7 +495,7 @@ pub async fn enrich_ytmusic_entries(
     .map_err(|_| "Cache lookup task panicked".to_string())??;
 
     let total = to_fetch.len();
-    if total == 0 || cancel_flag.load(Ordering::SeqCst) {
+    if total == 0 || superseded() {
         return Ok(());
     }
 
@@ -520,24 +515,36 @@ pub async fn enrich_ytmusic_entries(
             for _ in 0..4 {
                 let queue = Arc::clone(&queue);
                 let done = Arc::clone(&done);
-                let cancel_flag = Arc::clone(&cancel_flag);
+                let superseded = superseded.clone();
                 let app = app.clone();
                 let exe = exe.clone();
-                scope.spawn(move || loop {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let id = queue.lock().unwrap().pop_front();
-                    let Some(id) = id else { break };
-                    let meta = fetch_one_video_meta(&exe, &id);
-                    if meta.error.is_none() {
-                        if let Ok(conn) = crate::commands::library_index::open_db(&app) {
-                            let _ = cache_meta(&conn, &meta);
+                scope.spawn(move || {
+                    // One connection per worker, not one per video.
+                    let conn = crate::commands::library_index::open_db(&app).ok();
+                    loop {
+                        if superseded() {
+                            break;
                         }
+                        let id = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                        let Some(id) = id else { break };
+                        let meta = fetch_one_video_meta(&exe, &id);
+                        if meta.error.is_none() {
+                            if let Some(conn) = conn.as_ref() {
+                                let _ = cache_meta(conn, &meta);
+                            }
+                        }
+                        // A run replaced while this video was in flight must
+                        // not paint its result into the newer playlist's view.
+                        if superseded() {
+                            break;
+                        }
+                        let _ = app.emit("ytmusic-entry-meta", &meta);
+                        let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = app.emit(
+                            "ytmusic-enrich-progress",
+                            serde_json::json!({ "done": n, "total": total }),
+                        );
                     }
-                    let _ = app.emit("ytmusic-entry-meta", &meta);
-                    let n = done.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = app.emit("ytmusic-enrich-progress", serde_json::json!({ "done": n, "total": total }));
                 });
             }
         });
@@ -553,7 +560,7 @@ pub async fn enrich_ytmusic_entries(
 /// letting a stale run keep emitting into the new one.
 #[tauri::command]
 pub fn cancel_ytmusic_enrich(cancel: tauri::State<'_, EnrichCancelFlag>) {
-    cancel.0.store(true, Ordering::SeqCst);
+    cancel.0.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Fetches a playlist's track list — title, duration, video id — via one
@@ -574,7 +581,15 @@ pub async fn fetch_ytmusic_playlist(app: AppHandle, url: String) -> Result<Playl
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         let mut cmd = Command::new(&exe);
-        cmd.args(["-J", "--flat-playlist", "--no-warnings", "--ignore-errors", &url]);
+        cmd.args([
+            "-J",
+            "--flat-playlist",
+            "--no-warnings",
+            "--ignore-errors",
+            "--socket-timeout",
+            YTDLP_SOCKET_TIMEOUT,
+            &url,
+        ]);
         hide_console(&mut cmd);
         cmd.output()
     })

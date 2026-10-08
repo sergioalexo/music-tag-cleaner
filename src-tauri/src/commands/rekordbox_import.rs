@@ -17,7 +17,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use super::duplicates::{get_or_compute, open_db};
+use super::duplicates::{fingerprint_many, get_or_compute, open_db};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,13 +84,19 @@ pub struct ImportResult {
 /// Decodes `%XX` percent-escapes (the only encoding rekordbox.xml's
 /// `file://` URIs use) without pulling in a full URL-parsing crate for it.
 fn percent_decode(s: &str) -> String {
+    // Works on bytes throughout: slicing the `&str` to read the two hex
+    // digits panicked when a literal '%' was followed by a multi-byte
+    // character ("100%é"), since that slice ends mid-character.
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -101,14 +107,22 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `file://localhost/C:/Users/x/Music/song.flac` -> `C:\Users\x\Music\song.flac`.
+/// A rekordbox.xml `Location` URI as a native path:
+/// `file://localhost/C:/Users/x/song.flac` -> `C:\Users\x\song.flac` on
+/// Windows, `file://localhost/Users/x/song.flac` -> `/Users/x/song.flac` on
+/// macOS. (Converting to backslashes unconditionally broke every macOS
+/// import: no path it produced could exist.)
 fn location_to_path(location: &str) -> String {
-    let stripped = location
-        .strip_prefix("file://localhost/")
-        .or_else(|| location.strip_prefix("file:///"))
+    let rest = location
+        .strip_prefix("file://localhost")
         .or_else(|| location.strip_prefix("file://"))
         .unwrap_or(location);
-    percent_decode(stripped).replace('/', "\\")
+    let decoded = percent_decode(rest);
+    if cfg!(windows) {
+        decoded.trim_start_matches('/').replace('/', "\\")
+    } else {
+        decoded
+    }
 }
 
 // `unescape_value()`'s replacement (`normalized_value`) takes an XML version
@@ -521,31 +535,37 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize) {
 
 fn import_rekordbox_cues_blocking(app: &AppHandle, xml_path: &str) -> Result<ImportResult, String> {
     let tracks = parse_rekordbox_xml(xml_path)?;
-    let conn = open_db(app)?;
+    let mut conn = open_db(app)?;
     conn.execute_batch(CUES_SCHEMA_SQL).map_err(|e| e.to_string())?;
 
     let total = tracks.len();
-    let mut matched = 0;
-    let mut not_found = 0;
-    let mut errors = Vec::new();
+    let (present, missing): (Vec<_>, Vec<_>) =
+        tracks.iter().partition(|t| Path::new(&t.location).is_file());
+    let not_found = missing.len();
 
-    for (i, track) in tracks.iter().enumerate() {
-        if !Path::new(&track.location).is_file() {
-            not_found += 1;
-            emit_progress(app, i + 1, total);
-            continue;
-        }
-        match get_or_compute(&conn, &track.location) {
+    // Fingerprinting is the slow part (decode + FFT per track); it runs in
+    // parallel with cache reuse, and the cue rows go in as one transaction
+    // instead of one implicit transaction — and fsync — per track.
+    let locations: Vec<String> = present.iter().map(|t| t.location.clone()).collect();
+    let fingerprints = fingerprint_many(&mut conn, &locations, |done, _| {
+        emit_progress(app, not_found + done, total)
+    });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut matched = 0;
+    let mut errors = Vec::new();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (track, fp) in present.iter().zip(fingerprints) {
+        match fp {
             Ok(fp) => {
                 let key = fingerprint_key(&fp.fingerprint);
                 let mut data = track.cues.clone();
                 data.average_bpm = track.average_bpm;
                 let data_json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                conn.execute(
+                tx.execute(
                     "INSERT INTO cues (fingerprint_key, source_path, data, imported_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(fingerprint_key) DO UPDATE SET
@@ -557,8 +577,9 @@ fn import_rekordbox_cues_blocking(app: &AppHandle, xml_path: &str) -> Result<Imp
             }
             Err(e) => errors.push(format!("{}: {e}", track.location)),
         }
-        emit_progress(app, i + 1, total);
     }
+    tx.commit().map_err(|e| e.to_string())?;
+    emit_progress(app, total, total);
 
     Ok(ImportResult { total_entries: total, matched, not_found_on_disk: not_found, errors })
 }
@@ -617,8 +638,13 @@ pub struct RekordboxTagSummary {
 /// Windows paths differ only by case between Rekordbox's export and the
 /// app's own `canonicalize`/`WalkDir` reads often enough that an exact match
 /// would silently miss real tracks.
+///
+/// ASCII-only on purpose: the other side of the join is SQLite's `LOWER()`,
+/// which folds only A-Z. A Unicode `to_lowercase` here turned "C:\Музыка\..."
+/// or "...\Énergie.mp3" into a key `LOWER(path)` can never produce, so every
+/// track with a non-ASCII capital in its path silently lost its BPM and key.
 fn normalize_path_for_join(path: &str) -> String {
-    path.to_lowercase()
+    path.to_ascii_lowercase()
 }
 
 fn import_rekordbox_library_tags_blocking(
@@ -733,6 +759,18 @@ mod tests {
         assert_eq!(normalize_path_for_join(r"C:\Music\Song.flac"), r"c:\music\song.flac");
     }
 
+    /// The stored key must equal what SQLite's `LOWER()` makes of the library
+    /// path, or the join in `library_tracks` never matches.
+    #[test]
+    fn join_key_matches_sqlite_lower_for_non_ascii_paths() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for path in [r"C:\Музыка\Трек.mp3", r"C:\Music\Énergie Über.flac", r"C:\Music\Plain.mp3"] {
+            let sqlite: String =
+                conn.query_row("SELECT LOWER(?1)", [path], |r| r.get(0)).unwrap();
+            assert_eq!(normalize_path_for_join(path), sqlite, "{path}");
+        }
+    }
+
     #[test]
     fn parses_tonality_from_a_track_attribute() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -758,18 +796,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(windows)]
     #[test]
     fn location_to_path_decodes_percent_escapes_and_strips_file_uri() {
         assert_eq!(
             location_to_path("file://localhost/C:/Users/x/Music/A-Trak,%20Ferreck%20Dawn.flac"),
             r"C:\Users\x\Music\A-Trak, Ferreck Dawn.flac"
         );
+        assert_eq!(location_to_path("file:///C:/Music/a.mp3"), r"C:\Music\a.mp3");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn location_to_path_keeps_a_unix_path_absolute() {
+        assert_eq!(
+            location_to_path("file://localhost/Users/x/Music/A%20B.flac"),
+            "/Users/x/Music/A B.flac"
+        );
     }
 
     #[test]
     fn location_to_path_decodes_multibyte_utf8_percent_escapes() {
         // "é" as it appears in a real rekordbox.xml export (Dajaé).
-        assert_eq!(location_to_path("file://localhost/Daja%c3%a9.flac"), "Dajaé.flac");
+        assert!(location_to_path("file://localhost/Daja%c3%a9.flac").ends_with("Dajaé.flac"));
+    }
+
+    #[test]
+    fn percent_decode_leaves_a_stray_percent_before_multibyte_text_alone() {
+        assert_eq!(percent_decode("100%é mix"), "100%é mix");
+        assert_eq!(percent_decode("50%"), "50%");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
     }
 
     #[test]

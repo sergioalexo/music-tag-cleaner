@@ -110,7 +110,15 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize) {
 #[tauri::command]
 pub async fn create_backup_archive(app: AppHandle, paths: Vec<String>, dest_path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_backup_archive_core(&paths, &dest_path, |done, total| emit_progress(&app, done, total))
+        let result =
+            create_backup_archive_core(&paths, &dest_path, |done, total| emit_progress(&app, done, total));
+        // A failed run (an unreadable track, a full disk) leaves a truncated
+        // zip with no central directory — unopenable, but easy to mistake for
+        // a good backup later. Remove it.
+        if result.is_err() {
+            let _ = std::fs::remove_file(&dest_path);
+        }
+        result
     })
     .await
     .map_err(|_| "backup archive task panicked".to_string())?

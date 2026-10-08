@@ -163,8 +163,17 @@ fn convert_one(
     // Copy the source's tags (incl. the private Track ID frame) onto the new
     // file. A failure here doesn't invalidate the conversion — report it as a
     // warning but keep the produced file.
+    //
+    // FFmpeg's `-map_metadata 0` has already carried the source's fields
+    // across, so they are all kept: an empty keep-list here stripped the BPM,
+    // key, label, ISRC and the rest from every converted file.
     let tag_warning = match read_tags_impl(src_str) {
-        Ok(tags) => write_tags_blocking(&dst_str, tags, false, Vec::new(), true, None).err(),
+        Ok(tags) => {
+            let keep = read_tags_impl(&dst_str)
+                .map(|t| crate::commands::files::extra_field_keys(&t))
+                .unwrap_or_default();
+            write_tags_blocking(&dst_str, tags, false, keep, true, None).err()
+        }
         Err(e) => Some(format!("could not read source tags: {e}")),
     };
 

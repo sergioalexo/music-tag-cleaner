@@ -11,10 +11,8 @@
 //! package manager (`brew install ffmpeg`, `apt install ffmpeg`, …) and it's
 //! picked up off `PATH` automatically.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -62,7 +60,9 @@ fn managed_path(app: &AppHandle, exe: &str) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-fn on_path(exe: &str) -> Option<PathBuf> {
+/// `exe` on `PATH` — or, on macOS, in Homebrew's prefixes, which a GUI app
+/// launched from Finder/Dock doesn't have on its `PATH`.
+pub(crate) fn on_path(exe: &str) -> Option<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let p = dir.join(exe);
@@ -183,11 +183,9 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
     let dir = bin_dir(&app).ok_or_else(|| "Could not resolve the app data directory".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::builder()
-        .user_agent("music-tag-cleaner")
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Carries the User-Agent the GitHub API requires, plus connect and read
+    // timeouts so a stalled download can't hang the install forever.
+    let client = crate::commands::download::client()?;
 
     let release: GhRelease = client
         .get(format!("https://api.github.com/repos/{FFMPEG_REPO}/releases/latest"))
@@ -214,29 +212,15 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
         .ok_or("No win64-gpl FFmpeg build found in the latest release")?;
 
     let zip_path = dir.join("ffmpeg-download.zip");
-    let mut resp = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Download failed: HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
-    let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
-    let mut downloaded: u64 = 0;
-    let mut last_emitted: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Download failed: {e}"))? {
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        if downloaded - last_emitted >= 512 * 1024 {
-            last_emitted = downloaded;
-            emit_install_progress(&app, "downloading", downloaded, total);
-        }
-    }
-    drop(file);
+    let downloaded = crate::commands::download::download_to_file(
+        &client,
+        &asset.browser_download_url,
+        &zip_path,
+        |done, total| emit_install_progress(&app, "downloading", done, total),
+    )
+    .await?;
 
-    emit_install_progress(&app, "extracting", downloaded, total.max(downloaded));
+    emit_install_progress(&app, "extracting", downloaded, downloaded);
     let dir2 = dir.clone();
     let zip2 = zip_path.clone();
     tauri::async_runtime::spawn_blocking(move || extract_ffmpeg(&zip2, &dir2))
@@ -245,7 +229,7 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<(), String> {
     let _ = std::fs::remove_file(&zip_path);
     std::fs::write(dir.join("ffmpeg.tag"), &release.tag_name).map_err(|e| e.to_string())?;
 
-    emit_install_progress(&app, "done", downloaded, total.max(downloaded));
+    emit_install_progress(&app, "done", downloaded, downloaded);
     Ok(())
 }
 
@@ -271,9 +255,19 @@ fn extract_ffmpeg(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         let Some(out_name) = wanted_zip_entry(entry.name()) else {
             continue;
         };
+        // Extracted beside the target and renamed into place, so a failed or
+        // interrupted extraction never leaves a half-written ffmpeg.exe that
+        // `find_ffmpeg` would then report as installed.
         let out_path = dest_dir.join(out_name);
-        let mut out = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        let tmp_path = dest_dir.join(format!("{out_name}.part"));
+        let mut out = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+        if let Err(e) = std::io::copy(&mut entry, &mut out) {
+            drop(out);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
+        drop(out);
+        std::fs::rename(&tmp_path, &out_path).map_err(|e| e.to_string())?;
         extracted += 1;
     }
     if extracted == 0 {

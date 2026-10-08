@@ -95,6 +95,12 @@ const ALGO_VERSION: i64 = 1;
 
 pub(crate) fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
+    // Waveforms are requested per row while a scan may be writing; WAL lets
+    // those reads proceed, and the busy timeout makes a second writer wait
+    // instead of failing with "database is locked".
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
     conn.execute_batch(FILE_CACHE_SCHEMA_SQL).map_err(|e| e.to_string())?;
     // `algo_version` was added after the original schema shipped — a fresh
     // database gets it from FILE_CACHE_SCHEMA_SQL above, but an existing
@@ -117,19 +123,35 @@ fn file_stat(path: &Path) -> Result<(i64, i64), String> {
 }
 
 fn compute_blake3(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    // Streamed rather than `fs::read` + hash: a long WAV is 50-100 MB, and
+    // with fingerprinting running on several threads at once, holding whole
+    // files in memory just to hash them added up to gigabytes.
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher
+        .update_reader(std::io::BufReader::with_capacity(1 << 16, file))
+        .map_err(|e| e.to_string())?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Fingerprint matching only needs the first couple of minutes of a track —
 /// far cheaper than decoding a whole DJ mix start to end.
 const FINGERPRINT_MAX_SAMPLES: usize = 44_100 * 2 * 120; // ~120s stereo @44.1kHz worst case
 
-/// Decodes audio to interleaved i16 PCM, stopping early once `max_samples`
-/// interleaved samples have been decoded (`None` decodes the whole file —
-/// used for waveform generation, where the true shape of the whole track
-/// matters, unlike fingerprint matching).
-fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i16>, u32, u32, f64), String> {
+/// Decodes audio packet by packet, handing each packet's interleaved i16
+/// samples to `sink` along with the stream's sample rate and channel count.
+/// Stops early once `max_samples` interleaved samples have been delivered
+/// (`None` decodes the whole file). Returns `(sample_rate, channels,
+/// frames_decoded)`.
+///
+/// Streaming rather than collecting: the waveform needs the whole track, and
+/// buffering a 10-minute WAV as PCM first cost ~100 MB per request; the
+/// fingerprinter consumes samples incrementally anyway.
+fn decode_stream(
+    path: &str,
+    max_samples: Option<usize>,
+    mut sink: impl FnMut(&[i16], u32, u32),
+) -> Result<(u32, u32, u64), String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -154,7 +176,8 @@ fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i
         .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("unsupported codec: {e}"))?;
 
-    let mut pcm: Vec<i16> = Vec::new();
+    let mut chunk: Vec<i16> = Vec::new();
+    let mut delivered = 0usize;
     let mut sample_rate = 0u32;
     let mut channels = 0u32;
     let mut total_frames: u64 = 0;
@@ -162,9 +185,7 @@ fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
-            Ok(None) => break,
-            Err(SymError::ResetRequired) => break,
-            Err(_) => break,
+            Ok(None) | Err(SymError::ResetRequired) | Err(_) => break,
         };
         if packet.track_id != track_id {
             continue;
@@ -173,16 +194,17 @@ fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i
             Ok(audio_buf) => {
                 if sample_rate == 0 {
                     sample_rate = audio_buf.spec().rate();
-                    channels = audio_buf.spec().channels().count() as u32;
+                    channels = (audio_buf.spec().channels().count() as u32).max(1);
                 }
                 total_frames += audio_buf.frames() as u64;
-                let mut chunk: Vec<i16> = vec![0i16; audio_buf.samples_interleaved()];
+                // One scratch buffer reused across packets instead of a fresh
+                // allocation per packet.
+                chunk.resize(audio_buf.samples_interleaved(), 0);
                 audio_buf.copy_to_slice_interleaved(&mut chunk);
-                pcm.extend_from_slice(&chunk);
-                if let Some(max) = max_samples {
-                    if pcm.len() >= max {
-                        break;
-                    }
+                sink(&chunk, sample_rate, channels);
+                delivered += chunk.len();
+                if max_samples.is_some_and(|max| delivered >= max) {
+                    break;
                 }
             }
             Err(SymError::DecodeError(_)) => continue,
@@ -193,20 +215,17 @@ fn decode_to_pcm_capped(path: &str, max_samples: Option<usize>) -> Result<(Vec<i
     if sample_rate == 0 {
         return Err("could not decode any audio frames".to_string());
     }
-    // Duration is measured from the actual audio decoded here, so it's only
-    // the true track length when `max_samples` is None — a capped decode's
-    // caller should use the existing `file_info`/`list_files` duration
-    // instead if it needs the real length.
-    let duration_secs = total_frames as f64 / sample_rate as f64;
-    Ok((pcm, sample_rate, channels.max(1), duration_secs))
+    Ok((sample_rate, channels, total_frames))
 }
 
+/// Decodes to one interleaved PCM buffer, capped like the fingerprint pass.
+/// Only the tests need the samples themselves; the app streams them.
+#[cfg(test)]
 fn decode_to_pcm(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
-    decode_to_pcm_capped(path, Some(FINGERPRINT_MAX_SAMPLES))
-}
-
-fn decode_full(path: &str) -> Result<(Vec<i16>, u32, u32, f64), String> {
-    decode_to_pcm_capped(path, None)
+    let mut pcm = Vec::new();
+    let (rate, channels, frames) =
+        decode_stream(path, Some(FINGERPRINT_MAX_SAMPLES), |s, _, _| pcm.extend_from_slice(s))?;
+    Ok((pcm, rate, channels, frames as f64 / rate as f64))
 }
 
 /// The one Chromaprint configuration used everywhere a fingerprint is
@@ -226,6 +245,7 @@ fn fingerprint_config() -> Configuration {
     Configuration::preset_test2().with_removed_silence(50)
 }
 
+#[cfg(test)]
 fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<Vec<u32>, String> {
     let config = fingerprint_config();
     let mut printer = Fingerprinter::new(&config);
@@ -237,46 +257,99 @@ fn compute_fingerprint(pcm: &[i16], sample_rate: u32, channels: u32) -> Result<V
     Ok(printer.fingerprint().to_vec())
 }
 
-pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
-    let (mtime, size) = file_stat(Path::new(path))?;
+/// Hashes and fingerprints one file from scratch (no cache).
+///
+/// Samples go straight from the decoder into the fingerprinter. Its input
+/// stage buffers internally and only ever processes full fixed-size blocks,
+/// so feeding it packet by packet yields exactly the fingerprint one big
+/// buffer would — which matters, because imported Rekordbox cues are keyed by
+/// a hash of the fingerprint.
+fn compute_fingerprint_file(path: &str) -> Result<CachedFingerprint, String> {
+    let blake3 = compute_blake3(Path::new(path))?;
+    let config = fingerprint_config();
+    let mut printer = Fingerprinter::new(&config);
+    let mut start_error: Option<String> = None;
+    let mut started = false;
+    let (sample_rate, _channels, frames) =
+        decode_stream(path, Some(FINGERPRINT_MAX_SAMPLES), |samples, rate, channels| {
+            if !started {
+                started = true;
+                if let Err(e) = printer.start(rate, channels) {
+                    start_error = Some(format!("fingerprinter reset failed: {e:?}"));
+                }
+            }
+            if start_error.is_none() {
+                printer.consume(samples);
+            }
+        })?;
+    if let Some(e) = start_error {
+        return Err(e);
+    }
+    printer.finish();
+    Ok(CachedFingerprint {
+        blake3,
+        fingerprint: printer.fingerprint().to_vec(),
+        // The audio actually fingerprinted (capped), not the track length.
+        duration_secs: frames as f64 / sample_rate as f64,
+        sample_rate,
+    })
+}
 
+/// The cached fingerprint for `path`, if one exists for this exact file
+/// state (mtime + size) and this build's `ALGO_VERSION`.
+fn cached_fingerprint(
+    conn: &Connection,
+    path: &str,
+    mtime: i64,
+    size: i64,
+) -> Result<Option<CachedFingerprint>, String> {
     let cached: Option<(Option<String>, Option<String>, Option<f64>, Option<u32>, Option<i64>)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT blake3_hash, fingerprint, duration_secs, sample_rate, algo_version FROM file_cache
              WHERE path = ?1 AND mtime = ?2 AND size = ?3",
-            params![path, mtime, size],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
-        .optional()
+        .and_then(|mut stmt| {
+            stmt.query_row(params![path, mtime, size], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
+            .optional()
+        })
         .map_err(|e| e.to_string())?;
     // All four fingerprint columns must be present — a row that only has a
     // cached waveform (F3, computed independently) doesn't count as a
     // fingerprint hit — and `algo_version` must match this build's, or a
     // fingerprint computed under a since-changed `fingerprint_config()`
     // would be returned as if it were still comparable to a fresh one.
-    if let Some((Some(blake3), Some(fp_str), Some(duration_secs), Some(sample_rate), Some(v))) = cached {
-        if v == ALGO_VERSION {
-            return Ok(CachedFingerprint {
+    Ok(match cached {
+        Some((Some(blake3), Some(fp_str), Some(duration_secs), Some(sample_rate), Some(v)))
+            if v == ALGO_VERSION =>
+        {
+            Some(CachedFingerprint {
                 blake3,
                 fingerprint: fp_str.split(',').filter_map(|s| s.parse().ok()).collect(),
                 duration_secs,
                 sample_rate,
-            });
+            })
         }
-    }
+        _ => None,
+    })
+}
 
-    let blake3 = compute_blake3(Path::new(path))?;
-    let (pcm, sample_rate, channels, duration_secs) = decode_to_pcm(path)?;
-    let fingerprint = compute_fingerprint(&pcm, sample_rate, channels)?;
-    let fp_str = fingerprint.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
-
+fn store_fingerprint(
+    conn: &Connection,
+    path: &str,
+    mtime: i64,
+    size: i64,
+    fp: &CachedFingerprint,
+) -> Result<(), String> {
+    let fp_str = fp.fingerprint.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
     // The waveform cache (F3) is written by a separate upsert keyed on the
     // same path — preserve it only if mtime/size (the file's content) are
     // unchanged from what's already stored; if they differ, the existing
     // waveform_peaks belongs to an old version of this file and must not be
     // carried forward under the new mtime/size stamp, or a future waveform
     // read would silently return stale data for the changed file.
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO file_cache (path, mtime, size, blake3_hash, fingerprint, duration_secs, sample_rate, algo_version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(path) DO UPDATE SET
@@ -289,11 +362,94 @@ pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFing
                      AND file_cache.algo_version IS excluded.algo_version
                 THEN file_cache.waveform_peaks ELSE NULL
             END",
-        params![path, mtime, size, blake3, fp_str, duration_secs, sample_rate, ALGO_VERSION],
     )
-    .map_err(|e| e.to_string())?;
+    .and_then(|mut stmt| {
+        stmt.execute(params![
+            path,
+            mtime,
+            size,
+            fp.blake3,
+            fp_str,
+            fp.duration_secs,
+            fp.sample_rate,
+            ALGO_VERSION
+        ])
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
 
-    Ok(CachedFingerprint { blake3, fingerprint, duration_secs, sample_rate })
+pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFingerprint, String> {
+    let (mtime, size) = file_stat(Path::new(path))?;
+    if let Some(fp) = cached_fingerprint(conn, path, mtime, size)? {
+        return Ok(fp);
+    }
+    let fp = compute_fingerprint_file(path)?;
+    store_fingerprint(conn, path, mtime, size, &fp)?;
+    Ok(fp)
+}
+
+/// `get_or_compute` for many files: cache hits are read first, the misses
+/// are decoded and fingerprinted in parallel (`par_map` — this is CPU-bound
+/// decode + FFT work that used to run on a single core), and every new
+/// fingerprint is written back in one transaction rather than one implicit
+/// transaction (and fsync) per file. Results come back in input order.
+///
+/// `on_progress(done, total)` is called from worker threads as files finish.
+pub(crate) fn fingerprint_many(
+    conn: &mut Connection,
+    paths: &[String],
+    on_progress: impl Fn(usize, usize) + Sync,
+) -> Vec<Result<CachedFingerprint, String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = paths.len();
+    let mut results: Vec<Option<Result<CachedFingerprint, String>>> = Vec::with_capacity(total);
+    // (index into `paths`, mtime, size) of each file that needs computing.
+    let mut misses: Vec<(usize, i64, i64)> = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        let hit = file_stat(Path::new(path)).and_then(|(mtime, size)| {
+            let cached = cached_fingerprint(conn, path, mtime, size)?;
+            if cached.is_none() {
+                misses.push((i, mtime, size));
+            }
+            Ok(cached)
+        });
+        results.push(match hit {
+            Ok(Some(fp)) => Some(Ok(fp)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        });
+    }
+
+    let done = AtomicUsize::new(total - misses.len());
+    on_progress(done.load(Ordering::Relaxed), total);
+    let computed = crate::commands::files::par_map(
+        &misses,
+        |&(i, _, _)| {
+            let fp = compute_fingerprint_file(&paths[i]);
+            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+            fp
+        },
+        |_| Err(crate::commands::files::CRASHED.to_string()),
+    );
+
+    // Caching is an optimisation: a failed write must not fail the scan.
+    if let Ok(tx) = conn.transaction() {
+        for (&(i, mtime, size), fp) in misses.iter().zip(&computed) {
+            if let Ok(fp) = fp {
+                let _ = store_fingerprint(&tx, &paths[i], mtime, size, fp);
+            }
+        }
+        let _ = tx.commit();
+    }
+    for (&(i, _, _), fp) in misses.iter().zip(computed) {
+        results[i] = Some(fp);
+    }
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err("fingerprint was not computed".to_string())))
+        .collect()
 }
 
 /// Waveform peaks are downsampled to this many buckets — enough visual
@@ -301,31 +457,50 @@ pub(crate) fn get_or_compute(conn: &Connection, path: &str) -> Result<CachedFing
 /// track's structure, small enough to be a trivially cheap payload.
 const WAVEFORM_BUCKETS: usize = 400;
 
-/// Peak (max absolute amplitude, 0.0-1.0) per bucket, channels averaged
-/// down to mono first.
-fn compute_waveform_peaks(pcm: &[i16], channels: u32) -> Vec<f32> {
-    let channels = channels.max(1) as usize;
-    let frames = pcm.len() / channels;
-    if frames == 0 {
-        return Vec::new();
-    }
-    let bucket_size = (frames / WAVEFORM_BUCKETS).max(1);
-    let mut peaks = Vec::with_capacity(WAVEFORM_BUCKETS);
-    let mut frame_idx = 0;
-    while frame_idx < frames && peaks.len() < WAVEFORM_BUCKETS {
-        let end = (frame_idx + bucket_size).min(frames);
-        let mut max_abs = 0i32;
-        for f in frame_idx..end {
-            let mut sum = 0i32;
-            for c in 0..channels {
-                sum += pcm[f * channels + c] as i32;
+/// Frames per block while streaming peaks. The final buckets are the max
+/// over consecutive blocks, so this only bounds memory (~250 KB for a
+/// 10-minute track) and is far narrower than one bucket of any real track.
+const WAVEFORM_BLOCK_FRAMES: usize = 256;
+
+/// Peak (max absolute amplitude, 0.0-1.0) per bucket, channels averaged down
+/// to mono first — computed while decoding, so the track's PCM is never held
+/// in memory as a whole.
+fn compute_waveform_file(path: &str) -> Result<Vec<f32>, String> {
+    let mut blocks: Vec<f32> = Vec::new();
+    let mut block_max = 0i32;
+    let mut in_block = 0usize;
+    let to_peak = |max_abs: i32| (max_abs as f32 / i16::MAX as f32).min(1.0);
+    decode_stream(path, None, |samples, _rate, channels| {
+        let channels = channels.max(1) as usize;
+        for frame in samples.chunks_exact(channels) {
+            let sum: i32 = frame.iter().map(|&s| s as i32).sum();
+            block_max = block_max.max((sum / channels as i32).abs());
+            in_block += 1;
+            if in_block == WAVEFORM_BLOCK_FRAMES {
+                blocks.push(to_peak(block_max));
+                block_max = 0;
+                in_block = 0;
             }
-            max_abs = max_abs.max((sum / channels as i32).abs());
         }
-        peaks.push(max_abs as f32 / i16::MAX as f32);
-        frame_idx = end;
+    })?;
+    if in_block > 0 {
+        blocks.push(to_peak(block_max));
     }
-    peaks
+    Ok(bucket_peaks(&blocks))
+}
+
+/// Folds per-block peaks into at most `WAVEFORM_BUCKETS` buckets (max per bucket).
+fn bucket_peaks(blocks: &[f32]) -> Vec<f32> {
+    if blocks.len() <= WAVEFORM_BUCKETS {
+        return blocks.to_vec();
+    }
+    (0..WAVEFORM_BUCKETS)
+        .map(|k| {
+            let start = k * blocks.len() / WAVEFORM_BUCKETS;
+            let end = ((k + 1) * blocks.len() / WAVEFORM_BUCKETS).max(start + 1);
+            blocks[start..end].iter().copied().fold(0.0, f32::max)
+        })
+        .collect()
 }
 
 fn get_or_compute_waveform(conn: &Connection, path: &str) -> Result<Vec<f32>, String> {
@@ -348,8 +523,7 @@ fn get_or_compute_waveform(conn: &Connection, path: &str) -> Result<Vec<f32>, St
         }
     }
 
-    let (pcm, _sample_rate, channels, _duration_secs) = decode_full(path)?;
-    let peaks = compute_waveform_peaks(&pcm, channels);
+    let peaks = compute_waveform_file(path)?;
     let peaks_str = peaks.iter().map(|p| format!("{p:.4}")).collect::<Vec<_>>().join(",");
 
     // Same staleness guard as the fingerprint upsert above, mirrored: only
@@ -527,18 +701,20 @@ impl UnionFind {
 /// phase)`) instead of an `AppHandle`, so it can be exercised directly
 /// (real-library smoke testing, benchmarking) without a running app.
 fn scan_duplicates_core(
-    conn: &Connection,
+    conn: &mut Connection,
     paths: &[String],
-    mut on_progress: impl FnMut(usize, usize, &str),
+    on_progress: impl Fn(usize, usize, &str) + Sync,
 ) -> Vec<DuplicateGroup> {
     let total = paths.len();
     let mut fingerprints: Vec<(String, CachedFingerprint)> = Vec::with_capacity(total);
-    for (i, path) in paths.iter().enumerate() {
-        match get_or_compute(conn, path) {
+    let computed = fingerprint_many(conn, paths, |done, total| {
+        on_progress(done, total, "fingerprinting")
+    });
+    for (path, fp) in paths.iter().zip(computed) {
+        match fp {
             Ok(fp) => fingerprints.push((path.clone(), fp)),
             Err(e) => eprintln!("duplicate scan: skipping {path}: {e}"),
         }
-        on_progress(i + 1, total, "fingerprinting");
     }
 
     // Stage 1: exact byte-identical files (blake3), grouped immediately —
@@ -572,16 +748,39 @@ fn scan_duplicates_core(
     let mut uf = UnionFind::new(candidates.len());
     let mut pair_kind: std::collections::HashMap<(usize, usize), (bool, f64)> = std::collections::HashMap::new();
 
-    for (ci, &i) in candidates.iter().enumerate() {
-        for (cj, &j) in candidates.iter().enumerate().skip(ci + 1) {
-            let (_, fa) = &fingerprints[i];
-            let (_, fb) = &fingerprints[j];
-            let longer = fa.duration_secs.max(fb.duration_secs);
-            let shorter = fa.duration_secs.min(fb.duration_secs);
-            if longer <= 0.0 || shorter / longer < 0.30 {
-                continue; // durations too far apart to plausibly be related
+    // The pairwise comparison is O(n²) `match_fingerprints` calls — by far the
+    // slowest part of a big scan, and it ran on one core. Each row of the
+    // triangle (one file against every later one) is independent, so rows
+    // run in parallel and their matches are merged in row order afterwards;
+    // the grouping that comes out is identical to the sequential loop's.
+    let compared = std::sync::atomic::AtomicUsize::new(0);
+    let rows: Vec<usize> = (0..candidates.len()).collect();
+    let matches: Vec<Vec<(usize, PairMatch)>> = crate::commands::files::par_map(
+        &rows,
+        |&ci| {
+            let (_, fa) = &fingerprints[candidates[ci]];
+            let mut found = Vec::new();
+            for (cj, &j) in candidates.iter().enumerate().skip(ci + 1) {
+                let (_, fb) = &fingerprints[j];
+                let longer = fa.duration_secs.max(fb.duration_secs);
+                let shorter = fa.duration_secs.min(fb.duration_secs);
+                if longer <= 0.0 || shorter / longer < 0.30 {
+                    continue; // durations too far apart to plausibly be related
+                }
+                match classify_pair(fa, fb, &config) {
+                    PairMatch::NoMatch => {}
+                    m => found.push((cj, m)),
+                }
             }
-            match classify_pair(fa, fb, &config) {
+            let n = compared.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            on_progress(n, candidates.len(), "comparing");
+            found
+        },
+        |_| Vec::new(),
+    );
+    for (ci, found) in matches.into_iter().enumerate() {
+        for (cj, m) in found {
+            match m {
                 PairMatch::Duplicate { score } => {
                     uf.union(ci, cj);
                     pair_kind.insert((ci, cj), (true, score));
@@ -593,7 +792,6 @@ fn scan_duplicates_core(
                 PairMatch::NoMatch => {}
             }
         }
-        on_progress(i + 1, fingerprints.len(), "comparing");
     }
 
     let mut clusters: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
@@ -639,10 +837,9 @@ fn scan_duplicates_core(
 }
 
 fn scan_duplicates_blocking(app: &AppHandle, paths: Vec<String>) -> Result<Vec<DuplicateGroup>, String> {
-    let conn = open_db(app)?;
-    let app = app.clone();
-    Ok(scan_duplicates_core(&conn, &paths, |done, total, phase| {
-        emit_progress(&app, done, total, phase)
+    let mut conn = open_db(app)?;
+    Ok(scan_duplicates_core(&mut conn, &paths, |done, total, phase| {
+        emit_progress(app, done, total, phase)
     }))
 }
 
@@ -736,18 +933,19 @@ mod tests {
 
         let cache_dir = std::env::temp_dir().join("mtc-real-scan-cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
-        let conn = Connection::open(cache_dir.join("cache.sqlite")).unwrap();
+        let mut conn = Connection::open(cache_dir.join("cache.sqlite")).unwrap();
         conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
 
         let start = std::time::Instant::now();
-        let mut last_print = std::time::Instant::now();
-        let groups = scan_duplicates_core(&conn, &paths, |done, total, phase| {
-            if last_print.elapsed().as_secs() >= 3 || done == total {
+        let last_print = std::sync::Mutex::new(std::time::Instant::now());
+        let groups = scan_duplicates_core(&mut conn, &paths, |done, total, phase| {
+            let mut last = last_print.lock().unwrap();
+            if last.elapsed().as_secs() >= 3 || done == total {
                 println!(
                     "{phase}: {done}/{total} ({:.1}s elapsed)",
                     start.elapsed().as_secs_f64()
                 );
-                last_print = std::time::Instant::now();
+                *last = std::time::Instant::now();
             }
         });
         println!("\nScan took {:?} for {} files", start.elapsed(), paths.len());
@@ -823,6 +1021,64 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fingerprints from the streaming decoder must be bit-identical to the
+    /// one-big-buffer computation: imported Rekordbox cues are keyed by a
+    /// hash of the fingerprint, so any drift would orphan them.
+    #[test]
+    fn streamed_fingerprint_matches_the_buffered_one() {
+        let dir = scratch_dir("streamed");
+        let path = dir.join("melody.wav");
+        let sr = 44_100;
+        write_wav(&path, &melody_pcm(&[261.63, 329.63, 392.0, 523.25, 440.0], sr, 2.0), sr);
+        let path_str = path.to_str().unwrap();
+
+        let (pcm, rate, channels, _) = decode_to_pcm(path_str).unwrap();
+        let buffered = compute_fingerprint(&pcm, rate, channels).unwrap();
+        let streamed = compute_fingerprint_file(path_str).unwrap();
+        assert!(!buffered.is_empty());
+        assert_eq!(streamed.fingerprint, buffered);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The batch path (parallel compute + one transaction) agrees with the
+    /// single-file path and serves the second run entirely from the cache.
+    #[test]
+    fn fingerprint_many_matches_get_or_compute_and_caches() {
+        let dir = scratch_dir("many");
+        let sr = 44_100;
+        let mut paths = Vec::new();
+        for (i, f) in [220.0, 330.0, 440.0].iter().enumerate() {
+            let p = dir.join(format!("tone{i}.wav"));
+            write_wav(&p, &sine_pcm(*f, sr, 2.0), sr);
+            paths.push(p.to_string_lossy().to_string());
+        }
+        paths.push(dir.join("missing.wav").to_string_lossy().to_string());
+        let mut conn = Connection::open(dir.join("cache.sqlite")).unwrap();
+        conn.execute_batch(FILE_CACHE_SCHEMA_SQL).unwrap();
+
+        let first = fingerprint_many(&mut conn, &paths, |_, _| {});
+        assert_eq!(first.len(), 4);
+        assert!(first[3].is_err(), "a missing file is an error, not a dropped entry");
+        for (path, fp) in paths.iter().zip(&first).take(3) {
+            let single = get_or_compute(&conn, path).unwrap();
+            assert_eq!(fp.as_ref().unwrap().fingerprint, single.fingerprint);
+        }
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_cache WHERE fingerprint IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waveform_buckets_fold_blocks_by_max() {
+        let blocks: Vec<f32> = (0..1000).map(|i| (i % 10) as f32 / 10.0).collect();
+        let peaks = bucket_peaks(&blocks);
+        assert_eq!(peaks.len(), WAVEFORM_BUCKETS);
+        assert!(peaks.iter().all(|p| (0.0..=1.0).contains(p)));
+        assert_eq!(bucket_peaks(&[0.5, 0.25]), vec![0.5, 0.25], "short input passes through");
     }
 
     #[test]

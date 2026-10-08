@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use walkdir::WalkDir;
 
-use crate::commands::files::{par_map, read_for_index, read_tags_impl, AUDIO_EXTENSIONS};
+use crate::commands::files::{par_map, read_for_index, read_tags_impl, AUDIO_EXTENSIONS, CRASHED};
 use crate::models::WriteResult;
 
 /// Canonical tag keys that survive a write as typed fields, so they must not
@@ -118,7 +118,10 @@ CREATE TABLE IF NOT EXISTS rekordbox_track (
 /// A mismatch forces one full re-read, after which the stamp is updated.
 ///
 /// v2: `duration_secs` and `has_backup` are populated (they were always NULL/0).
-const INDEX_VERSION: i64 = 2;
+/// v3: MP3 star ratings are read from their POPM frames (always NULL before),
+///     and `comment` is the plain comment rather than whichever came first
+///     (often iTunes' `iTunNORM` hex).
+const INDEX_VERSION: i64 = 3;
 
 fn stored_index_version(conn: &Connection) -> i64 {
     conn.query_row(
@@ -140,8 +143,14 @@ pub(crate) fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
 pub(crate) fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let conn = Connection::open(db_path(app)?).map_err(|e| e.to_string())?;
     // WAL keeps a long indexing write from blocking the reads the UI makes
-    // while it runs (stats polling, the search dock).
+    // while it runs (stats polling, the search dock). NORMAL sync is the
+    // documented pairing for WAL: still crash-safe, far fewer fsyncs.
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    // Two writers can overlap (a re-index running while an edit refreshes its
+    // rows, an import session autosaving). Without a busy timeout the second
+    // fails at once with "database is locked" instead of waiting its turn.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
     conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -158,6 +167,68 @@ fn is_audio(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// An audio file worth indexing — not a macOS `._` AppleDouble companion,
+/// which carries the audio extension but holds only Finder metadata.
+fn is_track_file(e: &walkdir::DirEntry) -> bool {
+    e.file_type().is_file()
+        && is_audio(e.path())
+        && !e.file_name().to_string_lossy().starts_with("._")
+}
+
+/// Whether `path` sits under `root`, compared by path component — a plain
+/// string prefix would put `C:\Music2\x.mp3` under the root `C:\Music`.
+fn is_under(path: &str, root: &str) -> bool {
+    Path::new(path).starts_with(Path::new(root))
+}
+
+/// Inserts or refreshes one track's row.
+fn upsert_track(
+    tx: &rusqlite::Transaction,
+    path: &str,
+    mtime: i64,
+    size: i64,
+    row: crate::commands::files::IndexRow,
+    now: i64,
+) -> Result<(), String> {
+    let tags = row.tags;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT OR REPLACE INTO library_track (
+                path, mtime, size, format, duration_secs, has_backup, has_cover,
+                title, artist, album, album_artist, genre, year, comment,
+                composer, original_artist, track_id, rating, indexed_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.execute(params![
+        path,
+        mtime,
+        size,
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase(),
+        row.duration_secs,
+        row.has_backup as i64,
+        tags.has_cover_art as i64,
+        tags.title,
+        tags.artist,
+        tags.album,
+        tags.album_artist,
+        tags.genre,
+        tags.year,
+        tags.comment,
+        tags.composer,
+        tags.original_artist,
+        tags.track_id,
+        tags.rating.map(|r| r as i64),
+        now,
+    ])
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Folder name the Stems action writes into, which sits *inside* the track's
@@ -391,7 +462,7 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
                 .filter_entry(|e| e.depth() == 0 || !is_stems_dir(e))
                 .filter_map(|e| e.ok())
             {
-                if e.file_type().is_file() && is_audio(e.path()) {
+                if is_track_file(&e) {
                     found.push(e.into_path());
                 }
             }
@@ -436,12 +507,25 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
         // Tag parsing is the expensive part, so it runs in parallel and the
         // database write happens afterwards in one transaction — sqlite is
         // single-writer, and interleaving would serialise the parses too.
-        let parsed = par_map(&to_read, |p| {
-            let path = p.to_string_lossy().to_string();
-            let (mtime, size) = file_stat(p).unwrap_or((0, 0));
-            let row = read_for_index(&path);
-            (path, mtime, size, row)
-        });
+        // Progress is reported from the parse itself: reporting it from the
+        // insert loop below left the bar at zero for the whole (slow) parse of
+        // a first index, then raced it to the end during the (fast) inserts.
+        let parsed_count = std::sync::atomic::AtomicUsize::new(0);
+        let reading_total = to_read.len();
+        let parsed = par_map(
+            &to_read,
+            |p| {
+                let path = p.to_string_lossy().to_string();
+                let (mtime, size) = file_stat(p).unwrap_or((0, 0));
+                let row = read_for_index(&path);
+                let n = parsed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 32 == 0 || n == reading_total {
+                    emit_progress(&app, "reading", n, reading_total, &path);
+                }
+                (path, mtime, size, row)
+            },
+            |p| (p.to_string_lossy().to_string(), 0, 0, Err(CRASHED.to_string())),
+        );
 
         let mut summary = IndexSummary {
             scanned: total,
@@ -451,10 +535,7 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
 
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let now = now_secs();
-        for (i, (path, mtime, size, row)) in parsed.into_iter().enumerate() {
-            if i % 64 == 0 {
-                emit_progress(&app, "reading", i, to_read.len(), &path);
-            }
+        for (path, mtime, size, row) in parsed {
             let row = match row {
                 Ok(r) => r,
                 Err(e) => {
@@ -462,38 +543,8 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
                     continue;
                 }
             };
-            let tags = row.tags;
-            let p = Path::new(&path);
             let existed = known.contains_key(&path);
-            tx.execute(
-                "INSERT OR REPLACE INTO library_track (
-                    path, mtime, size, format, duration_secs, has_backup, has_cover,
-                    title, artist, album, album_artist, genre, year, comment,
-                    composer, original_artist, track_id, rating, indexed_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                params![
-                    path,
-                    mtime,
-                    size,
-                    p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase(),
-                    row.duration_secs,
-                    row.has_backup as i64,
-                    tags.has_cover_art as i64,
-                    tags.title,
-                    tags.artist,
-                    tags.album,
-                    tags.album_artist,
-                    tags.genre,
-                    tags.year,
-                    tags.comment,
-                    tags.composer,
-                    tags.original_artist,
-                    tags.track_id,
-                    tags.rating.map(|r| r as i64),
-                    now,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            upsert_track(&tx, &path, mtime, size, row, now)?;
             if existed {
                 summary.updated += 1;
             } else {
@@ -510,7 +561,7 @@ pub async fn index_library(app: AppHandle, rescan_all: bool) -> Result<IndexSumm
             .keys()
             .filter(|k| !seen.contains(*k))
             .filter(|k| !Path::new(k).exists())
-            .filter(|k| available_roots.iter().any(|r| k.starts_with(r.as_str())))
+            .filter(|k| available_roots.iter().any(|r| is_under(k, r)))
             .cloned()
             .collect();
         for path in &stale {
@@ -731,49 +782,48 @@ pub async fn retag_field(
     let results = tauri::async_runtime::spawn_blocking(move || {
         let total = paths.len();
         let done = std::sync::atomic::AtomicUsize::new(0);
-        par_map(&paths, |path| {
-            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % 16 == 0 {
-                emit_progress(&app2, "retagging", n, total, path);
-            }
-            let mut tags = match read_tags_impl(path) {
-                Ok(t) => t,
-                Err(e) => return WriteResult { path: path.clone(), error: Some(e) },
-            };
-            let v = if value.trim().is_empty() { None } else { Some(value.clone()) };
-            match field.as_str() {
-                "genre" => tags.genre = v,
-                "artist" => tags.artist = v,
-                "album" => tags.album = v,
-                "albumArtist" => tags.album_artist = v,
-                "year" => tags.year = v,
-                "comment" => tags.comment = v,
-                "composer" => tags.composer = v,
-                "originalArtist" => tags.original_artist = v,
-                other => {
-                    return WriteResult {
-                        path: path.clone(),
-                        error: Some(format!("Unsupported field: {other}")),
+        par_map(
+            &paths,
+            |path| {
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 16 == 0 {
+                    emit_progress(&app2, "retagging", n, total, path);
+                }
+                let mut tags = match read_tags_impl(path) {
+                    Ok(t) => t,
+                    Err(e) => return WriteResult { path: path.clone(), error: Some(e) },
+                };
+                let v = if value.trim().is_empty() { None } else { Some(value.clone()) };
+                match field.as_str() {
+                    "genre" => tags.genre = v,
+                    "artist" => tags.artist = v,
+                    "album" => tags.album = v,
+                    "albumArtist" => tags.album_artist = v,
+                    "year" => tags.year = v,
+                    "comment" => tags.comment = v,
+                    "composer" => tags.composer = v,
+                    "originalArtist" => tags.original_artist = v,
+                    other => {
+                        return WriteResult {
+                            path: path.clone(),
+                            error: Some(format!("Unsupported field: {other}")),
+                        }
                     }
                 }
-            }
-            let keep_extra: Vec<String> = tags
-                .all_fields
-                .keys()
-                .filter(|k| !KEPT_FIELD_KEYS.contains(&k.as_str()))
-                .cloned()
-                .collect();
-            let err = crate::commands::files::write_tags_blocking(
-                path,
-                tags,
-                backup,
-                keep_extra,
-                preserve_art,
-                backup_field.clone(),
-            )
-            .err();
-            WriteResult { path: path.clone(), error: err }
-        })
+                let keep_extra = crate::commands::files::extra_field_keys(&tags);
+                let err = crate::commands::files::write_tags_blocking(
+                    path,
+                    tags,
+                    backup,
+                    keep_extra,
+                    preserve_art,
+                    backup_field.clone(),
+                )
+                .err();
+                WriteResult { path: path.clone(), error: err }
+            },
+            |path| WriteResult { path: path.clone(), error: Some(CRASHED.to_string()) },
+        )
     })
     .await
     .map_err(|_| "Retagging failed unexpectedly".to_string())?;
@@ -804,49 +854,33 @@ pub async fn reindex_library_paths(app: AppHandle, paths: Vec<String>) -> Result
 }
 
 /// Re-reads specific paths into the index. Cheap enough to run right after a
-/// write, so the index never lags the files it describes.
+/// write, so the index never lags the files it describes. A path whose file
+/// is gone (renamed, deleted) has its row dropped rather than left behind as
+/// a ghost track until the next full re-index.
 pub(crate) fn reindex_paths(app: &AppHandle, paths: &[String]) -> Result<(), String> {
-    let parsed = par_map(paths, |path| {
-        let p = Path::new(path);
-        let (mtime, size) = file_stat(p).unwrap_or((0, 0));
-        (path.clone(), mtime, size, read_for_index(path))
-    });
+    let parsed = par_map(
+        paths,
+        |path| {
+            let p = Path::new(path);
+            let (mtime, size) = file_stat(p).unwrap_or((0, 0));
+            (path.clone(), mtime, size, read_for_index(path))
+        },
+        |path| (path.clone(), 0, 0, Err(CRASHED.to_string())),
+    );
     let mut conn = open_db(app)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = now_secs();
     for (path, mtime, size, row) in parsed {
-        let Ok(row) = row else { continue };
-        let tags = row.tags;
-        let p = Path::new(&path);
-        tx.execute(
-            "INSERT OR REPLACE INTO library_track (
-                path, mtime, size, format, duration_secs, has_backup, has_cover,
-                title, artist, album, album_artist, genre, year, comment,
-                composer, original_artist, track_id, rating, indexed_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            params![
-                path,
-                mtime,
-                size,
-                p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase(),
-                row.duration_secs,
-                row.has_backup as i64,
-                tags.has_cover_art as i64,
-                tags.title,
-                tags.artist,
-                tags.album,
-                tags.album_artist,
-                tags.genre,
-                tags.year,
-                tags.comment,
-                tags.composer,
-                tags.original_artist,
-                tags.track_id,
-                tags.rating.map(|r| r as i64),
-                now,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        match row {
+            Ok(row) => upsert_track(&tx, &path, mtime, size, row, now)?,
+            Err(_) if !Path::new(&path).exists() => {
+                tx.execute("DELETE FROM library_track WHERE path = ?1", params![path])
+                    .map_err(|e| e.to_string())?;
+            }
+            // Present but unreadable right now (locked, mid-download): keep
+            // the last good row rather than dropping a track that exists.
+            Err(_) => {}
+        }
     }
     tx.commit().map_err(|e| e.to_string())
 }
@@ -964,6 +998,7 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::create_dir_all(dir.join("Album")).unwrap();
         std::fs::write(dir.join("Album").join("real.mp3"), b"x").unwrap();
+        std::fs::write(dir.join("Album").join("._real.mp3"), b"x").unwrap();
         std::fs::write(deep.join("vocals.wav"), b"x").unwrap();
         std::fs::write(deep.join("drums.wav"), b"x").unwrap();
 
@@ -972,7 +1007,7 @@ mod tests {
                 .into_iter()
                 .filter_entry(|e| e.depth() == 0 || !is_stems_dir(e))
                 .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_file() && is_audio(e.path()))
+                .filter(is_track_file)
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .collect()
         };
@@ -1002,15 +1037,18 @@ mod tests {
     /// directory this run may have stale rows removed under it.
     #[test]
     fn stale_rows_under_an_offline_root_are_not_pruned() {
-        let known_paths = ["C:/Online/a.mp3", "C:/Offline/b.mp3"];
-        let seen: BTreeSet<String> = BTreeSet::new(); // neither was walked this run
-        let available_roots = vec!["C:/Online".to_string()]; // only Online resolved to a dir
+        // "Music2" is an unplugged root whose name merely *starts with* the
+        // online root's: a string-prefix check counted its tracks as under
+        // "Music" and deleted them.
+        let known_paths = ["C:/Music/a.mp3", "C:/Offline/b.mp3", "C:/Music2/c.mp3"];
+        let seen: BTreeSet<String> = BTreeSet::new(); // none was walked this run
+        let available_roots = vec!["C:/Music".to_string()]; // only Music resolved to a dir
         let stale: Vec<&&str> = known_paths
             .iter()
             .filter(|k| !seen.contains(**k))
-            .filter(|k| available_roots.iter().any(|r| k.starts_with(r.as_str())))
+            .filter(|k| available_roots.iter().any(|r| is_under(k, r)))
             .collect();
-        assert_eq!(stale, vec![&"C:/Online/a.mp3"]);
+        assert_eq!(stale, vec![&"C:/Music/a.mp3"]);
     }
 
     /// Workstream D0: a Rekordbox row joins onto its Library track by a

@@ -8,6 +8,7 @@ pub mod backup_archive;
 pub mod components;
 pub mod convert;
 pub mod demucs;
+pub(crate) mod download;
 pub mod duplicates;
 pub mod ffmpeg;
 pub mod files;

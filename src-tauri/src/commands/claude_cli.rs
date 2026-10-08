@@ -27,7 +27,7 @@
 //!    with `is_error: true`, so the error text has to be read out of
 //!    `result`.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -50,6 +50,13 @@ const CLAUDE_EXE: &str = "claude";
 
 /// `claude --version` is a local call; if it takes this long something is wrong.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest prompt passed as a command-line argument. Windows caps a whole
+/// command line at 32,767 UTF-16 units, and an AI-playlist prompt for a
+/// 600-track pool runs to twice that — `CreateProcess` refused it outright
+/// (os error 206). Anything longer is piped through stdin instead, which
+/// `claude --print` reads as the prompt when none is given on the line.
+const MAX_ARG_PROMPT_UNITS: usize = 8_000;
 /// The Settings "is it usable?" ping — one trivial prompt.
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
 /// Real batches: a base cost plus a per-track allowance, capped so a huge
@@ -268,7 +275,7 @@ fn version_of(exe: &PathBuf) -> Option<String> {
     let mut cmd = Command::new(exe);
     cmd.arg("--version");
     hide_console(&mut cmd);
-    let out = run_with_timeout(cmd, VERSION_TIMEOUT).ok()?;
+    let out = run_with_timeout(cmd, VERSION_TIMEOUT, None).ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!v.is_empty()).then_some(v)
 }
@@ -319,13 +326,27 @@ fn drain<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
 /// until `limit`, and on expiry the whole process tree is killed. The
 /// offline CLI retries with backoff and may never exit by itself, which is
 /// what made AI Clean and the Settings check spin forever.
-fn run_with_timeout(mut cmd: Command, limit: Duration) -> Result<Output, CliError> {
+///
+/// `input`, when given, is written to the child's stdin on its own thread
+/// (so a child that is busy filling stdout can't deadlock against the write)
+/// and stdin is closed afterwards.
+fn run_with_timeout(
+    mut cmd: Command,
+    limit: Duration,
+    input: Option<String>,
+) -> Result<Output, CliError> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CliError::other(format!("Could not run the Claude CLI: {e}")))?;
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(text.as_bytes());
+            // Dropping `stdin` here closes the pipe: the CLI's end-of-input.
+        });
+    }
     let out_rx = drain(child.stdout.take().expect("piped stdout"));
     let err_rx = drain(child.stderr.take().expect("piped stderr"));
 
@@ -403,10 +424,13 @@ fn run_prompt(
     if !anthropic_reachable() {
         return Err(CliError::offline());
     }
+    let via_stdin = prompt.encode_utf16().count() > MAX_ARG_PROMPT_UNITS;
     let mut cmd = Command::new(exe);
-    cmd.arg("--print")
-        .arg(prompt)
-        .arg("--output-format")
+    cmd.arg("--print");
+    if !via_stdin {
+        cmd.arg(prompt);
+    }
+    cmd.arg("--output-format")
         .arg("json")
         // Tag work is pure text transformation: no file access, no shell, no
         // network. Denying the tools outright means a prompt built from
@@ -423,7 +447,7 @@ fn run_prompt(
     }
     hide_console(&mut cmd);
 
-    let out = run_with_timeout(cmd, limit)?;
+    let out = run_with_timeout(cmd, limit, via_stdin.then(|| prompt.to_string()))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
 
     let envelope: Value = serde_json::from_str(stdout.trim())

@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -97,33 +96,18 @@ pub async fn install_ollama(app: AppHandle) -> Result<(), String> {
             "Automatic install is only supported on Windows — download from https://ollama.com/download".into(),
         );
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut resp = client
-        .get("https://ollama.com/download/OllamaSetup.exe")
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Download failed: HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
+    let client = crate::commands::download::client()?;
     let dest = std::env::temp_dir().join("OllamaSetup.exe");
-    let mut file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
-    let mut downloaded: u64 = 0;
-    let mut last_emitted: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Download failed: {e}"))? {
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        if downloaded - last_emitted >= 512 * 1024 {
-            last_emitted = downloaded;
-            emit_progress(&app, "ollama", "downloading", downloaded, total);
-        }
-    }
-    drop(file);
-    emit_progress(&app, "ollama", "launching", downloaded, total.max(downloaded));
+    // A truncated installer would launch and fail in some confusing way;
+    // `download_to_file` only produces the file once it has fully arrived.
+    let downloaded = crate::commands::download::download_to_file(
+        &client,
+        "https://ollama.com/download/OllamaSetup.exe",
+        &dest,
+        |done, total| emit_progress(&app, "ollama", "downloading", done, total),
+    )
+    .await?;
+    emit_progress(&app, "ollama", "launching", downloaded, downloaded);
     std::process::Command::new(&dest)
         .spawn()
         .map_err(|e| format!("Could not launch the installer: {e}"))?;
@@ -169,7 +153,10 @@ fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
 pub async fn pull_model(app: AppHandle, url: String, model: String) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        // No overall timeout: large models take a long time to pull.
+        // No overall timeout — large models take a long time to pull — but a
+        // stream that goes silent this long has stalled. Generous, since
+        // Ollama can be quiet while it verifies a big layer's digest.
+        .read_timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
     let mut resp = client
@@ -182,11 +169,14 @@ pub async fn pull_model(app: AppHandle, url: String, model: String) -> Result<()
         return Err(format!("Ollama returned HTTP {}", resp.status()));
     }
 
-    let mut buf = String::new();
+    // Buffered as bytes and decoded a whole line at a time: decoding each
+    // network chunk on its own garbled any UTF-8 character split across two.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buf.find('\n') {
-            let line: String = buf.drain(..=pos).collect();
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
             let line = line.trim();
             if line.is_empty() {
                 continue;

@@ -38,7 +38,7 @@ fn openable_paths<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 /// with; it drains the list so a later reload doesn't re-import them.
 #[tauri::command]
 fn take_opened_files(state: tauri::State<PendingOpen>) -> Vec<String> {
-    std::mem::take(&mut *state.0.lock().unwrap())
+    std::mem::take(&mut *state.0.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Taskbar identity. Must equal `identifier` in tauri.conf.json — that is the
@@ -117,7 +117,7 @@ fn main() {
             let paths = openable_paths(argv.into_iter().skip(1));
             if !paths.is_empty() {
                 if let Some(state) = app.try_state::<PendingOpen>() {
-                    state.0.lock().unwrap().extend(paths);
+                    state.0.lock().unwrap_or_else(|e| e.into_inner()).extend(paths);
                 }
                 let _ = app.emit("open-files", ());
             }
