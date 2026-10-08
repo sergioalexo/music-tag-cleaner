@@ -384,7 +384,8 @@ export interface PendingChange {
   raw?: boolean;
 }
 
-export const AUDIO_EXTENSIONS = ["mp3", "flac", "ogg", "aac", "m4a", "wav", "aiff", "aif"];
+/** Mirrors `AUDIO_EXTENSIONS` in `src-tauri/src/commands/files.rs`. */
+export const AUDIO_EXTENSIONS = ["mp3", "flac", "ogg", "opus", "aac", "m4a", "wav", "aiff", "aif"];
 
 /** Canonical lofty key names that survive a strip (must match key_name() in Rust). */
 export const KEPT_FIELD_KEYS = new Set([

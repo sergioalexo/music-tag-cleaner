@@ -36,7 +36,7 @@ import {
   recommendedBackupField,
   TRANSLITERATE_SCRIPTS,
 } from "../types";
-import { migrate, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
+import { migrate, mergeWithDefaults, CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS } from "../hooks/useSettings";
 import { STANDARDIZE_FIELDS } from "../hooks/useTags";
 import { ALLOWED_DESCRIPTION, DEFAULT_FLAG_EXTRA_CHARS } from "../lib/standardize";
 import { SHORTCUTS, comboFromEvent, shortcutFor } from "../lib/shortcuts";
@@ -49,6 +49,11 @@ import type { LibraryIndexApi } from "../hooks/useLibraryIndex";
 interface Props {
   settings: Settings;
   onSave: (settings: Settings) => void;
+  /** Read-modify-write against the newest settings (see `useSettings.update`).
+   * Every single-field change goes through this: building the whole object
+   * from this render's `settings` reverted anything that changed in between —
+   * most visibly after an `await`, like the Rekordbox re-import. */
+  onUpdate: (fn: (prev: Settings) => Settings) => void;
   /** Renames a genre across the whole collection, after confirming. */
   onRenameGenre: (oldName: string, newName: string) => void;
   /** Every distinct genre spelling in the collection, near-duplicates grouped. */
@@ -293,12 +298,12 @@ function DetectGenresPanel({
  */
 function LibraryIndexCard({
   settings,
-  onSave,
+  onUpdate,
   libraryIndex,
   notify,
 }: {
   settings: Settings;
-  onSave: (settings: Settings) => void;
+  onUpdate: (fn: (prev: Settings) => Settings) => void;
   libraryIndex: LibraryIndexApi;
   notify: Notify;
 }) {
@@ -338,7 +343,7 @@ function LibraryIndexCard({
     if (!ok) return;
     try {
       await libraryIndex.setRoots([picked]);
-      onSave({ ...settings, libraryFolder: picked });
+      onUpdate((prev) => ({ ...prev, libraryFolder: picked }));
       void runIndex(false);
     } catch (e) {
       notify(String(e), "error");
@@ -359,7 +364,7 @@ function LibraryIndexCard({
       filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
     });
     if (typeof picked !== "string") return;
-    onSave({ ...settings, rekordboxXmlPath: picked });
+    onUpdate((prev) => ({ ...prev, rekordboxXmlPath: picked }));
     void reimportRekordboxXml(picked);
   };
 
@@ -368,7 +373,7 @@ function LibraryIndexCard({
     try {
       const summary = await libraryIndex.importRekordboxTags(xmlPath);
       const mtime = await invoke<number | null>("file_mtime_secs", { path: xmlPath });
-      onSave({ ...settings, rekordboxXmlPath: xmlPath, rekordboxXmlMtime: mtime ?? 0 });
+      onUpdate((prev) => ({ ...prev, rekordboxXmlPath: xmlPath, rekordboxXmlMtime: mtime ?? 0 }));
       notify(
         `Rekordbox BPM/key imported — ${summary.matched} of ${summary.libraryTrackCount} Library tracks matched (${summary.xmlEntries} entries in the XML)`,
         "success",
@@ -479,10 +484,10 @@ function LibraryIndexCard({
               className={cn(selectClass, "w-44")}
               value={settings.genreClickInManualSession}
               onChange={(e) =>
-                onSave({
-                  ...settings,
+                onUpdate((prev) => ({
+                  ...prev,
                   genreClickInManualSession: e.target.value as Settings["genreClickInManualSession"],
-                })
+                }))
               }
             >
               <option value="ask">Ask each time</option>
@@ -575,6 +580,7 @@ function LibraryIndexCard({
 export function SettingsPage({
   settings,
   onSave,
+  onUpdate,
   onRenameGenre,
   collectionGenreGroups,
   libraryIndex,
@@ -630,9 +636,14 @@ export function SettingsPage({
     setImportingSettings(true);
     try {
       const raw = await invoke<string>("read_text_file", { path: src });
-      const parsed = JSON.parse(raw) as Partial<Settings>;
-      const merged = { ...DEFAULT_SETTINGS, ...parsed };
-      const savedVersion = parsed.settingsVersion ?? 1;
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("that file isn't a settings export");
+      }
+      // The same merge + sanitising the startup load uses: a bare spread let
+      // an imported file with a null usage counter crash the Settings page.
+      const merged = mergeWithDefaults(parsed as Partial<Settings>);
+      const savedVersion = (parsed as Partial<Settings>).settingsVersion ?? 1;
       const next = savedVersion < CURRENT_SETTINGS_VERSION ? migrate(merged, savedVersion) : merged;
       onSave(next);
       notify("Settings imported", "success");
@@ -725,7 +736,7 @@ export function SettingsPage({
     );
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
-    onSave({ ...settings, [key]: value });
+    onUpdate((prev) => ({ ...prev, [key]: value }));
 
   const addCasingException = () => {
     const value = casingExceptionDraft.trim();
@@ -825,7 +836,7 @@ export function SettingsPage({
     setStatus(result);
     setTesting(false);
     if (result.running && result.models.length && !result.models.includes(settings.ollamaModel)) {
-      onSave({ ...settings, ollamaUrl: u, ollamaModel: result.models[0] });
+      onUpdate((prev) => ({ ...prev, ollamaUrl: u, ollamaModel: result.models[0] }));
     }
   };
 
@@ -1578,7 +1589,7 @@ export function SettingsPage({
         </div>
       </Card>
 
-      <LibraryIndexCard settings={settings} onSave={onSave} libraryIndex={libraryIndex} notify={notify} />
+      <LibraryIndexCard settings={settings} onUpdate={onUpdate} libraryIndex={libraryIndex} notify={notify} />
 
       <Card>
         <CardHeader

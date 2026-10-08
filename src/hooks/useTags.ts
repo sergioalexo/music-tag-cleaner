@@ -47,17 +47,19 @@ interface WriteResult {
  * than erroring, which would silently disable the searchable backup.
  */
 async function writeBatch(items: WriteItem[], settings: Settings): Promise<ApplyResult> {
-  if (!items.length) return { written: 0, errors: [] };
+  if (!items.length) return { written: 0, errors: [], failedPaths: [] };
   const results = await invoke<WriteResult[]>("write_tags_batch", {
     items,
     backup: settings.backupBeforeChanges,
     preserveArt: settings.preserveCoverArt,
     backupField: backupArg(settings),
   });
-  const errors = results
-    .filter((r) => r.error)
-    .map((r) => `${basename(r.path)}: ${r.error}`);
-  return { written: results.length - errors.length, errors };
+  const failed = results.filter((r) => r.error);
+  return {
+    written: results.length - failed.length,
+    errors: failed.map((r) => `${basename(r.path)}: ${r.error}`),
+    failedPaths: failed.map((r) => r.path),
+  };
 }
 
 /** Subscribes to the batch writers' progress events for the duration of `run`. */
@@ -79,6 +81,8 @@ async function withWriteProgress<T>(
 export interface ApplyResult {
   written: number;
   errors: string[];
+  /** Paths whose write failed — so history can leave out changes that never happened. */
+  failedPaths?: string[];
   /** True if a backup/restore run was stopped early by the user. */
   stopped?: boolean;
 }

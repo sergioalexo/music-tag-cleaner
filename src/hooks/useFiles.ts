@@ -183,7 +183,10 @@ export function useFiles(
       const updated = await invoke<AudioFile[]>("list_files", {
         paths: filesRef.current.map((f) => f.path),
       });
-      setFiles(updated);
+      // Merged in place rather than replacing the list: a big re-read takes
+      // seconds, and files added (or removed) meanwhile must survive it.
+      const byPath = new Map(updated.map((f) => [f.path, f]));
+      setFiles((prev) => prev.map((f) => byPath.get(f.path) ?? f));
     } catch (e) {
       console.error("Failed to refresh file list:", e);
     }

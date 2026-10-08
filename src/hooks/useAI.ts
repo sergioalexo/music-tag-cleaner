@@ -45,6 +45,18 @@ export interface CleanResult {
   stopped: boolean;
   /** Tracks the AI could not identify from tags or filename. */
   unresolved: string[];
+  /** One message per batch that failed; the other batches' results stand. */
+  batchErrors: string[];
+}
+
+/**
+ * Keeps only the results whose index belongs to `batch`. A model that
+ * answers with an index from outside the batch it was given would otherwise
+ * overwrite another track's result — a different song's tags written into it.
+ */
+export function resultsForBatch(batch: TrackInput[], results: CleanedTrack[]): CleanedTrack[] {
+  const allowed = new Set(batch.map((t) => t.index));
+  return results.filter((r) => allowed.has(r.index));
 }
 
 /** Builds the clean prompt's track list. Indexes are 1-based over `paths`. */
@@ -162,6 +174,7 @@ export function useAI() {
     const inputs = cleanInputs(valid, map);
 
     const cleanedByIndex = new Map<number, CleanedTrack>();
+    const batchErrors: string[] = [];
     const batchSize = safeBatchSize(settings.batchSize);
     onProgress(0, valid.length);
     for (let start = 0; start < inputs.length; start += batchSize) {
@@ -171,28 +184,45 @@ export function useAI() {
       // batching, progress and Stop are identical either way, and both
       // commands build the prompt and parse the answer with the same shared
       // Rust helpers, so a track cleans the same whichever is selected.
-      const results =
-        settings.aiBackend === "claude"
-          ? await invoke<CleanedTrack[]>("claude_clean_batch", {
-              tracks: batch,
-              transliterateScripts: settings.transliterateScripts,
-              model: settings.claudeTasks.clean.model || null,
-              effort: settings.claudeTasks.clean.effort || null,
-            })
-          : await invoke<CleanedTrack[]>("ai_clean_batch", {
-              url: settings.ollamaUrl,
-              model,
-              tracks: batch,
-              transliterateScripts: settings.transliterateScripts,
-            });
+      let results: CleanedTrack[];
+      try {
+        results =
+          settings.aiBackend === "claude"
+            ? await invoke<CleanedTrack[]>("claude_clean_batch", {
+                tracks: batch,
+                transliterateScripts: settings.transliterateScripts,
+                model: settings.claudeTasks.clean.model || null,
+                effort: settings.claudeTasks.clean.effort || null,
+              })
+            : await invoke<CleanedTrack[]>("ai_clean_batch", {
+                url: settings.ollamaUrl,
+                model,
+                tracks: batch,
+                transliterateScripts: settings.transliterateScripts,
+              });
+      } catch (e) {
+        // One bad batch (a dropped connection, an answer that isn't JSON)
+        // used to throw away every batch already finished. Keep them, and
+        // report which tracks this one covered.
+        const first = batch[0].index;
+        const last = batch[batch.length - 1].index;
+        batchErrors.push(`Tracks ${first}–${last}: ${String(e)}`);
+        onProgress(Math.min(start + batch.length, valid.length), valid.length);
+        continue;
+      }
       // Discard a batch that finished after the user asked to stop.
       if (stopRef.current) break;
-      for (const r of results) cleanedByIndex.set(r.index, r);
+      for (const r of resultsForBatch(batch, results)) cleanedByIndex.set(r.index, r);
       onProgress(Math.min(start + batch.length, valid.length), valid.length);
     }
 
+    // Every batch failed: that is an error (offline, Ollama down), not an
+    // empty result.
+    if (batchErrors.length && cleanedByIndex.size === 0 && !stopRef.current) {
+      throw new Error(batchErrors[0]);
+    }
     const { rows, unresolved } = buildCleanRows(valid, map, cleanedByIndex);
-    return { rows, stopped: stopRef.current, unresolved };
+    return { rows, stopped: stopRef.current, unresolved, batchErrors };
   };
 
   return { status, check, runClean, stop };

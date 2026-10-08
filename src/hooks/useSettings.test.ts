@@ -1,0 +1,42 @@
+import { describe, expect, it } from "vitest";
+import { CURRENT_SETTINGS_VERSION, DEFAULT_SETTINGS, mergeWithDefaults, migrate } from "./useSettings";
+import type { Settings } from "../types";
+
+describe("mergeWithDefaults", () => {
+  it("fills keys a nested object saved by an older version is missing", () => {
+    const saved = {
+      stemOptions: { model: "htdemucs_ft" },
+      claudeTasks: { clean: { model: "opus" } },
+    } as unknown as Partial<Settings>;
+    const merged = mergeWithDefaults(saved);
+    expect(merged.stemOptions.model).toBe("htdemucs_ft");
+    for (const key of Object.keys(DEFAULT_SETTINGS.stemOptions)) {
+      expect(merged.stemOptions).toHaveProperty(key);
+    }
+    expect(merged.claudeTasks.clean).toEqual({ model: "opus", effort: DEFAULT_SETTINGS.claudeTasks.clean.effort });
+    expect(merged.claudeTasks.playlist).toEqual(DEFAULT_SETTINGS.claudeTasks.playlist);
+  });
+
+  it("repairs null usage counters instead of passing them to the Settings page", () => {
+    const saved = { usage: { totalCalls: null, totalPromptTokens: 12 } } as unknown as Partial<Settings>;
+    const merged = mergeWithDefaults(saved);
+    expect(merged.usage.totalCalls).toBe(0);
+    expect(merged.usage.totalPromptTokens).toBe(12);
+    expect(merged.usage.songsProcessed).toBe(0);
+  });
+});
+
+describe("migrate", () => {
+  it("v15 forgets the rekordbox.xml mtime so BPM/key re-import once", () => {
+    const old = { ...DEFAULT_SETTINGS, rekordboxXmlPath: "C:/rb.xml", rekordboxXmlMtime: 1234 };
+    const next = migrate(old, 14);
+    expect(next.rekordboxXmlMtime).toBe(0);
+    expect(next.rekordboxXmlPath).toBe("C:/rb.xml");
+    expect(next.settingsVersion).toBe(CURRENT_SETTINGS_VERSION);
+  });
+
+  it("leaves an up-to-date mtime alone", () => {
+    const current = { ...DEFAULT_SETTINGS, rekordboxXmlMtime: 99 };
+    expect(migrate(current, 15).rekordboxXmlMtime).toBe(99);
+  });
+});

@@ -5,7 +5,7 @@ import type { Settings } from "../types";
 import { DEFAULT_STEM_OPTIONS } from "../types";
 import { DEFAULT_FLAG_EXTRA_CHARS, DEFAULT_REPLACEMENTS } from "../lib/standardize";
 
-export const CURRENT_SETTINGS_VERSION = 14;
+export const CURRENT_SETTINGS_VERSION = 15;
 
 export const DEFAULT_SETTINGS: Settings = {
   aiBackend: "ollama",
@@ -83,6 +83,27 @@ function sanitizeNumbers<T extends object>(obj: T | undefined, defaults: T): T {
 }
 
 /**
+ * Merges saved settings over the defaults. Nested option objects are merged a
+ * level deeper too: a plain spread replaced them wholesale, so an object saved
+ * by an older version (before a stem option or Claude task existed) came back
+ * missing the newer keys, as `undefined`.
+ */
+export function mergeWithDefaults(saved: Partial<Settings>): Settings {
+  const merged: Settings = { ...DEFAULT_SETTINGS, ...saved };
+  merged.djApp = { ...DEFAULT_SETTINGS.djApp, ...saved.djApp };
+  merged.stemOptions = { ...DEFAULT_SETTINGS.stemOptions, ...saved.stemOptions };
+  merged.claudeTasks = {
+    clean: { ...DEFAULT_SETTINGS.claudeTasks.clean, ...saved.claudeTasks?.clean },
+    playlist: { ...DEFAULT_SETTINGS.claudeTasks.playlist, ...saved.claudeTasks?.playlist },
+  };
+  // A counter that was once NaN is persisted as JSON `null`, which later
+  // crashes `.toLocaleString()` on the Settings page.
+  merged.usage = sanitizeNumbers(saved.usage, DEFAULT_SETTINGS.usage);
+  merged.plan = { ...saved.plan, ...sanitizeNumbers(saved.plan, DEFAULT_SETTINGS.plan) };
+  return merged;
+}
+
+/**
  * Brings older saved settings up to date. v2 ensures the Preview and Rating
  * columns (added after some users' settings were first saved) are visible.
  * v3 retires the never-shipped "claude" backend in favour of "manual".
@@ -107,7 +128,10 @@ function sanitizeNumbers<T extends object>(obj: T | undefined, defaults: T): T {
  * v13 adds `rekordboxXmlPath`/`rekordboxXmlMtime` (D0), both filled in by the
  * `{ ...DEFAULT_SETTINGS, ...saved }` merge — no migration logic needed.
  * v14 adds `genreClickInManualSession` (the remembered answer to the genre
- * session dialog, default "ask"), filled in by the same merge.
+ * session dialog, default "ask"), filled in by the same merge. v15 forgets the
+ * remembered rekordbox.xml mtime so the next launch re-imports BPM/key once:
+ * rows for paths with a non-ASCII capital (Cyrillic, É, Ü…) were stored under
+ * a key the library join could never match, and only a re-import rewrites them.
  */
 export function migrate(s: Settings, savedVersion: number): Settings {
   const next = { ...s };
@@ -168,6 +192,9 @@ export function migrate(s: Settings, savedVersion: number): Settings {
     }
     delete legacy.claudeModel;
   }
+  if (savedVersion < 15) {
+    next.rekordboxXmlMtime = 0;
+  }
   next.settingsVersion = CURRENT_SETTINGS_VERSION;
   return next;
 }
@@ -188,12 +215,7 @@ export function useSettings() {
         storeRef.current = store;
         const saved = await store.get<Partial<Settings>>("settings");
         if (saved) {
-          const merged = { ...DEFAULT_SETTINGS, ...saved };
-          // The merge is shallow, so a saved `usage`/`plan` replaces the default
-          // object wholesale. A counter that was once NaN is persisted as JSON
-          // `null`, which later crashes `.toLocaleString()` on the Settings page.
-          merged.usage = sanitizeNumbers(merged.usage, DEFAULT_SETTINGS.usage);
-          merged.plan = { ...merged.plan, ...sanitizeNumbers(merged.plan, DEFAULT_SETTINGS.plan) };
+          const merged = mergeWithDefaults(saved);
           const savedVersion = saved.settingsVersion ?? 1;
           let next =
             savedVersion < CURRENT_SETTINGS_VERSION ? migrate(merged, savedVersion) : merged;

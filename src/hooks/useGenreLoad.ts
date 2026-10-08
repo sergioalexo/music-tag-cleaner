@@ -64,7 +64,7 @@ export function useGenreLoad({
     setLibraryTags((prev) => ({ ...seed, ...prev }));
 
     // Background refresh of the seeded rows, chunked like the table's own reader.
-    let gone = 0;
+    const gone: string[] = [];
     for (let i = 0; i < toRead.length; i += TAG_READ_CHUNK) {
       const chunk = toRead.slice(i, i + TAG_READ_CHUNK);
       try {
@@ -80,15 +80,20 @@ export function useGenreLoad({
         if (gen !== generation.current) return;
         if (missing.length) {
           filesApi.removeFiles(missing);
-          gone += missing.length;
+          gone.push(...missing);
         }
       } catch (e) {
         console.error("Failed to read tags for genre:", e);
         return;
       }
     }
-    if (gone) {
-      notify(`${gone} file${gone === 1 ? "" : "s"} no longer exist${gone === 1 ? "s" : ""}; re-index to tidy up`, "info");
+    if (gone.length) {
+      // Re-indexing a path whose file is gone drops its row, so the genre's
+      // count and search stop offering it — no full re-index needed.
+      // The refresh after it updates the in-memory rows too (rare, so cheap enough).
+      void libraryIndex.reindexPaths(gone).then(() => libraryIndex.refresh());
+      const n = gone.length;
+      notify(`${n} file${n === 1 ? "" : "s"} no longer exist${n === 1 ? "s" : ""} — removed from the Library`, "info");
     }
   };
 

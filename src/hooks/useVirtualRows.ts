@@ -32,7 +32,11 @@ export function useVirtualRows(
 ): VirtualRows {
   const { estimateRowHeight, overscan = 8, enabled = true } = opts;
   const [rowHeight, setRowHeight] = useState(estimateRowHeight);
-  const [scrollTop, setScrollTop] = useState(0);
+  // The first row at the top of the viewport — deliberately not the raw
+  // scrollTop. Storing scrollTop re-rendered the whole table on every scroll
+  // event even when the same rows stayed on screen; a row index only changes
+  // once per row scrolled, and React skips a setState to an unchanged value.
+  const [firstRow, setFirstRow] = useState(0);
   const [viewport, setViewport] = useState(0);
   const rowHeightRef = useRef(rowHeight);
   rowHeightRef.current = rowHeight;
@@ -41,7 +45,8 @@ export function useVirtualRows(
     const el = scrollRef.current;
     if (!el) return;
     const sync = () => {
-      setScrollTop(el.scrollTop);
+      const h = rowHeightRef.current || estimateRowHeight;
+      setFirstRow(Math.floor(el.scrollTop / h));
       setViewport(el.clientHeight);
     };
     sync();
@@ -52,7 +57,9 @@ export function useVirtualRows(
       el.removeEventListener("scroll", sync);
       ro.disconnect();
     };
-  }, [scrollRef]);
+    // `rowHeight` re-runs this so `firstRow` is recomputed once a real row
+    // has been measured, not left on the estimate until the next scroll.
+  }, [scrollRef, rowHeight, estimateRowHeight]);
 
   // Measure a real row's height when the row-height setting changes or rows
   // first appear — not on every render, since getBoundingClientRect forces a
@@ -79,8 +86,9 @@ export function useVirtualRows(
   }
 
   const h = rowHeight || estimateRowHeight;
-  const start = Math.max(0, Math.floor(scrollTop / h) - overscan);
-  const end = Math.min(count, Math.ceil((scrollTop + viewport) / h) + overscan);
+  const start = Math.max(0, firstRow - overscan);
+  // +1: the viewport can straddle one more row than it is tall.
+  const end = Math.min(count, firstRow + Math.ceil(viewport / h) + 1 + overscan);
   return {
     start,
     end,

@@ -215,16 +215,26 @@ export function LibrarySidebar({
     else onFilterChange({ mode, value } as SidebarFilter);
   };
 
+  // Width while a resize drag is in progress. The drag only re-renders this
+  // sidebar; the setting is saved once, on release. Saving per mousemove wrote
+  // the settings file and re-rendered the whole app ~60 times a second.
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const shownWidth = dragWidth ?? width;
+
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = width;
+    let latest = width;
     const onMove = (ev: MouseEvent) => {
-      onWidthChange(Math.max(160, Math.min(420, startWidth + ev.clientX - startX)));
+      latest = Math.max(160, Math.min(420, startWidth + ev.clientX - startX));
+      setDragWidth(latest);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      setDragWidth(null);
+      if (latest !== startWidth) onWidthChange(latest);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp, { once: true });
@@ -257,7 +267,7 @@ export function LibrarySidebar({
   return (
     <div
       className="relative flex shrink-0 flex-col border-r bg-card/50"
-      style={{ width }}
+      style={{ width: shownWidth }}
     >
       <div className="flex items-center gap-1 border-b p-2">
         {(

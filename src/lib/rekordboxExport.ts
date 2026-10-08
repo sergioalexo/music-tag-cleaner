@@ -20,8 +20,23 @@ export function buildM3u8(paths: string[], files: Record<string, AudioFile>, tag
   return lines.join("\n") + "\n";
 }
 
-function escapeXmlAttr(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+/**
+ * Escapes text for a double-quoted XML attribute. Tab/newline/CR become
+ * character references (a parser would otherwise normalise them to spaces),
+ * and the other C0 control characters are dropped: XML 1.0 forbids them
+ * outright, so a single stray \x01 in a messy tag — exactly the kind of tag
+ * this app exists to clean — made Rekordbox reject the whole file.
+ */
+export function escapeXmlAttr(s: string): string {
+  return s
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\t/g, "&#9;")
+    .replace(/\n/g, "&#10;")
+    .replace(/\r/g, "&#13;");
 }
 
 /**
@@ -30,8 +45,10 @@ function escapeXmlAttr(s: string): string {
  * `rekordbox_import.rs` (backslashes to forward slashes, each segment
  * percent-encoded except the drive letter).
  */
-function pathToLocation(path: string): string {
-  const forward = path.replace(/\\/g, "/");
+export function pathToLocation(path: string): string {
+  // A macOS path's leading "/" is the separator after "localhost", not an
+  // empty first segment — keeping it produced "file://localhost//Users/…".
+  const forward = path.replace(/\\/g, "/").replace(/^\/+/, "");
   return forward
     .split("/")
     .map((seg, i) => (i === 0 && /^[A-Za-z]:$/.test(seg) ? seg : encodeURIComponent(seg)))

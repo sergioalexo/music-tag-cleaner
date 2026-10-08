@@ -35,6 +35,13 @@ import { internalDrag } from "../lib/internalDrag";
 import { matchesTerms, parseQuery } from "../lib/trackSearch";
 import { matchesShortcut, shortcutFor } from "../lib/shortcuts";
 import { useVirtualRows } from "../hooks/useVirtualRows";
+
+/**
+ * One collator for every table sort: `localeCompare` builds its comparison
+ * state on each call, which dominated sorting a few thousand rows. `numeric`
+ * also puts "Track 2" before "Track 10".
+ */
+const SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 import { AudioPreview, formatDuration, releasePlayback, takeOverPlayback } from "./AudioPreview";
 import { Waveform } from "./Waveform";
 import { dominantFamily, fieldHeaderLabel, rawNameTooltip } from "../lib/rawFieldNames";
@@ -927,10 +934,17 @@ export function TrackTable({
     // otherwise, which is the expensive part for large libraries.
     const keyed = filteredRows.map((f) => ({ f, k: sortValue(f) }));
     keyed.sort((a, b) => {
+      // Numbers compare by `<`, not subtraction: two blank years are both
+      // -Infinity, and -Infinity - -Infinity is NaN, which made the order of
+      // every untagged row undefined.
       const cmp =
         typeof a.k === "number" && typeof b.k === "number"
-          ? a.k - b.k
-          : String(a.k).localeCompare(String(b.k));
+          ? a.k === b.k
+            ? 0
+            : a.k < b.k
+              ? -1
+              : 1
+          : SORT_COLLATOR.compare(String(a.k), String(b.k));
       return sortDir === "asc" ? cmp : -cmp;
     });
     return keyed.map((x) => x.f);

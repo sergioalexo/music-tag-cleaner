@@ -146,7 +146,10 @@ interface Props {
    * Genre Mode uses it to advance playback off the track being deleted. */
   onDeleteFile: (file: AudioFile, opts?: { onConfirmed?: () => void }) => void | Promise<void>;
   onRenameFile: (path: string, newStem: string) => void;
-  onSaveSettings: (settings: Settings) => void;
+  /** Merges `patch` into the newest settings. A patch, not a whole object:
+   * spreading this render's `settings` reverted whatever else changed between
+   * the render and the call. */
+  onSaveSettings: (patch: Partial<Settings>) => void;
   backupFieldId: string | null;
   shortcuts: Record<string, string>;
   onTrack: (name: string) => void;
@@ -261,7 +264,7 @@ export function LibraryPage({
   };
   const chooseForGenre = (genre: string, choice: GenreSessionChoice, remember: boolean) => {
     setGenreDialog(null);
-    if (remember) onSaveSettings({ ...settings, genreClickInManualSession: choice });
+    if (remember) onSaveSettings({ genreClickInManualSession: choice });
     if (choice === "filter") return filterToGenre(genre);
     setSidebarFilter(null);
     if (choice === "newTab") onOpenGenreInNewTab(genre);
@@ -666,8 +669,8 @@ export function LibraryPage({
           activeGenre={filesApi.source.kind === "genre" ? filesApi.source.genre : null}
           onGenreClick={onGenreClick}
           onFilterChange={setSidebarFilter}
-          onWidthChange={(w) => onSaveSettings({ ...settings, sidebarWidth: w })}
-          onCollapsedChange={(c) => onSaveSettings({ ...settings, sidebarCollapsed: c })}
+          onWidthChange={(w) => onSaveSettings({ sidebarWidth: w })}
+          onCollapsedChange={(c) => onSaveSettings({ sidebarCollapsed: c })}
         />
         <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
           <SessionTabs
@@ -710,9 +713,9 @@ export function LibraryPage({
               onToggle={filesApi.toggle}
               onSetAll={filesApi.setAll}
               onSetMany={filesApi.setManySelected}
-              onVisibleColumnsChange={(cols) => onSaveSettings({ ...settings, visibleColumns: cols })}
-              onColumnWidthsChange={(widths) => onSaveSettings({ ...settings, columnWidths: widths })}
-              onRowHeightChange={(h: RowHeight) => onSaveSettings({ ...settings, rowHeight: h })}
+              onVisibleColumnsChange={(cols) => onSaveSettings({ visibleColumns: cols })}
+              onColumnWidthsChange={(widths) => onSaveSettings({ columnWidths: widths })}
+              onRowHeightChange={(h: RowHeight) => onSaveSettings({ rowHeight: h })}
               onEditField={onEditField}
               onEditRawField={onEditRawField}
               onEditRating={onEditRating}

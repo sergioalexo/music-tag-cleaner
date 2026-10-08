@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { audioDir, join as joinPath } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { Upload, X } from "lucide-react";
 
@@ -52,6 +53,7 @@ import {
   type FfmpegInfo,
   type PendingChange,
   type PreviewMode,
+  type Settings,
   type TagData,
 } from "./types";
 
@@ -125,6 +127,11 @@ let toastId = 0;
 
 export default function App() {
   const { settings, save, update, loaded } = useSettings();
+  /** Merges a partial change into the newest settings (see `update`). */
+  const savePatch = useCallback(
+    (patch: Partial<Settings>) => void update((prev) => ({ ...prev, ...patch })),
+    [update],
+  );
   const [page, setPage] = useState<Page>("library");
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -210,14 +217,24 @@ export default function App() {
         }
         return;
       }
-      // No Library folder ever configured — ask once, suggesting the
-      // owner's usual Music\Collection if it's actually there.
+      // No Library folder ever configured — ask once, suggesting this
+      // user's own Music\Collection (the owner's layout) or else their Music
+      // folder, whichever actually exists. This used to be a hard-coded
+      // "C:\Users\sopas\..." path, which no other install could ever have.
       try {
-        const defaultPath = "C:\\Users\\sopas\\Music\\Collection";
-        const exists = await invoke<boolean>("path_exists", { path: defaultPath }).catch(
-          () => false,
-        );
-        setSuggestedLibraryFolder(exists ? defaultPath : null);
+        const music = await audioDir();
+        const candidates = [await joinPath(music, "Collection"), music];
+        let suggestion: string | null = null;
+        for (const candidate of candidates) {
+          const exists = await invoke<boolean>("path_exists", { path: candidate }).catch(
+            () => false,
+          );
+          if (exists) {
+            suggestion = candidate;
+            break;
+          }
+        }
+        setSuggestedLibraryFolder(suggestion);
       } catch {
         setSuggestedLibraryFolder(null);
       } finally {
@@ -286,6 +303,24 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [aiRunning, setAiRunning] = useState(false);
   const [backupRunning, setBackupRunning] = useState(false);
+
+  /**
+   * Refreshes the Library index rows for whichever of `paths` sit inside the
+   * Library folder — after edits, and after renames/deletes too: the backend
+   * drops the row of a path that no longer exists, so passing a rename's old
+   * path stops it lingering as a ghost track in search and matching.
+   * Compared with separators normalised, so it works for macOS paths as well
+   * as Windows ones (it used to assume a trailing "\").
+   */
+  const reindexLibraryPaths = (paths: string[]) => {
+    const root = settingsRef.current.libraryFolder;
+    if (!root || !paths.length) return Promise.resolve();
+    const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+    const prefix = norm(root).replace(/\/+$/, "") + "/";
+    const inLibrary = [...new Set(paths)].filter((p) => norm(p).startsWith(prefix));
+    return inLibrary.length ? libraryIndex.reindexPaths(inLibrary) : Promise.resolve();
+  };
+
   const history = useHistory({
     tagsApi,
     settings,
@@ -297,13 +332,7 @@ export default function App() {
     resetLibraryTags: () => setLibraryTags({}),
     refreshPaths: (paths) => filesApi.refreshPaths(paths),
     refreshAll: () => filesApi.refresh(),
-    reindexLibraryPaths: (paths) => {
-      const root = settingsRef.current.libraryFolder;
-      if (!root) return Promise.resolve();
-      const normalizedRoot = root.replace(/[\\/]+$/, "").toLowerCase() + "\\";
-      const inLibrary = paths.filter((p) => p.toLowerCase().startsWith(normalizedRoot));
-      return libraryIndex.reindexPaths(inLibrary);
-    },
+    reindexLibraryPaths,
   });
   const pushHistory = history.push;
 
@@ -669,7 +698,7 @@ export default function App() {
    * pattern as Clear Fields.
    */
   const runCapitalizationOnly = (mode: Capitalization) => {
-    void save({ ...settings, capitalization: mode });
+    void update((prev) => ({ ...prev, capitalization: mode }));
     runStandardize(
       "standardize",
       (value) => applyCapitalization(value, mode, settingsRef.current.casingExceptions),
@@ -799,7 +828,12 @@ export default function App() {
     try {
       const { map, errors } = await tagsApi.read(paths);
       errors.forEach((e) => notify(e, "error"));
-      const { rows, stopped, unresolved: unresolvedPaths } = await ai.runClean(
+      const {
+        rows,
+        stopped,
+        unresolved: unresolvedPaths,
+        batchErrors,
+      } = await ai.runClean(
         paths,
         map,
         settings,
@@ -811,6 +845,7 @@ export default function App() {
             label: `Processing track ${Math.min(done + 1, total)} of ${total}`,
           }),
       );
+      batchErrors.forEach((e) => notify(`AI batch failed — ${e}`, "error"));
       setTagsMap(map);
       setPreviewMode("ai");
       setUnresolved(new Set(unresolvedPaths));
@@ -855,15 +890,26 @@ export default function App() {
       result.errors.forEach((e) => notify(e, "error"));
       if (result.written)
         notify(`Updated ${result.written} file${result.written === 1 ? "" : "s"}`, "success");
-      // Cleared raw frames stay out of history — they can't be re-created from
-      // the key alone, so "Restore Backup" is their revert path. Curated
-      // clears are `kind: "remove"`, so match those too.
+      // Only files that were actually written go into history: undoing a
+      // change that never happened would write its "before" over whatever is
+      // really there. Curated clears are `kind: "remove"`, so match those too.
+      // Cleared raw frames are recorded under the `__raw:` prefix — the
+      // backend can recreate a removed frame from its name, so they undo too.
+      const failed = new Set(result.failedPaths ?? []);
       const changes = pending
         .filter(
           (r) =>
-            r.changed && r.include && !r.raw && (r.kind === "update" || previewMode === "clear"),
+            r.changed &&
+            r.include &&
+            !failed.has(r.path) &&
+            (r.kind === "update" || previewMode === "clear"),
         )
-        .map((r) => ({ path: r.path, field: r.field, before: r.before, after: r.after }));
+        .map((r) => ({
+          path: r.path,
+          field: r.raw ? `__raw:${r.field}` : r.field,
+          before: r.before,
+          after: r.after,
+        }));
       pushHistory({ label: `Apply ${previewMode}`, changes });
       await afterWrite(affected);
       if (previewMode === "standardize" && settings.standardizeFilename && lastStandardizeTransformRef.current) {
@@ -879,27 +925,36 @@ export default function App() {
 
   /** Applies `transform` to each affected file's stem (extension preserved), used by Standardize's filename scope. */
   const renameFilenamesInPlace = async (paths: string[], transform: (stem: string) => string) => {
-    let renamed = 0;
+    const byPath = new Map(filesApi.files.map((f) => [f.path, f]));
+    /** [old path, new path] per successful rename, re-read in one call below. */
+    const renamed: [string, string][] = [];
     for (const path of paths) {
-      const file = filesApi.files.find((f) => f.path === path);
+      const file = byPath.get(path);
       if (!file) continue;
       const dot = file.filename.lastIndexOf(".");
       const stem = dot > 0 ? file.filename.slice(0, dot) : file.filename;
       const newStem = transform(stem).trim();
       if (!newStem || newStem === stem) continue;
       try {
-        const newPath = await invoke<string>("rename_file", { path, newStem });
-        const [updated] = await invoke<AudioFile[]>("list_files", { paths: [newPath] });
-        if (updated) {
-          invalidateCovers([path]);
-          filesApi.remap({ [path]: updated });
-          renamed++;
-        }
+        // Sequential on purpose: collision suffixes (" (2)") are resolved
+        // against what is on disk, one rename at a time.
+        renamed.push([path, await invoke<string>("rename_file", { path, newStem })]);
       } catch (e) {
         notify(String(e), "error");
       }
     }
-    if (renamed) notify(`Renamed ${renamed} file${renamed === 1 ? "" : "s"}`, "success");
+    if (!renamed.length) return;
+    const updated = await invoke<AudioFile[]>("list_files", { paths: renamed.map(([, p]) => p) });
+    const byNewPath = new Map(updated.map((f) => [f.path, f]));
+    const mapping: Record<string, AudioFile> = {};
+    for (const [oldPath, newPath] of renamed) {
+      const info = byNewPath.get(newPath);
+      if (info) mapping[oldPath] = info;
+    }
+    invalidateCovers(Object.keys(mapping));
+    filesApi.remap(mapping);
+    void reindexLibraryPaths(renamed.flat());
+    notify(`Renamed ${renamed.length} file${renamed.length === 1 ? "" : "s"}`, "success");
   };
 
   const generateIds = async () => {
@@ -1054,6 +1109,7 @@ export default function App() {
         const removed = ok.map((o) => o.source);
         invalidateCovers(removed);
         filesApi.removeFiles(removed);
+        void reindexLibraryPaths(removed);
       }
       if (ok.length) {
         notify(
@@ -1254,6 +1310,9 @@ export default function App() {
       if (Object.keys(result.mapping).length) {
         invalidateCovers(Object.keys(result.mapping));
         filesApi.remap(result.mapping);
+        void reindexLibraryPaths(
+          Object.entries(result.mapping).flatMap(([oldPath, f]) => [oldPath, f.path]),
+        );
         // A rename only changes the path, not the tags — carry the cached
         // TagData over to the new path instead of clearing everything and
         // forcing a full-library re-read from disk.
@@ -1290,6 +1349,7 @@ export default function App() {
       await invoke("delete_file", { path: file.path });
       invalidateCovers([file.path]);
       filesApi.removeFiles([file.path]);
+      void reindexLibraryPaths([file.path]);
       setLibraryTags((prev) => {
         const next = { ...prev };
         delete next[file.path];
@@ -1334,6 +1394,7 @@ export default function App() {
     if (removed) {
       invalidateCovers(paths);
       filesApi.removeFiles(paths);
+      void reindexLibraryPaths(paths);
       setLibraryTags((prev) => {
         const next = { ...prev };
         for (const p of paths) delete next[p];
@@ -1557,6 +1618,7 @@ export default function App() {
       if (updated) {
         invalidateCovers([path]);
         filesApi.remap({ [path]: updated });
+        void reindexLibraryPaths([path, newPath]);
         setLibraryTags((prev) => {
           if (!prev[path]) return prev;
           const next = { ...prev };
@@ -2022,7 +2084,7 @@ This rewrites the genre tag on ${
               onFetchImageInfo={imageInfoApi.fetchOne}
               onSetCoverArt={withTrack1("setCoverArt", setCoverArt)}
               onRemoveCoverArt={withTrack1("removeCoverArt", removeCoverArt)}
-              onSaveSettings={save}
+              onSaveSettings={savePatch}
               backupFieldId={
                 settings.searchableBackup
                   ? settings.backupField.charAt(0).toLowerCase() + settings.backupField.slice(1)
@@ -2107,6 +2169,7 @@ This rewrites the genre tag on ${
             <SettingsPage
               settings={settings}
               onSave={save}
+              onUpdate={update}
               onRenameGenre={renameGenreEverywhere}
               collectionGenreGroups={collectionGenreGroups}
               libraryIndex={libraryIndex}
@@ -2160,7 +2223,7 @@ This rewrites the genre tag on ${
               : filesApi.files.filter((f) => filesApi.selected.has(f.path)).length
           }
           settings={settings}
-          onSaveSettings={save}
+          onSaveSettings={savePatch}
           onCancel={() => {
             setConvertOpen(false);
             setConvertSeedFile(null);
@@ -2179,7 +2242,7 @@ This rewrites the genre tag on ${
           paths={stemsPaths}
           info={demucsInfo}
           options={settings.stemOptions}
-          onSaveOptions={(stemOptions) => void save({ ...settingsRef.current, stemOptions })}
+          onSaveOptions={(stemOptions) => void update((prev) => ({ ...prev, stemOptions }))}
           onClose={() => setStemsPaths(null)}
           notify={notify}
         />

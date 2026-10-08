@@ -145,8 +145,14 @@ export function useHistory({
         setHistory((h) => h.slice(0, -1));
         setRedoStack((r) => [...r, entry]);
       }
-      dropLibraryTags(entry.changes.map((c) => c.path));
-      await refreshPaths(entry.changes.map((c) => c.path));
+      const paths = [...new Set(entry.changes.map((c) => c.path))];
+      dropLibraryTags(paths);
+      await refreshPaths(paths);
+      // Undo/redo is a real write like the action itself, so the Library
+      // index has to hear about it too — `push` reindexes the original edit,
+      // and without this an undone genre change lingered in the sidebar and
+      // search until the next full re-index.
+      void reindexLibraryPaths(paths);
       notify(`${verb}: ${entry.label}`, "success");
     } catch (e) {
       notify(String(e), "error");
@@ -185,6 +191,11 @@ export function useHistory({
       setRedoStack([...timeline.slice(targetIndex + 1)].reverse());
       resetLibraryTags();
       await refreshAll();
+      const replayed =
+        targetIndex < index
+          ? timeline.slice(targetIndex + 1, index + 1)
+          : timeline.slice(index + 1, targetIndex + 1);
+      void reindexLibraryPaths([...new Set(replayed.flatMap((e) => e.changes.map((c) => c.path)))]);
       notify(
         targetIndex < 0 ? "Jumped to session start" : `Jumped to: ${timeline[targetIndex].label}`,
         "success",

@@ -41,8 +41,13 @@ export function useLibraryIndex(notify: Notify) {
 
   const refreshStats = useCallback(async () => {
     try {
-      setStats(await invoke<LibraryStats>("library_stats"));
-      setGenres(await invoke<GenreCount[]>("library_genres"));
+      // Independent queries — issued together rather than one after the other.
+      const [nextStats, nextGenres] = await Promise.all([
+        invoke<LibraryStats>("library_stats"),
+        invoke<GenreCount[]>("library_genres"),
+      ]);
+      setStats(nextStats);
+      setGenres(nextGenres);
     } catch {
       // A missing/locked database is not worth a toast on every poll — the
       // Settings card shows "not indexed yet", which is the honest state.

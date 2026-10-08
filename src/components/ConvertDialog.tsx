@@ -16,7 +16,10 @@ interface Props {
   /** Number of selected tracks to convert. */
   count: number;
   settings: Settings;
-  onSaveSettings: (s: Settings) => void;
+  /** Merges `patch` into the newest settings. A patch, not a whole object:
+   * spreading this render's `settings` reverted whatever else changed between
+   * the render and the call. */
+  onSaveSettings: (patch: Partial<Settings>) => void;
   onCancel: () => void;
   onConvert: (opts: ConvertOptions) => void;
   /** Navigate to the Components page (shown when FFmpeg is missing). */
@@ -43,7 +46,7 @@ export function ConvertDialog({
   const run = () => {
     // Remember the format/location choice for next time.
     if (preset !== settings.convertPreset || output !== settings.convertOutput) {
-      onSaveSettings({ ...settings, convertPreset: preset, convertOutput: output });
+      onSaveSettings({ convertPreset: preset, convertOutput: output });
     }
     onConvert({ preset, output, addToLibrary, deleteOriginals });
   };
